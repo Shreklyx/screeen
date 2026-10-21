@@ -1,0 +1,13 @@
+{
+  // Cloudflare Worker that serves the static site from ./public
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mozizas-share",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./public"
+  },
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "share.mozizas.hu", "custom_domain": true }
+  ]
+}

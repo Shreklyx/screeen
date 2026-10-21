@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Mozizás – 4K képernyőmegosztás hanggal</title>
+  <meta name="description" content="Képernyőmegosztás 4K-ban, 60 FPS-sel és rendszerhanggal, minimális késleltetéssel. Regisztráció és telepítés nélkül, közvetlenül a böngészőből.">
+  <meta name="theme-color" content="#0b0b10">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d5e'/%3E%3Cpath d='M12.5 9.5v13l10-6.5z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js" integrity="sha384-x0YgkOr/3UOZP2CRDxGW9e0Q+2Qjyr3uJrm4xU32Y7ZCNAo7Cc7bjhrZMi/dwczu" crossorigin="anonymous" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="Mozizás – főoldal">
+      <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M12.5 9.5v13l10-6.5z"/></svg>
+      <span>mozizás<span class="brand-tld">.hu</span></span>
+    </a>
+    <span class="topbar-note"><span class="dot" aria-hidden="true"></span>Közvetlen P2P · végponttól titkosítva</span>
+  </header>
+
+  <main>
+    <!-- ============ HOME ============ -->
+    <section id="view-home" data-view class="home">
+      <div class="hero">
+        <h1>Képernyőmegosztás <em>4K-ban</em>, hanggal, késés nélkül.</h1>
+        <p class="lead">Nincs regisztráció, nincs telepítés. A kép és a hang közvetlenül a gépek között megy, titkosítva – nem egy szerveren keresztül.</p>
+      </div>
+
+      <div class="cards">
+        <article class="card">
+          <div class="card-head">
+            <span class="card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 20.5h8M12 17v3.5"/></svg></span>
+            <h2>Megosztok</h2>
+          </div>
+          <p>Válaszd ki a képernyőt, kapsz egy linket – küldd el a többieknek.</p>
+          <button id="btnShare" class="btn btn-primary btn-lg" type="button">Képernyő megosztása</button>
+          <p id="shareUnsupported" class="hint warn" hidden>Ez a böngésző nem tud képernyőt megosztani. Számítógépen használj Chrome-ot vagy Edge-et.</p>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <span class="card-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M10 8.5v7l6-3.5z"/></svg></span>
+            <h2>Nézek</h2>
+          </div>
+          <p>Írd be a kapott kódot, vagy egyszerűen nyisd meg a linket.</p>
+          <form id="joinForm" class="join" autocomplete="off">
+            <input id="joinCode" type="text" autocapitalize="off" spellcheck="false" placeholder="Szobakód, pl. k7x2pq" aria-label="Szobakód vagy link" required>
+            <button class="btn btn-secondary btn-lg" type="submit">Csatlakozás</button>
+          </form>
+        </article>
+      </div>
+
+      <ul class="features">
+        <li><strong>4K · 60 FPS</strong><span>Natív felbontás, akár 80 Mbit/s</span></li>
+        <li><strong>Rendszerhang</strong><span>Sztereó, 510 kbit/s Opus</span></li>
+        <li><strong>Minimális késés</strong><span>WebRTC, közvetlen kapcsolat</span></li>
+        <li><strong>Hardveres kódolás</strong><span>Automatikus kodekválasztás</span></li>
+      </ul>
+
+      <section class="howto" aria-labelledby="howto-title">
+        <h2 id="howto-title">Így megy a hang Windows 10 / 11 alatt</h2>
+        <ol>
+          <li>Nyisd meg az oldalt <b>Chrome</b>-ban vagy <b>Edge</b>-ben, és kattints a <b>Képernyő megosztása</b> gombra.</li>
+          <li>A felugró ablakban válaszd a <b>Teljes képernyő</b> lehetőséget, és pipáld be a <b>Rendszerhang megosztása</b> négyzetet.</li>
+          <li>Csak egy böngészőfül hangja kell (pl. egy film)? Válaszd a <b>Chrome-lap</b> fület, és kapcsold be a <b>lap hangjának megosztását</b>.</li>
+        </ol>
+        <p class="hint">Ha egyetlen ablak megosztásakor nincs hang, oszd meg inkább a teljes képernyőt. A nézők bármilyen böngészőben nézhetik, telefonon is.</p>
+      </section>
+    </section>
+
+    <!-- ============ HOST ============ -->
+    <section id="view-host" data-view class="host" hidden>
+      <div class="stage">
+        <div class="preview-wrap">
+          <video id="preview" autoplay muted playsinline disablepictureinpicture></video>
+          <div id="previewHidden" class="preview-paused" hidden>
+            <p>Előnézet elrejtve (kíméli a gépet). A megosztás megy tovább.</p>
+          </div>
+          <div id="previewPaused" class="preview-paused" hidden>
+            <p>A megosztás szünetel. A nézők kapcsolatban maradnak.</p>
+            <button id="btnResume" class="btn btn-primary" type="button">Megosztás folytatása</button>
+          </div>
+          <div class="preview-badges">
+            <span id="liveBadge" class="badge badge-live">ÉLŐ</span>
+            <span id="captureInfo" class="badge"></span>
+          </div>
+        </div>
+        <div class="stage-actions">
+          <button id="btnSwitch" class="btn" type="button">Forrás váltása</button>
+          <button id="btnStop" class="btn" type="button">Szüneteltetés</button>
+          <button id="btnPreview" class="btn btn-ghost" type="button">Előnézet elrejtése</button>
+          <span class="spacer"></span>
+          <button id="btnClose" class="btn btn-danger" type="button">Szoba bezárása</button>
+        </div>
+      </div>
+
+      <aside class="panel">
+        <section class="box">
+          <h3>Meghívó</h3>
+          <div class="code-row">
+            <span class="label">Szobakód</span>
+            <span id="roomCode" class="room-code">······</span>
+          </div>
+          <div class="link-row">
+            <input id="roomLink" type="text" readonly value="Szoba létrehozása…" aria-label="Meghívó link">
+            <button id="btnCopy" class="btn btn-primary" type="button" disabled>Másolás</button>
+          </div>
+          <p id="signalStatus" class="hint">Kapcsolódás a szerverhez…</p>
+        </section>
+
+        <section class="box">
+          <h3>Hang</h3>
+          <div class="meter" aria-hidden="true"><div id="audioMeter" class="meter-fill"></div></div>
+          <p id="audioStatus" class="hint"></p>
+        </section>
+
+        <section class="box">
+          <h3>Minőség</h3>
+          <div class="field">
+            <label for="setRes">Felbontás</label>
+            <select id="setRes">
+              <option value="native">Natív (akár 4K)</option>
+              <option value="2160">4K – 2160p</option>
+              <option value="1440">1440p</option>
+              <option value="1080">1080p</option>
+              <option value="720">720p</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="setFps">Képkocka/mp</label>
+            <select id="setFps">
+              <option value="60">60 FPS</option>
+              <option value="30">30 FPS</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="setKbps">Max. bitráta</label>
+            <select id="setKbps">
+              <option value="80000">80 Mbit/s (helyi hálózat)</option>
+              <option value="50000">50 Mbit/s</option>
+              <option value="30000">30 Mbit/s</option>
+              <option value="20000">20 Mbit/s</option>
+              <option value="12000">12 Mbit/s</option>
+              <option value="6000">6 Mbit/s</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="setMode">Tartalom</label>
+            <select id="setMode">
+              <option value="motion">Film / játék – folyamatos mozgás</option>
+              <option value="detail">Szöveg / prezentáció – élesség</option>
+              <option value="balanced">Kiegyensúlyozott</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="setCodec">Kodek</label>
+            <select id="setCodec">
+              <option value="auto">Automatikus (hardveres)</option>
+              <option value="AV1">AV1</option>
+              <option value="VP9">VP9</option>
+              <option value="H264">H.264</option>
+              <option value="VP8">VP8</option>
+            </select>
+          </div>
+          <label class="check"><input id="setAudio" type="checkbox"> Hang megosztása (rendszerhang / lap hangja)</label>
+          <p class="hint">A változások azonnal élnek. A hang ki-/bekapcsolása a következő forrásválasztáskor érvényes.</p>
+        </section>
+
+        <section class="box">
+          <h3>Nézők <span id="viewerCount" class="count">0</span></h3>
+          <ul id="viewerList" class="viewer-list"></ul>
+          <p id="noViewers" class="hint">Még senki sem csatlakozott. Küldd el a linket!</p>
+        </section>
+      </aside>
+    </section>
+
+    <!-- ============ VIEWER ============ -->
+    <section id="view-viewer" data-view class="viewer" hidden>
+      <div id="player" class="player ui-visible">
+        <video id="remoteVideo" autoplay playsinline></video>
+
+        <div id="overlay" class="overlay">
+          <div class="overlay-box">
+            <div id="spinner" class="spinner" aria-hidden="true"></div>
+            <p id="overlayText">Csatlakozás…</p>
+            <div id="overlayActions" class="overlay-actions"></div>
+          </div>
+        </div>
+
+        <button id="btnUnmute" class="unmute" type="button" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>
+          Kattints a hang bekapcsolásához
+        </button>
+
+        <div id="stats" class="stats" hidden></div>
+
+        <div class="controls">
+          <span id="viewerLive" class="badge badge-live" hidden>ÉLŐ</span>
+          <span id="viewerInfo" class="badge"></span>
+          <span class="spacer"></span>
+          <button id="btnMute" class="icon-btn" type="button" aria-label="Némítás (M)" title="Némítás (M)">
+            <svg class="ico-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>
+            <svg class="ico-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg>
+          </button>
+          <input id="volume" class="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Hangerő">
+          <select id="latency" class="latency" aria-label="Késleltetés" title="Késleltetés / puffer">
+            <option value="0">Minimális késés</option>
+            <option value="150">Simább (+150 ms)</option>
+            <option value="400">Stabil (+400 ms)</option>
+          </select>
+          <button id="btnStats" class="icon-btn" type="button" aria-label="Statisztika (S)" title="Statisztika (S)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V11M10 19V5M15 19v-6M20 19V8"/></svg>
+          </button>
+          <button id="btnFullscreen" class="icon-btn" type="button" aria-label="Teljes képernyő (F)" title="Teljes képernyő (F)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+          </button>
+        </div>
+      </div>
+      <p class="viewer-meta">Szoba: <b id="viewerRoom"></b> · <span id="viewerCountText">–</span> · Dupla kattintás: teljes képernyő · M: némítás · S: statisztika</p>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <noscript><p class="noscript">Az oldal működéséhez JavaScript szükséges.</p></noscript>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "name": "mozizas-share",
+  "version": "1.0.0",
+  "private": true,
+  "description": "4K, alacsony késleltetésű képernyőmegosztás hanggal (WebRTC)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.147.0"
+  }
+}
