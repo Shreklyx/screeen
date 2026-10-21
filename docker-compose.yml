@@ -1,0 +1,94 @@
+# Éles telepítés: Screen Share + Caddy (HTTPS) + coturn (TURN relé)
+# Telepítés / frissítés:  sudo bash deploy/install.sh
+name: screenshare
+
+services:
+  app:
+    build: .
+    init: true
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-mozizas.hu}
+      HOST_PASSWORD: ${HOST_PASSWORD:?Állítsd be a HOST_PASSWORD-öt a .env fájlban (sudo bash deploy/install.sh)}
+      TURN_SECRET: ${TURN_SECRET:?Hiányzik a TURN_SECRET a .env fájlból (sudo bash deploy/install.sh)}
+      TURN_PORT: "3478"
+      # csak a Caddy éri el, így a X-Forwarded-For fejléc megbízható
+      TRUST_PROXY: "1"
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:-mozizas.hu}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  # TURN relé azoknak, akik nem tudnak közvetlenül kapcsolódni (pl. mobilnet, szigorú NAT).
+  # Csak az app által kiadott, 24 óráig érvényes jelszavakkal használható.
+  turn:
+    image: coturn/coturn:4.18.0
+    restart: unless-stopped
+    network_mode: host
+    # közvetlenül a turnserver indul (a kép saját indítója shell-lel értelmezné az argumentumokat)
+    entrypoint: ["turnserver"]
+    command:
+      - -n
+      - --pidfile=/tmp/turnserver.pid
+      - --log-file=stdout
+      - --listening-port=3478
+      - --min-port=${TURN_MIN_PORT:-49160}
+      - --max-port=${TURN_MAX_PORT:-49200}
+      - --external-ip=${TURN_EXTERNAL_IP:?Hiányzik a TURN_EXTERNAL_IP a .env fájlból (sudo bash deploy/install.sh)}
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET:?Hiányzik a TURN_SECRET a .env fájlból (sudo bash deploy/install.sh)}
+      - --realm=${DOMAIN:-mozizas.hu}
+      - --fingerprint
+      - --no-tls
+      - --no-tcp-relay
+      - --no-multicast-peers
+      - --unauthorized-ratelimit
+      - --stale-nonce=600
+      - --user-quota=40
+      - --total-quota=400
+      # a relén át ne lehessen belső / foglalt címeket elérni
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=169.254.0.0-169.254.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.0.0.0-192.0.0.255
+      - --denied-peer-ip=192.0.2.0-192.0.2.255
+      - --denied-peer-ip=192.88.99.0-192.88.99.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=198.18.0.0-198.19.255.255
+      - --denied-peer-ip=198.51.100.0-198.51.100.255
+      - --denied-peer-ip=203.0.113.0-203.0.113.255
+      - --denied-peer-ip=240.0.0.0-255.255.255.255
+      - --denied-peer-ip=::1
+      - --denied-peer-ip=64:ff9b::-64:ff9b::ffff:ffff
+      - --denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255
+      - --denied-peer-ip=100::-100::ffff:ffff:ffff:ffff
+      - --denied-peer-ip=2001::-2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff
+      - --denied-peer-ip=2002::-2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+
+volumes:
+  caddy_data:
+  caddy_config:

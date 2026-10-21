@@ -1,0 +1,15 @@
+# Caddy: automatikus HTTPS (Let's Encrypt) a .env-ben megadott DOMAIN-re (alap: mozizas.hu).
+# A domain A rekordja közvetlenül a szerverre mutasson (Cloudflare esetén "DNS only" / szürke felhő).
+
+{$DOMAIN:mozizas.hu} {
+	encode zstd gzip
+	# Az oldal és a WebSocket (/ws) is a Node szerverhez megy
+	reverse_proxy app:8080 {
+		# konfiguráció-újratöltéskor ne szakadjanak meg azonnal a kapcsolatok
+		stream_close_delay 5m
+	}
+}
+
+www.{$DOMAIN:mozizas.hu} {
+	redir https://{$DOMAIN:mozizas.hu}{uri} permanent
+}

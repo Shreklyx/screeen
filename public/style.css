@@ -61,8 +61,7 @@ body {
 }
 .brand-icon { width: 28px; height: 28px; }
 .brand-icon rect { fill: var(--accent); }
-.brand-icon path { fill: #fff; }
-.brand-tld { color: var(--text-muted); font-weight: 600; }
+.brand-icon path { stroke: #fff; }
 .topbar-note {
   display: inline-flex;
   align-items: center;
@@ -118,6 +117,7 @@ select { cursor: pointer; }
 .hint { color: var(--text-muted); font-size: 13px; margin: 10px 0 0; }
 .hint.warn { color: var(--warn); }
 .hint.ok { color: var(--ok); }
+.hint.error { color: var(--danger); }
 
 /* ---------- Home ---------- */
 .hero { max-width: 780px; margin: 24px auto 36px; text-align: center; }
@@ -160,6 +160,18 @@ select { cursor: pointer; }
 }
 .card-icon svg { width: 22px; height: 22px; fill: none; stroke: var(--accent); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .join { display: flex; gap: 10px; margin-top: auto; }
+.share-form { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; margin-top: auto; }
+.share-form input[type="password"] { width: 100%; font-size: 16px; }
+.share-form .hint { margin: 0; }
+input[type="password"] {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  min-width: 0;
+}
 .join input { flex: 1; font-size: 16px; font-family: var(--mono); letter-spacing: 0.04em; }
 
 .features {
@@ -465,7 +477,7 @@ select { cursor: pointer; }
   .cards { grid-template-columns: minmax(0, 1fr); }
   .features { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .join { flex-direction: column; }
-  .card > .btn, .join .btn { width: 100%; }
+  .card > .btn, .join .btn, .share-form .btn { width: 100%; }
   .player { border-radius: 12px; max-height: none; }
   .volume, .latency, #viewerInfo { display: none; }
   .controls { opacity: 1; padding: 18px 10px 10px; gap: 8px; }

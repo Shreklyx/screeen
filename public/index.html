@@ -3,21 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Mozizás – 4K képernyőmegosztás hanggal</title>
+  <title>Screen Share – 4K képernyőmegosztás hanggal</title>
   <meta name="description" content="Képernyőmegosztás 4K-ban, 60 FPS-sel és rendszerhanggal, minimális késleltetéssel. Regisztráció és telepítés nélkül, közvetlenül a böngészőből.">
   <meta name="theme-color" content="#0b0b10">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d5e'/%3E%3Cpath d='M12.5 9.5v13l10-6.5z' fill='white'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d5e'/%3E%3Cpath d='M8 10.5h16v10H8zM13 24h6' fill='none' stroke='white' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
-  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js" integrity="sha384-x0YgkOr/3UOZP2CRDxGW9e0Q+2Qjyr3uJrm4xU32Y7ZCNAo7Cc7bjhrZMi/dwczu" crossorigin="anonymous" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="./" aria-label="Mozizás – főoldal">
-      <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M12.5 9.5v13l10-6.5z"/></svg>
-      <span>mozizás<span class="brand-tld">.hu</span></span>
+    <a class="brand" href="/" aria-label="Screen Share – főoldal">
+      <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M8 10.5h16v10H8zM13 24h6" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Screen Share</span>
     </a>
-    <span class="topbar-note"><span class="dot" aria-hidden="true"></span>Közvetlen P2P · végponttól titkosítva</span>
+    <span class="topbar-note"><span class="dot" aria-hidden="true"></span>Közvetlen P2P · titkosított kapcsolat</span>
   </header>
 
   <main>
@@ -25,7 +24,7 @@
     <section id="view-home" data-view class="home">
       <div class="hero">
         <h1>Képernyőmegosztás <em>4K-ban</em>, hanggal, késés nélkül.</h1>
-        <p class="lead">Nincs regisztráció, nincs telepítés. A kép és a hang közvetlenül a gépek között megy, titkosítva – nem egy szerveren keresztül.</p>
+        <p class="lead">Nincs regisztráció, nincs telepítés. A kép és a hang közvetlenül a gépek között megy, titkosítva. Nézni bárki tud a linkkel, megosztani a jelszóval lehet.</p>
       </div>
 
       <div class="cards">
@@ -35,7 +34,12 @@
             <h2>Megosztok</h2>
           </div>
           <p>Válaszd ki a képernyőt, kapsz egy linket – küldd el a többieknek.</p>
-          <button id="btnShare" class="btn btn-primary btn-lg" type="button">Képernyő megosztása</button>
+          <form id="shareForm" class="share-form">
+            <input id="hostPassword" type="password" autocomplete="current-password" placeholder="Megosztási jelszó" aria-label="Megosztási jelszó" required>
+            <label class="check"><input id="rememberPassword" type="checkbox" checked> Jelszó megjegyzése ezen a gépen</label>
+            <button id="btnShare" class="btn btn-primary btn-lg" type="submit">Képernyő megosztása</button>
+            <p id="shareError" class="hint error" role="alert" hidden></p>
+          </form>
           <p id="shareUnsupported" class="hint warn" hidden>Ez a böngésző nem tud képernyőt megosztani. Számítógépen használj Chrome-ot vagy Edge-et.</p>
         </article>
 
@@ -55,7 +59,7 @@
       <ul class="features">
         <li><strong>4K · 60 FPS</strong><span>Natív felbontás, akár 80 Mbit/s</span></li>
         <li><strong>Rendszerhang</strong><span>Sztereó, 510 kbit/s Opus</span></li>
-        <li><strong>Minimális késés</strong><span>WebRTC, közvetlen kapcsolat</span></li>
+        <li><strong>Minimális késés</strong><span>Közvetlen kapcsolat, saját relé szerver</span></li>
         <li><strong>Hardveres kódolás</strong><span>Automatikus kodekválasztás</span></li>
       </ul>
 

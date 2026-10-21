@@ -1,23 +1,13 @@
 'use strict';
 
 /* =====================================================================
- * mozizás – low-latency 4K screen sharing over WebRTC (PeerJS signaling)
+ * Screen Share – low-latency 4K screen sharing with system audio.
  *
- * Topology: the host keeps one RTCPeerConnection per viewer (P2P mesh).
- * Each viewer opens a PeerJS DataConnection to the host for control
- * messages; the host then places a PeerJS MediaConnection (the call) to
- * the viewer with the screen + system audio tracks.
+ * Signaling: a WebSocket to this site's own server (/ws). Media: WebRTC,
+ * directly between the browsers (or through the server's TURN relay when a
+ * direct path is impossible). The host keeps one RTCPeerConnection per
+ * viewer and always makes the offers; viewers only answer.
  * ===================================================================== */
-
-const CONFIG = {
-  idPrefix: 'mozizas-',
-  // Add your own TURN server here if some viewers can't connect directly.
-  iceServers: [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-    { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
-  ],
-};
 
 const RES_TARGETS = { native: null, 2160: [3840, 2160], 1440: [2560, 1440], 1080: [1920, 1080], 720: [1280, 720] };
 const CONTENT_HINT = { motion: 'motion', detail: 'detail', balanced: '' };
@@ -31,29 +21,39 @@ const OPUS_PARAMS = {
 const AUDIO_MAX_BPS = 510000;
 const START_KBPS_CAP = 12000;
 const DEFAULT_SETTINGS = { res: 'native', fps: 60, kbps: 30000, mode: 'motion', codec: 'auto', audio: true };
-const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
+
+const ERROR_TEXT = {
+  auth: 'Hibás jelszó.',
+  rate: 'Túl sok próbálkozás. Várj egy kicsit, és próbáld újra.',
+  full: 'A szerver vagy a szoba megtelt. Próbáld újra később.',
+  notfound: 'Ez a szoba nem létezik, vagy már bezárult.',
+  offline: 'Nem sikerült elérni a szervert.',
+  timeout: 'A szerver nem válaszolt időben.',
+};
+const errorText = (err) => ERROR_TEXT[err?.code] || err?.message || 'Ismeretlen hiba.';
+
+// Troubleshooting aid: ?relay=1 forces all media through the TURN relay.
+const FORCE_RELAY = new URLSearchParams(location.search).has('relay');
+const rtcConfig = (iceServers) => ({ iceServers, bundlePolicy: 'max-bundle', iceTransportPolicy: FORCE_RELAY ? 'relay' : 'all' });
 
 /* ---------------------------- helpers ---------------------------- */
 
 const $ = (sel) => document.querySelector(sel);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Storage can be missing or throw (private mode, blocked site data) – never let it break the page.
 const store = {
-  get(key, fallback, area = localStorage) {
-    try { const v = area.getItem(key); return v == null ? fallback : JSON.parse(v); } catch { return fallback; }
+  area(kind) { return kind === 'session' ? window.sessionStorage : window.localStorage; },
+  get(key, fallback, kind) {
+    try { const v = this.area(kind).getItem(key); return v == null ? fallback : JSON.parse(v); } catch { return fallback; }
   },
-  set(key, value, area = localStorage) {
-    try { area.setItem(key, JSON.stringify(value)); } catch { /* storage unavailable */ }
+  set(key, value, kind) {
+    try { this.area(kind).setItem(key, JSON.stringify(value)); } catch { /* storage unavailable */ }
   },
-  remove(key, area = localStorage) {
-    try { area.removeItem(key); } catch { /* storage unavailable */ }
+  remove(key, kind) {
+    try { this.area(kind).removeItem(key); } catch { /* storage unavailable */ }
   },
 };
-
-function randomCode(n = 6) {
-  const bytes = crypto.getRandomValues(new Uint8Array(n));
-  return Array.from(bytes, (b) => CODE_ALPHABET[b % CODE_ALPHABET.length]).join('');
-}
 
 function parseCode(input) {
   let s = String(input || '').trim();
@@ -61,6 +61,8 @@ function parseCode(input) {
   if (hash >= 0) s = s.slice(hash + 1);
   return s.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
+
+const randomId = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
 
 function showView(id) {
   for (const el of document.querySelectorAll('[data-view]')) el.hidden = el.id !== id;
@@ -82,49 +84,6 @@ function fmtKbps(kbps) {
 }
 const fmtMs = (ms) => (ms == null || !isFinite(ms) ? '–' : `${Math.round(ms)} ms`);
 
-function peerOptions() {
-  const opts = {
-    debug: 1,
-    config: { iceServers: CONFIG.iceServers, bundlePolicy: 'max-bundle', sdpSemantics: 'unified-plan' },
-  };
-  // Optional self-hosted PeerJS server: ?server=https://peer.example.com:443/
-  const server = new URLSearchParams(location.search).get('server');
-  if (server) {
-    try {
-      const u = new URL(server.includes('://') ? server : `https://${server}`);
-      opts.host = u.hostname;
-      opts.secure = u.protocol === 'https:' || u.protocol === 'wss:';
-      opts.port = Number(u.port) || (opts.secure ? 443 : 80);
-      opts.path = u.pathname || '/';
-    } catch {
-      console.warn('Invalid ?server= parameter, using the PeerJS cloud server.');
-    }
-  }
-  return opts;
-}
-
-function createPeer(id) {
-  return new Promise((resolve, reject) => {
-    const peer = new Peer(id, peerOptions());
-    const onError = (err) => { peer.destroy(); reject(err); };
-    peer.once('open', () => { peer.off('error', onError); resolve(peer); });
-    peer.once('error', onError);
-  });
-}
-
-function keepSignaling(peer, onStatus) {
-  let timer = null;
-  peer.on('disconnected', () => {
-    onStatus?.(false);
-    clearInterval(timer);
-    timer = setInterval(() => {
-      if (peer.destroyed || !peer.disconnected) { clearInterval(timer); return; }
-      try { peer.reconnect(); } catch { /* retry on next tick */ }
-    }, 3000);
-  });
-  peer.on('open', () => { clearInterval(timer); onStatus?.(true); });
-}
-
 let audioCtx = null;
 function ensureAudioCtx() {
   if (!audioCtx) {
@@ -136,14 +95,89 @@ function ensureAudioCtx() {
   return audioCtx;
 }
 
-// A silent placeholder keeps an audio transceiver in every call, so system
-// audio can later be swapped in with replaceTrack() without renegotiation.
-let silentTrack = null;
-function getSilentTrack() {
-  if (silentTrack && silentTrack.readyState === 'live') return silentTrack;
-  const ctx = ensureAudioCtx();
-  silentTrack = ctx ? ctx.createMediaStreamDestination().stream.getAudioTracks()[0] : null;
-  return silentTrack;
+/* --------------------------- signaling --------------------------- */
+
+/**
+ * WebSocket to /ws that reconnects by itself. `request()` sends a message and
+ * resolves with the first reply of the given types (or rejects on an error reply).
+ */
+function createSignal({ onMessage, onOpen, onClose }) {
+  let ws = null;
+  let closed = false;
+  let attempt = 0;
+  let timer = null;
+  const waiters = new Set();
+  const openWaiters = new Set();
+
+  function connect() {
+    const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+    ws = socket;
+    socket.onopen = () => {
+      attempt = 0;
+      for (const w of openWaiters) w();
+      openWaiters.clear();
+      onOpen?.();
+    };
+    socket.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      if (!msg || typeof msg !== 'object') return;
+      for (const w of waiters) {
+        if (w.match(msg)) { waiters.delete(w); w.settle(msg); return; }
+      }
+      onMessage(msg);
+    };
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      ws = null;
+      for (const w of waiters) w.fail(Object.assign(new Error('offline'), { code: 'offline' }));
+      waiters.clear();
+      if (closed) return;
+      onClose?.();
+      timer = setTimeout(connect, Math.min(10000, 500 * 2 ** attempt++));
+    };
+    socket.onerror = () => {};
+  }
+  connect();
+
+  const api = {
+    get open() { return ws?.readyState === WebSocket.OPEN; },
+    send(msg) {
+      if (ws?.readyState !== WebSocket.OPEN) return false;
+      ws.send(JSON.stringify(msg));
+      return true;
+    },
+    whenOpen(ms = 10000) {
+      if (api.open) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const done = () => { clearTimeout(t); resolve(); };
+        const t = setTimeout(() => { openWaiters.delete(done); reject(Object.assign(new Error('offline'), { code: 'offline' })); }, ms);
+        openWaiters.add(done);
+      });
+    },
+    request(msg, okTypes, ms = 10000) {
+      return new Promise((resolve, reject) => {
+        const w = {
+          match: (m) => okTypes.includes(m.t) || m.t === 'error',
+          settle: (m) => {
+            clearTimeout(w.timer);
+            if (m.t === 'error') reject(Object.assign(new Error(m.code), { code: m.code }));
+            else resolve(m);
+          },
+          fail: (err) => { clearTimeout(w.timer); reject(err); },
+        };
+        w.timer = setTimeout(() => { waiters.delete(w); reject(Object.assign(new Error('timeout'), { code: 'timeout' })); }, ms);
+        waiters.add(w);
+        if (!api.send(msg)) { waiters.delete(w); w.fail(Object.assign(new Error('offline'), { code: 'offline' })); }
+      });
+    },
+    close() {
+      closed = true;
+      clearTimeout(timer);
+      ws?.close();
+    },
+  };
+  return api;
 }
 
 /* --------------------------- codecs / SDP --------------------------- */
@@ -194,11 +228,10 @@ function mergeFmtp(line, params) {
 }
 
 /**
- * Tunes an SDP blob:
+ * Tunes the viewer's answer before the host applies it:
  *  - Opus: stereo, 510 kbit/s, no DTX, in-band FEC.
- *  - video: puts `preferCodec` first, and (in the viewer's answer) raises the
- *    start bitrate and lifts libwebrtc's 2.5 Mbit/s default ceiling; the real
- *    cap is applied with RTCRtpSender.setParameters() on the host.
+ *  - video: `preferCodec` first, high start bitrate, and libwebrtc's 2.5 Mbit/s
+ *    default ceiling lifted (the real cap is set with setParameters()).
  */
 function mungeSdp(sdp, { preferCodec, startKbps } = {}) {
   const sections = sdp.split(/\r\n(?=m=)/);
@@ -260,18 +293,22 @@ function isRelayed(report, pair) {
 
 const rate = (cur, prev, key) => (prev && cur[key] != null && prev[key] != null ? cur[key] - prev[key] : null);
 const kbpsBetween = (cur, prev, key) => {
-  const bytes = rate(cur, prev, key);
+  const bytes = cur ? rate(cur, prev, key) : null;
   const ms = cur && prev ? cur.timestamp - prev.timestamp : 0;
   return bytes != null && ms > 0 ? (bytes * 8) / ms : null;
 };
 
 /* ============================== HOST ============================== */
 
-const settings = { ...DEFAULT_SETTINGS, ...store.get('mozizas-settings', {}) };
+const settings = { ...DEFAULT_SETTINGS, ...store.get('ss-settings', {}) };
 
 const host = {
-  peer: null,
+  signal: null,
+  password: '',
   code: null,
+  token: null,
+  iceServers: [],
+  msid: null, // groups audio + video into one stream on the viewer side (lip sync)
   video: null,
   audio: null,
   viewers: new Map(),
@@ -281,6 +318,7 @@ const host = {
   meter: null,
   dims: '',
   previewOn: true,
+  active: false,
 };
 
 const isLive = () => Boolean(host.video && host.video.readyState === 'live');
@@ -312,69 +350,96 @@ async function captureScreen() {
   return { video: videoTrack, audio: audioTrack };
 }
 
-async function startHosting() {
-  if (!window.Peer) { toast('Nem sikerült betölteni a kapcsolódási modult. Frissítsd az oldalt.', 'error'); return; }
+function hostSignal() {
+  if (!host.signal) {
+    host.signal = createSignal({
+      onMessage: onHostMessage,
+      onOpen: () => { if (host.code) reclaimRoom(); },
+      onClose: () => { if (host.code) setSignalStatus('Megszakadt a kapcsolat a szerverrel, újracsatlakozás… (a nézők látnak tovább)', 'warn'); },
+    });
+  }
+  return host.signal;
+}
+
+async function openRoom(password) {
+  const signal = hostSignal();
+  await signal.whenOpen(8000);
+  const resume = store.get('ss-host-room', null, 'session');
+  const res = await signal.request({ t: 'host', password, resume: resume || undefined }, ['hosted']);
+  applyHosted(res);
+}
+
+// After a lost server connection: take the room back with its token (password as fallback).
+async function reclaimRoom() {
+  try {
+    const res = await host.signal.request({ t: 'host', password: host.password, resume: { code: host.code, token: host.token } }, ['hosted']);
+    const changed = res.code !== host.code;
+    applyHosted(res);
+    if (changed) toast('A korábbi szoba lejárt, új link készült – küldd el újra a nézőknek.', 'warn', 8000);
+  } catch (err) {
+    setSignalStatus(`Nem sikerült visszacsatlakozni a szobához: ${errorText(err)}`, 'warn');
+  }
+}
+
+function applyHosted(res) {
+  host.code = res.code;
+  host.token = res.token;
+  host.iceServers = res.iceServers || [];
+  store.set('ss-host-room', { code: res.code, token: res.token }, 'session');
+  const link = `${location.origin}${location.pathname}#${res.code}`;
+  $('#roomCode').textContent = res.code;
+  $('#roomLink').value = link;
+  $('#btnCopy').disabled = false;
+  setSignalStatus('Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.', 'ok');
+  host.signal.send({ t: 'state', live: isLive() });
+  for (const v of res.viewers || []) ensureViewer(v.id, v.caps);
+}
+
+async function startHosting(e) {
+  e?.preventDefault();
+  const password = $('#hostPassword').value;
+  const errorEl = $('#shareError');
+  errorEl.hidden = true;
   ensureAudioCtx(); // must happen inside the click gesture
   const encCaps = host.encCaps ? Promise.resolve(host.encCaps) : codecSupport('encode');
+  const capture = captureScreen(); // the screen picker needs the gesture: start it right away
+  const room = openRoom(password);
 
   let tracks;
   try {
-    tracks = await captureScreen();
+    tracks = await capture;
   } catch (err) {
-    if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') toast(`A megosztás nem indult el: ${err.message}`, 'error');
+    room.then(() => host.signal.send({ t: 'close' }), () => {});
+    if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') showShareError(`A megosztás nem indult el: ${err.message}`);
+    return;
+  }
+  try {
+    await room;
+  } catch (err) {
+    tracks.video.stop();
+    tracks.audio?.stop();
+    showShareError(errorText(err));
+    if (err.code === 'auth') { $('#hostPassword').select(); store.remove('ss-host-password'); }
     return;
   }
 
+  host.password = password;
+  if ($('#rememberPassword').checked) store.set('ss-host-password', password);
+  else store.remove('ss-host-password');
+
+  host.active = true;
   showView('view-host');
   window.addEventListener('beforeunload', confirmLeave);
   host.encCaps = await encCaps;
   updateCodecOptions();
   setHostTracks(tracks);
   if (!host.statsTimer) host.statsTimer = setInterval(hostStatsTick, 1000);
-
-  while (!host.peer) {
-    try {
-      await openHostPeer();
-    } catch (err) {
-      setSignalStatus(`Nem sikerült kapcsolódni a szerverhez (${err.type || err.message}). Újrapróbálom…`, 'warn');
-      await sleep(5000);
-    }
-  }
 }
 
-async function openHostPeer() {
-  let code = store.get('mozizas-room', null, sessionStorage) || randomCode();
-  for (let attempt = 0; ; attempt++) {
-    try {
-      host.peer = await createPeer(CONFIG.idPrefix + code);
-      break;
-    } catch (err) {
-      // After a page reload the old ID may still be held for a moment.
-      if (err.type !== 'unavailable-id' || attempt >= 3) throw err;
-      if (attempt >= 1) code = randomCode();
-      await sleep(1500);
-    }
-  }
-  host.code = code;
-  store.set('mozizas-room', code, sessionStorage);
-
-  const peer = host.peer;
-  peer.on('connection', onViewerConnection);
-  peer.on('call', (call) => call.close());
-  peer.on('error', (err) => {
-    if (err.type === 'peer-unavailable') return; // a viewer left before we called
-    console.warn('PeerJS:', err.type, err);
-  });
-  keepSignaling(peer, (online) => setSignalStatus(
-    online ? 'Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.' : 'Szerverkapcsolat megszakadt, újrapróbálom… (a már bent lévő nézők látnak tovább)',
-    online ? 'ok' : 'warn',
-  ));
-
-  const link = `${location.origin}${location.pathname}${location.search}#${code}`;
-  $('#roomCode').textContent = code;
-  $('#roomLink').value = link;
-  $('#btnCopy').disabled = false;
-  setSignalStatus('Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.', 'ok');
+function showShareError(text) {
+  const el = $('#shareError');
+  el.textContent = text;
+  el.hidden = false;
 }
 
 function setSignalStatus(text, kind = '') {
@@ -383,70 +448,195 @@ function setSignalStatus(text, kind = '') {
   el.className = `hint ${kind}`;
 }
 
-function onViewerConnection(conn) {
-  conn.on('open', () => {
-    const prev = host.viewers.get(conn.peer); // same viewer reconnecting
-    const v = { id: conn.peer, conn, call: null, n: prev?.n ?? ++host.seq, caps: conn.metadata?.caps ?? null, codec: null, prev: null, stats: null, lastCall: 0 };
-    host.viewers.set(conn.peer, v);
-    prev?.call?.close();
-    prev?.conn.close();
-    sendTo(v, { type: 'state', live: isLive() });
-    if (isLive()) callViewer(v);
-    viewersChanged();
-  });
-  conn.on('data', (msg) => {
-    const v = host.viewers.get(conn.peer);
-    if (!v || v.conn !== conn || !msg) return;
-    if (msg.type === 'bye') dropViewer(conn.peer, conn);
-    if (msg.type === 'recall' && isLive() && Date.now() - v.lastCall > 3000) callViewer(v);
-  });
-  conn.on('close', () => dropViewer(conn.peer, conn));
-  conn.on('error', () => dropViewer(conn.peer, conn));
+function onHostMessage(msg) {
+  switch (msg.t) {
+    case 'viewer': ensureViewer(msg.id, msg.caps); break;
+    case 'viewer-left': dropViewer(msg.id); break;
+    case 'signal': onViewerSignal(msg.from, msg.data); break;
+    case 'count': $('#viewerCount').textContent = String(msg.n); break;
+    case 'replaced':
+      host.code = null;
+      stopTracks();
+      for (const id of [...host.viewers.keys()]) dropViewer(id);
+      window.removeEventListener('beforeunload', confirmLeave);
+      toast('A szobát egy másik ablakban vetted át – itt leállt a megosztás.', 'warn', 8000);
+      setSignalStatus('A szobát egy másik ablak vette át.', 'warn');
+      break;
+    default: break;
+  }
 }
 
-function dropViewer(id, conn) {
-  const v = host.viewers.get(id);
-  if (!v || (conn && v.conn !== conn)) return;
-  host.viewers.delete(id);
-  v.call?.close();
-  v.conn.close();
-  viewersChanged();
+/* ---- one RTCPeerConnection per viewer ---- */
+
+function videoEncoding() {
+  return {
+    maxBitrate: settings.kbps * 1000,
+    maxFramerate: settings.fps,
+    scaleResolutionDownBy: scaleFor(host.video),
+    priority: 'high',
+    networkPriority: 'high',
+  };
 }
 
-function sendTo(v, msg) {
-  try { if (v.conn.open) v.conn.send(msg); } catch { /* channel closing */ }
-}
-function broadcast(msg) { for (const v of host.viewers.values()) sendTo(v, msg); }
-
-function viewersChanged() {
-  broadcast({ type: 'viewers', count: host.viewers.size });
+function ensureViewer(id, caps) {
+  let v = host.viewers.get(id);
+  if (v && v.pc && !['failed', 'closed'].includes(v.pc.connectionState)) return;
+  if (!v) {
+    v = { id, n: ++host.seq, caps: caps || null, pc: null, stats: null, prev: null };
+    host.viewers.set(id, v);
+  }
+  createViewerPc(v);
   renderViewers();
 }
 
-function callViewer(v) {
-  const old = v.call;
-  const codec = settings.codec === 'auto' ? pickCodec(host.encCaps, v.caps) : settings.codec;
-  const audio = host.audio || getSilentTrack();
-  const stream = new MediaStream(audio ? [host.video, audio] : [host.video]);
-  const call = host.peer.call(v.id, stream, {
-    metadata: { codec, startKbps: Math.min(settings.kbps, START_KBPS_CAP) },
-    sdpTransform: (sdp) => mungeSdp(sdp, { preferCodec: codec }),
-  });
-  if (!call) return;
-  v.call = call;
-  v.codec = codec;
-  v.prev = null;
-  v.lastCall = Date.now();
-  old?.close();
+function addSendTransceiver(pc, trackOrKind, encoding) {
+  const init = { direction: 'sendonly', streams: [host.msid] };
+  try {
+    return pc.addTransceiver(trackOrKind, { ...init, sendEncodings: [encoding] });
+  } catch {
+    return pc.addTransceiver(trackOrKind, init); // browsers that reject some encoding fields
+  }
+}
 
-  const pc = call.peerConnection;
-  pc.addEventListener('connectionstatechange', () => {
-    if (v.call !== call) return;
+function createViewerPc(v) {
+  closeViewerPc(v);
+  host.msid ||= new MediaStream();
+  v.session = randomId();
+  v.codec = settings.codec === 'auto' ? pickCodec(host.encCaps, v.caps) : settings.codec;
+  v.negotiating = false;
+  v.pendingNegotiation = false;
+  v.pendingRestart = false;
+  v.remoteCandidates = [];
+  v.restarts = 0;
+  v.prev = null;
+  v.stats = null;
+
+  const pc = new RTCPeerConnection(rtcConfig(host.iceServers));
+  v.pc = pc;
+  v.videoTx = addSendTransceiver(pc, host.video || 'video', videoEncoding());
+  v.audioTx = addSendTransceiver(pc, host.audio || 'audio', { maxBitrate: AUDIO_MAX_BPS, priority: 'high', networkPriority: 'high' });
+  applyCodecPreference(v);
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate && v.pc === pc) {
+      host.signal.send({ t: 'signal', to: v.id, data: { type: 'candidate', session: v.session, candidate: e.candidate.toJSON() } });
+    }
+  };
+  pc.onconnectionstatechange = () => onViewerPcState(v, pc);
+  negotiate(v);
+}
+
+function closeViewerPc(v) {
+  clearTimeout(v.answerTimer);
+  clearTimeout(v.discTimer);
+  if (v.pc) {
+    v.pc.onicecandidate = null;
+    v.pc.onconnectionstatechange = null;
+    v.pc.close();
+    v.pc = null;
+  }
+}
+
+function dropViewer(id) {
+  const v = host.viewers.get(id);
+  if (!v) return;
+  closeViewerPc(v);
+  host.viewers.delete(id);
+  renderViewers();
+}
+
+// Put the chosen codec first; the answer is reordered too (see mungeSdp), so
+// this is only a bonus where setCodecPreferences works for send-only transceivers.
+function applyCodecPreference(v) {
+  const tx = v.videoTx;
+  if (!tx?.setCodecPreferences) return;
+  const mime = `video/${v.codec}`.toLowerCase();
+  for (const Api of [window.RTCRtpReceiver, window.RTCRtpSender]) {
+    const codecs = Api?.getCapabilities?.('video')?.codecs;
+    if (!codecs?.some((c) => c.mimeType.toLowerCase() === mime)) continue;
+    const ordered = [...codecs.filter((c) => c.mimeType.toLowerCase() === mime), ...codecs.filter((c) => c.mimeType.toLowerCase() !== mime)];
+    try { tx.setCodecPreferences(ordered); return; } catch { /* try the other capability list */ }
+  }
+}
+
+async function negotiate(v, { iceRestart = false } = {}) {
+  const pc = v.pc;
+  if (!pc) return;
+  if (v.negotiating) {
+    v.pendingNegotiation = true;
+    v.pendingRestart ||= iceRestart;
+    return;
+  }
+  v.negotiating = true;
+  try {
+    const offer = await pc.createOffer({ iceRestart });
+    if (v.pc !== pc) return;
+    await pc.setLocalDescription(offer);
+    host.signal.send({ t: 'signal', to: v.id, data: { type: 'offer', session: v.session, sdp: pc.localDescription.sdp } });
+    clearTimeout(v.answerTimer);
+    // No answer (lost message, viewer stuck): start over with a fresh connection.
+    v.answerTimer = setTimeout(() => {
+      if (v.pc === pc && pc.signalingState === 'have-local-offer' && host.viewers.get(v.id) === v) createViewerPc(v);
+    }, 15000);
+  } catch (err) {
+    console.warn('offer failed', err);
+    v.negotiating = false;
+  }
+}
+
+async function onViewerSignal(id, data) {
+  const v = host.viewers.get(id);
+  if (!v || !v.pc || !data || typeof data !== 'object') return;
+  if (data.type === 'recall') {
+    createViewerPc(v);
+    return;
+  }
+  if (data.session !== v.session) return;
+  const pc = v.pc;
+  if (data.type === 'answer' && typeof data.sdp === 'string') {
+    if (pc.signalingState !== 'have-local-offer') return;
+    clearTimeout(v.answerTimer);
+    try {
+      await pc.setRemoteDescription({ type: 'answer', sdp: mungeSdp(data.sdp, { preferCodec: v.codec, startKbps: Math.min(settings.kbps, START_KBPS_CAP) }) });
+    } catch (err) {
+      console.warn('answer rejected', err);
+      if (v.pc === pc) createViewerPc(v);
+      return;
+    }
+    if (v.pc !== pc) return;
+    for (const c of v.remoteCandidates.splice(0)) pc.addIceCandidate(c).catch(() => {});
+    v.negotiating = false;
     if (pc.connectionState === 'connected') applySenderParams(v);
-    renderViewers();
-  });
-  call.on('close', () => { if (v.call === call) { v.call = null; renderViewers(); } });
-  call.on('error', (err) => console.warn('call error', err));
+    if (v.pendingNegotiation) {
+      const iceRestart = v.pendingRestart;
+      v.pendingNegotiation = false;
+      v.pendingRestart = false;
+      negotiate(v, { iceRestart });
+    }
+  } else if (data.type === 'candidate' && data.candidate) {
+    if (pc.remoteDescription) pc.addIceCandidate(data.candidate).catch(() => {});
+    else v.remoteCandidates.push(data.candidate);
+  }
+}
+
+function onViewerPcState(v, pc) {
+  if (v.pc !== pc) return;
+  const state = pc.connectionState;
+  clearTimeout(v.discTimer);
+  if (state === 'connected') {
+    v.restarts = 0;
+    applySenderParams(v);
+  } else if (state === 'disconnected') {
+    v.discTimer = setTimeout(() => { if (v.pc === pc && pc.connectionState === 'disconnected') restartIce(v); }, 4000);
+  } else if (state === 'failed') {
+    restartIce(v);
+  }
+  renderViewers();
+}
+
+function restartIce(v) {
+  if (v.restarts++ >= 2) createViewerPc(v);
+  else negotiate(v, { iceRestart: true });
 }
 
 function scaleFor(track) {
@@ -458,24 +648,19 @@ function scaleFor(track) {
 }
 
 async function applySenderParams(v) {
-  const pc = v.call?.peerConnection;
-  if (!pc) return;
-  for (const t of pc.getTransceivers()) {
-    const kind = t.receiver.track?.kind;
-    const sender = t.sender;
+  if (!v.pc) return;
+  for (const [tx, kind] of [[v.videoTx, 'video'], [v.audioTx, 'audio']]) {
+    const sender = tx?.sender;
+    if (!sender) continue;
     const p = sender.getParameters();
     if (!p.encodings?.length) continue; // not negotiated yet
     const enc = p.encodings[0];
     if (kind === 'video') {
-      enc.maxBitrate = settings.kbps * 1000;
-      enc.maxFramerate = settings.fps;
-      enc.scaleResolutionDownBy = scaleFor(host.video);
+      Object.assign(enc, videoEncoding());
       p.degradationPreference = DEGRADATION[settings.mode];
     } else {
-      enc.maxBitrate = AUDIO_MAX_BPS;
+      Object.assign(enc, { maxBitrate: AUDIO_MAX_BPS, priority: 'high', networkPriority: 'high' });
     }
-    enc.priority = 'high';
-    enc.networkPriority = 'high';
     try {
       await sender.setParameters(p);
     } catch {
@@ -491,6 +676,8 @@ function applyAllSenders() {
   for (const v of host.viewers.values()) applySenderParams(v);
 }
 
+/* ---- capture lifecycle ---- */
+
 function setHostTracks({ video, audio }) {
   const old = [host.video, host.audio];
   host.video = video;
@@ -498,17 +685,10 @@ function setHostTracks({ video, audio }) {
   video.addEventListener('ended', () => { if (host.video === video) pauseSharing(); });
 
   for (const v of host.viewers.values()) {
-    const pc = v.call?.peerConnection;
-    if (pc && pc.connectionState !== 'closed' && pc.connectionState !== 'failed') {
-      for (const t of pc.getTransceivers()) {
-        const kind = t.receiver.track?.kind;
-        const track = kind === 'video' ? video : (audio || getSilentTrack());
-        t.sender.replaceTrack(track).catch((err) => console.warn('replaceTrack failed', err));
-      }
-      applySenderParams(v);
-    } else {
-      callViewer(v);
-    }
+    if (!v.pc) continue;
+    v.videoTx?.sender.replaceTrack(video).catch((err) => console.warn('replaceTrack failed', err));
+    v.audioTx?.sender.replaceTrack(audio).catch((err) => console.warn('replaceTrack failed', err));
+    applySenderParams(v);
   }
   for (const t of old) if (t && t !== video && t !== audio) t.stop();
 
@@ -518,17 +698,26 @@ function setHostTracks({ video, audio }) {
   $('#liveBadge').classList.remove('off');
   $('#liveBadge').textContent = 'ÉLŐ';
   $('#btnStop').hidden = false;
-  broadcast({ type: 'state', live: true });
+  host.signal?.send({ t: 'state', live: true });
   startMeter(audio);
   updateCaptureInfo();
+  renderViewers();
 }
 
-function pauseSharing() {
+function stopTracks() {
   host.video?.stop();
   host.audio?.stop();
   host.video = null;
   host.audio = null;
   stopMeter();
+}
+
+function pauseSharing() {
+  stopTracks();
+  for (const v of host.viewers.values()) {
+    v.videoTx?.sender.replaceTrack(null).catch(() => {});
+    v.audioTx?.sender.replaceTrack(null).catch(() => {});
+  }
   $('#preview').srcObject = null;
   $('#previewPaused').hidden = false;
   $('#liveBadge').classList.add('off');
@@ -536,7 +725,8 @@ function pauseSharing() {
   $('#btnStop').hidden = true;
   $('#captureInfo').textContent = '';
   $('#audioStatus').textContent = '';
-  broadcast({ type: 'state', live: false });
+  host.signal?.send({ t: 'state', live: false });
+  renderViewers();
 }
 
 async function switchSource() {
@@ -550,15 +740,12 @@ async function switchSource() {
 
 function closeRoom() {
   if (host.viewers.size && !confirm('Biztosan bezárod a szobát? Minden néző kilép.')) return;
-  broadcast({ type: 'closed' });
+  host.signal?.send({ t: 'close' });
   window.removeEventListener('beforeunload', confirmLeave);
-  store.remove('mozizas-room', sessionStorage);
-  setTimeout(() => {
-    host.video?.stop();
-    host.audio?.stop();
-    host.peer?.destroy();
-    location.href = location.pathname + location.search;
-  }, 300);
+  store.remove('ss-host-room', 'session');
+  stopTracks();
+  for (const id of [...host.viewers.keys()]) dropViewer(id);
+  setTimeout(() => { location.href = location.pathname; }, 200);
 }
 
 function confirmLeave(e) {
@@ -576,7 +763,9 @@ function updateCaptureInfo() {
   $('#captureInfo').textContent = w && h ? `${w}×${h} · ${fps} FPS` : '';
 
   const el = $('#audioStatus');
-  if (host.audio) {
+  if (!host.video) {
+    el.textContent = '';
+  } else if (host.audio) {
     el.textContent = 'Hang megosztva (sztereó). A csík mutatja, hogy jön-e hang.';
     el.className = 'hint ok';
   } else if (!settings.audio) {
@@ -622,13 +811,18 @@ function stopMeter() {
 
 function updateSetting(key, value) {
   settings[key] = value;
-  store.set('mozizas-settings', settings);
+  store.set('ss-settings', settings);
   if (key === 'fps' && isLive()) {
     host.video.applyConstraints({ frameRate: { ideal: value, max: value } }).catch(() => {});
   }
   if (key === 'mode' && host.video) host.video.contentHint = CONTENT_HINT[value];
   if (key === 'codec') {
-    if (isLive()) for (const v of host.viewers.values()) callViewer(v);
+    for (const v of host.viewers.values()) {
+      if (!v.pc) continue;
+      v.codec = value === 'auto' ? pickCodec(host.encCaps, v.caps) : value;
+      applyCodecPreference(v);
+      negotiate(v);
+    }
     renderViewers();
     return;
   }
@@ -650,7 +844,8 @@ function updateCodecOptions() {
 }
 
 async function hostStatsTick() {
-  const dims = (() => { const s = host.video?.getSettings?.() || {}; return `${s.width}x${s.height}`; })();
+  const s = host.video?.getSettings?.() || {};
+  const dims = `${s.width}x${s.height}`;
   if (isLive() && dims !== host.dims) {
     host.dims = dims;
     applyAllSenders();
@@ -658,15 +853,15 @@ async function hostStatsTick() {
   }
 
   for (const v of host.viewers.values()) {
-    const pc = v.call?.peerConnection;
+    const pc = v.pc;
     if (!pc || pc.connectionState !== 'connected') { v.stats = null; continue; }
     let report;
     try { report = await pc.getStats(); } catch { continue; }
     let out = null;
     let remoteIn = null;
-    report.forEach((s) => {
-      if (s.type === 'outbound-rtp' && s.kind === 'video') out = s;
-      if (s.type === 'remote-inbound-rtp' && s.kind === 'video') remoteIn = s;
+    report.forEach((x) => {
+      if (x.type === 'outbound-rtp' && x.kind === 'video') out = x;
+      if (x.type === 'remote-inbound-rtp' && x.kind === 'video') remoteIn = x;
     });
     if (!out) continue;
     const pair = selectedPair(report);
@@ -691,7 +886,6 @@ async function hostStatsTick() {
 const LIMIT_LABEL = { cpu: 'CPU', bandwidth: 'sávszélesség', other: 'egyéb' };
 
 function renderViewers() {
-  const list = $('#viewerList');
   const rows = [];
   for (const v of host.viewers.values()) {
     const li = document.createElement('li');
@@ -700,9 +894,9 @@ function renderViewers() {
     const name = document.createElement('span');
     name.textContent = `Néző #${v.n}`;
     const state = document.createElement('span');
-    const cs = v.call?.peerConnection?.connectionState;
+    const cs = v.pc?.connectionState;
     if (!isLive()) { state.textContent = 'vár (szünet)'; state.className = 'viewer-state'; }
-    else if (cs === 'connected') { state.textContent = v.stats?.relay ? 'kapcsolódva · TURN' : 'kapcsolódva · közvetlen'; state.className = 'viewer-state ok'; }
+    else if (cs === 'connected') { state.textContent = v.stats?.relay ? 'kapcsolódva · TURN relé' : 'kapcsolódva · közvetlen'; state.className = 'viewer-state ok'; }
     else if (cs === 'failed' || cs === 'disconnected') { state.textContent = 'kapcsolat gond…'; state.className = 'viewer-state warn'; }
     else { state.textContent = 'kapcsolódik…'; state.className = 'viewer-state'; }
     head.append(name, state);
@@ -730,7 +924,7 @@ function renderViewers() {
     }
     rows.push(li);
   }
-  list.replaceChildren(...rows);
+  $('#viewerList').replaceChildren(...rows);
   $('#viewerCount').textContent = String(host.viewers.size);
   $('#noViewers').hidden = host.viewers.size > 0;
 }
@@ -768,7 +962,10 @@ function initHostUi() {
   audio.checked = settings.audio;
   audio.addEventListener('change', () => updateSetting('audio', audio.checked));
 
-  $('#btnShare').addEventListener('click', startHosting);
+  const saved = store.get('ss-host-password', '');
+  if (saved) $('#hostPassword').value = saved;
+
+  $('#shareForm').addEventListener('submit', startHosting);
   $('#btnSwitch').addEventListener('click', switchSource);
   $('#btnResume').addEventListener('click', switchSource);
   $('#btnStop').addEventListener('click', pauseSharing);
@@ -777,7 +974,7 @@ function initHostUi() {
   $('#btnCopy').addEventListener('click', copyLink);
   $('#roomLink').addEventListener('focus', (e) => e.target.select());
 
-  if (!navigator.mediaDevices?.getDisplayMedia) {
+  if (!navigator.mediaDevices?.getDisplayMedia || !window.RTCPeerConnection) {
     $('#btnShare').disabled = true;
     $('#shareUnsupported').hidden = false;
   }
@@ -786,20 +983,23 @@ function initHostUi() {
 /* ============================= VIEWER ============================= */
 
 const viewer = {
-  peer: null,
+  signal: null,
   code: null,
-  hostId: null,
-  conn: null,
-  call: null,
+  id: null,
+  iceServers: [],
   caps: null,
+  pc: null,
+  session: null,
+  pendingCandidates: [],
+  chain: Promise.resolve(),
   closed: false,
   live: false,
-  attempts: 0,
   retryTimer: null,
+  failTimer: null,
   prev: null,
   prevAudio: null,
   statsTimer: null,
-  bufferMs: store.get('mozizas-buffer', 0),
+  bufferMs: store.get('ss-buffer', 0),
   muted: false,
   wakeLock: null,
   idleTimer: null,
@@ -810,106 +1010,145 @@ const video = () => $('#remoteVideo');
 async function startViewing(code) {
   showView('view-viewer');
   $('#viewerRoom').textContent = code;
-  if (!window.Peer) { setOverlay('Nem sikerült betölteni a kapcsolódási modult. Frissítsd az oldalt.', { spinner: false, actions: [reloadAction()] }); return; }
   if (location.hash.slice(1) !== code) history.replaceState(null, '', `#${code}`);
-  viewer.code = code;
-  viewer.hostId = CONFIG.idPrefix + code;
-  setOverlay('Csatlakozás a szobához…');
-
-  viewer.caps = await Promise.race([codecSupport('decode'), sleep(1500).then(() => null)]);
-  try {
-    viewer.peer = await createPeer(`${CONFIG.idPrefix}v-${randomCode(10)}`);
-  } catch (err) {
-    setOverlay(`Nem sikerült kapcsolódni a szerverhez (${err.type || err.message}).`, { spinner: false, actions: [reloadAction()] });
+  if (!window.RTCPeerConnection) {
+    setOverlay('Ez a böngésző nem támogatja a WebRTC-t. Használj friss Chrome-ot, Edge-et, Firefoxot vagy Safarit.', { spinner: false });
     return;
   }
-  viewer.peer.on('call', onHostCall);
-  viewer.peer.on('error', onViewerPeerError);
-  keepSignaling(viewer.peer);
-  window.addEventListener('pagehide', () => {
-    try { if (viewer.conn?.open) viewer.conn.send({ type: 'bye' }); } catch { /* closing */ }
+  viewer.code = code;
+  setOverlay('Csatlakozás a szobához…');
+  viewer.caps = await Promise.race([codecSupport('decode'), sleep(1500).then(() => null)]);
+  viewer.signal = createSignal({
+    onMessage: onViewerMessage,
+    onOpen: joinRoom,
+    onClose: () => {
+      if (!viewer.closed && !hasPicture()) setOverlay('Megszakadt a kapcsolat a szerverrel, újracsatlakozás…');
+    },
   });
   viewer.statsTimer = setInterval(viewerStatsTick, 1000);
-  connectToHost();
+  window.addEventListener('pagehide', () => viewer.signal?.send({ t: 'leave' }));
 }
 
-function connectToHost() {
+async function joinRoom() {
   clearTimeout(viewer.retryTimer);
-  if (viewer.closed || !viewer.peer || viewer.peer.destroyed) return;
-  const old = viewer.conn;
-  viewer.conn = null; // detach first so the old connection's 'close' is ignored
-  old?.close();
-  const conn = viewer.peer.connect(viewer.hostId, { reliable: true, serialization: 'json', metadata: { caps: viewer.caps } });
-  viewer.conn = conn;
-  let opened = false;
-  const openTimeout = setTimeout(() => { if (viewer.conn === conn && !opened) scheduleReconnect(); }, 15000);
-  const onGone = () => {
-    clearTimeout(openTimeout);
-    if (viewer.conn !== conn) return;
-    if (opened) hostLost(); else scheduleReconnect();
-  };
-  conn.on('open', () => {
-    clearTimeout(openTimeout);
-    if (viewer.conn !== conn) return;
-    opened = true;
-    viewer.attempts = 0;
-    if (!viewer.call) setOverlay('Csatlakozva. Várakozás a képre…');
-  });
-  conn.on('data', onHostMessage);
-  conn.on('close', onGone);
-  conn.on('error', onGone);
-}
-
-function scheduleReconnect() {
   if (viewer.closed) return;
-  clearTimeout(viewer.retryTimer);
-  const delay = Math.min(10000, 2000 + viewer.attempts * 1000);
-  viewer.attempts++;
-  viewer.retryTimer = setTimeout(connectToHost, delay);
-}
-
-function hostLost() {
-  if (viewer.closed) return;
-  viewer.call?.close();
-  viewer.call = null;
-  setLive(false);
-  setOverlay('A kapcsolat megszakadt. Újracsatlakozás…');
-  scheduleReconnect();
-}
-
-function onViewerPeerError(err) {
-  if (err.type === 'peer-unavailable') {
-    if (viewer.closed) return;
-    setOverlay('A szoba nem található, vagy a megosztó még nem indította el. Folyamatosan újrapróbálom…', {
-      actions: [{ label: 'Vissza a főoldalra', onClick: goHome }],
-    });
-    scheduleReconnect();
-    return;
+  try {
+    const res = await viewer.signal.request({ t: 'join', code: viewer.code, caps: viewer.caps }, ['joined']);
+    viewer.id = res.id;
+    viewer.iceServers = res.iceServers || [];
+    viewer.live = Boolean(res.live);
+    if (!res.hostPresent) setOverlay('A megosztó épp nincs bent. Várakozás…');
+    else if (!viewer.live) setOverlay('A megosztás szünetel. Amint folytatódik, itt lesz a kép.');
+    else if (!hasPicture()) setOverlay('Csatlakozva. Kép betöltése…');
+  } catch (err) {
+    if (err.code === 'offline') return; // reconnect will call joinRoom again
+    const delay = err.code === 'rate' ? 30000 : 5000;
+    setOverlay(`${errorText(err)} Újrapróbálom…`, { actions: [{ label: 'Vissza a főoldalra', onClick: goHome }] });
+    viewer.retryTimer = setTimeout(joinRoom, delay);
   }
-  console.warn('PeerJS:', err.type, err);
 }
 
-function onHostCall(call) {
-  if (call.peer !== viewer.hostId) { call.close(); return; }
-  const old = viewer.call;
-  viewer.call = call;
+function onViewerMessage(msg) {
+  switch (msg.t) {
+    case 'signal':
+      if (msg.from === 'host' && msg.data && typeof msg.data === 'object') {
+        viewer.chain = viewer.chain.then(() => onHostSignal(msg.data)).catch((err) => console.warn('signal handling failed', err));
+      }
+      break;
+    case 'state':
+    case 'host-back':
+      viewer.live = Boolean(msg.live);
+      if (!viewer.live) setOverlay('A megosztás szünetel. Amint folytatódik, itt lesz a kép.');
+      else if (hasPicture()) { hideOverlay(); setLive(true); }
+      else setOverlay('Kép betöltése…');
+      if (!viewer.live) setLive(false);
+      break;
+    case 'host-away':
+      // Media may still flow peer-to-peer; only cover the picture if it stopped.
+      if (!hasPicture() || viewer.pc?.connectionState !== 'connected') setOverlay('A megosztó kapcsolata megszakadt. Várakozás…');
+      break;
+    case 'count':
+      $('#viewerCountText').textContent = `${msg.n} néző`;
+      break;
+    case 'closed':
+      viewer.closed = true;
+      clearTimeout(viewer.retryTimer);
+      closeViewerConnection();
+      setLive(false);
+      setOverlay(msg.reason === 'timeout' ? 'A megosztó nem tért vissza, a szoba bezárult.' : 'A megosztó befejezte a megosztást. Köszi, hogy néztél!', {
+        spinner: false,
+        actions: [{ label: 'Vissza a főoldalra', onClick: goHome, primary: true }],
+      });
+      viewer.signal?.close();
+      break;
+    default: break;
+  }
+}
+
+function sendToHost(data) {
+  viewer.signal?.send({ t: 'signal', to: 'host', data: { ...data, session: viewer.session } });
+}
+
+function newViewerPc(session) {
+  closeViewerConnection();
+  viewer.session = session;
+  viewer.pendingCandidates = [];
   viewer.prev = null;
   viewer.prevAudio = null;
-  old?.close();
-
-  const meta = call.metadata || {};
-  call.answer(undefined, { sdpTransform: (sdp) => mungeSdp(sdp, { preferCodec: meta.codec, startKbps: meta.startKbps }) });
-  const pc = call.peerConnection;
-  pc.addEventListener('track', (e) => tuneReceiver(e.receiver));
-  pc.addEventListener('connectionstatechange', () => {
-    if (viewer.call !== call) return;
+  const pc = new RTCPeerConnection(rtcConfig(viewer.iceServers));
+  viewer.pc = pc;
+  pc.ontrack = (e) => {
+    if (viewer.pc !== pc) return;
+    tuneReceiver(e.receiver);
+    const stream = e.streams[0] || (viewer.fallbackStream ||= new MediaStream());
+    if (!e.streams[0]) stream.addTrack(e.track);
+    attachStream(stream);
+  };
+  pc.onicecandidate = (e) => {
+    if (e.candidate && viewer.pc === pc) sendToHost({ type: 'candidate', candidate: e.candidate.toJSON() });
+  };
+  pc.onconnectionstatechange = () => {
+    if (viewer.pc !== pc) return;
+    clearTimeout(viewer.failTimer);
     if (pc.connectionState === 'failed') {
       setOverlay('A videókapcsolat megszakadt. Újrapróbálom…');
-      try { if (viewer.conn?.open) viewer.conn.send({ type: 'recall' }); } catch { /* closing */ }
+      // The host restarts ICE on its own; ask for a brand new connection if that does not help.
+      viewer.failTimer = setTimeout(() => {
+        if (viewer.pc === pc && pc.connectionState === 'failed') sendToHost({ type: 'recall' });
+      }, 8000);
+    } else if (pc.connectionState === 'connected' && viewer.live && hasPicture()) {
+      hideOverlay();
     }
-  });
-  call.on('stream', (stream) => { if (viewer.call === call) attachStream(stream); });
-  call.on('close', () => { if (viewer.call === call) viewer.call = null; });
+  };
+  return pc;
+}
+
+function closeViewerConnection() {
+  clearTimeout(viewer.failTimer);
+  if (viewer.pc) {
+    viewer.pc.ontrack = null;
+    viewer.pc.onicecandidate = null;
+    viewer.pc.onconnectionstatechange = null;
+    viewer.pc.close();
+    viewer.pc = null;
+  }
+  viewer.fallbackStream = null;
+}
+
+async function onHostSignal(data) {
+  if (data.type === 'offer' && typeof data.sdp === 'string') {
+    if (!viewer.pc || viewer.session !== data.session || viewer.pc.signalingState === 'closed') newViewerPc(data.session);
+    const pc = viewer.pc;
+    await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+    for (const c of viewer.pendingCandidates.splice(0)) await pc.addIceCandidate(c).catch(() => {});
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    if (viewer.pc === pc) sendToHost({ type: 'answer', sdp: pc.localDescription.sdp });
+  } else if (data.type === 'candidate' && data.candidate) {
+    if (data.session !== viewer.session || !viewer.pc) return;
+    if (viewer.pc.remoteDescription) await viewer.pc.addIceCandidate(data.candidate).catch(() => {});
+    else viewer.pendingCandidates.push(data.candidate);
+  }
 }
 
 function tuneReceiver(receiver) {
@@ -922,7 +1161,7 @@ function tuneReceiver(receiver) {
 async function attachStream(stream) {
   const el = video();
   if (el.srcObject !== stream) el.srcObject = stream;
-  for (const r of viewer.call?.peerConnection?.getReceivers() || []) tuneReceiver(r);
+  for (const r of viewer.pc?.getReceivers() || []) tuneReceiver(r);
   await playVideo();
 }
 
@@ -939,26 +1178,6 @@ async function playVideo() {
     if (!viewer.muted) $('#btnUnmute').hidden = false;
   }
   syncMuteUi();
-}
-
-function onHostMessage(msg) {
-  if (!msg || typeof msg !== 'object') return;
-  if (msg.type === 'state') {
-    viewer.live = Boolean(msg.live);
-    if (!viewer.live) setOverlay('A megosztás szünetel. Amint folytatódik, itt lesz a kép.');
-    else if (hasPicture()) hideOverlay();
-    else setOverlay('Kép betöltése…');
-    setLive(viewer.live && hasPicture());
-  } else if (msg.type === 'viewers') {
-    $('#viewerCountText').textContent = `${msg.count} néző`;
-  } else if (msg.type === 'closed') {
-    viewer.closed = true;
-    clearTimeout(viewer.retryTimer);
-    viewer.call?.close();
-    setLive(false);
-    setOverlay('A megosztó bezárta a szobát. Köszi, hogy néztél!', { spinner: false, actions: [{ label: 'Vissza a főoldalra', onClick: goHome, primary: true }] });
-    setTimeout(() => viewer.peer?.destroy(), 500);
-  }
 }
 
 const hasPicture = () => video().readyState >= 2 && video().videoWidth > 0;
@@ -979,8 +1198,7 @@ function setOverlay(text, { spinner = true, actions = [] } = {}) {
   $('#overlay').hidden = false;
   $('#spinner').hidden = !spinner;
   $('#overlayText').textContent = text;
-  const box = $('#overlayActions');
-  box.replaceChildren(...actions.map((a) => {
+  $('#overlayActions').replaceChildren(...actions.map((a) => {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = `btn ${a.primary ? 'btn-primary' : ''}`;
@@ -992,8 +1210,7 @@ function setOverlay(text, { spinner = true, actions = [] } = {}) {
 }
 
 function hideOverlay() { $('#overlay').hidden = true; }
-const reloadAction = () => ({ label: 'Újrapróbálás', onClick: () => location.reload(), primary: true });
-function goHome() { location.href = location.pathname + location.search; }
+function goHome() { location.href = location.pathname; }
 
 async function requestWakeLock() {
   try {
@@ -1005,7 +1222,7 @@ async function requestWakeLock() {
 }
 
 async function viewerStatsTick() {
-  const pc = viewer.call?.peerConnection;
+  const pc = viewer.pc;
   if (!pc || pc.connectionState === 'closed') { $('#viewerInfo').textContent = ''; return; }
   let report;
   try { report = await pc.getStats(); } catch { return; }
@@ -1053,8 +1270,8 @@ async function viewerStatsTick() {
     ['Dekódolás', decode != null ? `${nf1.format(decode)} ms` : '–'],
     ['Csomagvesztés', `${nf1.format(loss)} %`, loss > 2],
     ['Eldobott képk.', String(v.framesDropped ?? 0)],
-    ['Kapcsolat', relay == null ? '–' : relay ? 'TURN relé' : 'Közvetlen P2P', relay === true],
-    ['Hang', a ? fmtKbps(audioKbps) : 'nincs'],
+    ['Kapcsolat', relay == null ? '–' : relay ? 'TURN relé' : 'Közvetlen P2P'],
+    ['Hang', a && audioKbps ? fmtKbps(audioKbps) : 'nincs'],
   ];
   const dl = document.createElement('dl');
   for (const [k, val, warn] of rows) {
@@ -1127,12 +1344,12 @@ function initViewerUi() {
   player.addEventListener('pointerdown', showControls);
 
   const vol = $('#volume');
-  vol.value = String(store.get('mozizas-volume', 1));
+  vol.value = String(store.get('ss-volume', 1));
   el.volume = Number(vol.value);
   vol.addEventListener('input', () => {
     el.volume = Number(vol.value);
     el.muted = viewer.muted = el.volume === 0;
-    store.set('mozizas-volume', el.volume);
+    store.set('ss-volume', el.volume);
     if (!el.muted) $('#btnUnmute').hidden = true;
   });
 
@@ -1141,8 +1358,8 @@ function initViewerUi() {
   if (lat.value !== String(viewer.bufferMs)) { viewer.bufferMs = 0; lat.value = '0'; }
   lat.addEventListener('change', () => {
     viewer.bufferMs = Number(lat.value);
-    store.set('mozizas-buffer', viewer.bufferMs);
-    for (const r of viewer.call?.peerConnection?.getReceivers() || []) tuneReceiver(r);
+    store.set('ss-buffer', viewer.bufferMs);
+    for (const r of viewer.pc?.getReceivers() || []) tuneReceiver(r);
   });
 
   $('#btnMute').addEventListener('click', toggleMute);
@@ -1183,7 +1400,7 @@ function init() {
     startViewing(code);
   });
 
-  window.addEventListener('hashchange', () => location.reload());
+  window.addEventListener('hashchange', () => { if (!host.active) location.reload(); });
 
   const code = parseCode(location.hash);
   if (code) startViewing(code);
