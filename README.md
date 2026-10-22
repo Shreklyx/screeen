@@ -6,13 +6,18 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
 - **WebRTC, közvetlen kapcsolat** – a kép és a hang közvetlenül a gépek között megy, titkosítva (DTLS-SRTP).
   A szerver csak a kapcsolat felépítését intézi, illetve **TURN relével** segít, ha a két gép nem éri el egymást
   közvetlenül (pl. mobilnet, szigorú NAT).
-- **Natív felbontás, akár 4K 60 FPS**, állítható max. bitráta (6–80 Mbit/s). A WebRTC alapértelmezett 2,5 Mbit/s-os
-  plafonja fel van oldva, és a kapcsolat rögtön magas bitrátáról indul.
-- **Hardveres kódolás**: automatikusan azt a kodeket választja (AV1 / VP9 / H.264 / VP8), amelyikhez a megosztó *és* a
-  néző gépén is van hardveres gyorsítás.
-- **Rendszerhang**: Opus, sztereó, 510 kbit/s, zajszűrés / visszhangszűrés / hangerő-szabályzás nélkül (filmhez, zenéhez).
-- **Alacsony késleltetés**: minimális jitter puffer a nézőnél (rossz hálózaton „Simább” / „Stabil” módra állítható),
-  mozgásra hangolt kódolás filmhez/játékhoz.
+- **4K 60 FPS** (alapból 4K-ra korlátozva, így egy 5K-s Retina kijelző sem terheli feleslegesen a gépet; „Natív”
+  módban teljes felbontás), állítható max. bitráta (6–80 Mbit/s). A WebRTC alapértelmezett 2,5 Mbit/s-os plafonja fel
+  van oldva, és a kapcsolat rögtön magas bitrátáról indul.
+- **Hardveres kódolás a videókártyán**: NVIDIA NVENC, Apple VideoToolbox (Mac), Intel Quick Sync, AMD VCN. Automatikusan
+  azt a kodeket választja (AV1 / H.265 / VP9 / H.264 / VP8), amelyiket a videókártya kódol – megosztás közben
+  **ellenőrzi**, hogy tényleg a videókártya kódol-e, ha nem, kodeket vált, és a gépre megjegyzi az eredményt.
+  A megosztó panelen látszik: *Videókártya: NVIDIA GeForce …* · *Hardveres kódolás: NVIDIA NVENC · H.264 · 3 ms/kép*.
+- **Rendszerhang**: Opus, sztereó, 510 kbit/s, 10 ms-os csomagok, zajszűrés / visszhangszűrés / hangerő-szabályzás
+  nélkül (filmhez, zenéhez).
+- **Alacsony késleltetés**: hardveres kódolás, minimális jitter puffer a nézőnél (rossz hálózaton „Simább” / „Stabil”
+  módra állítható), mozgásra hangolt kódolás filmhez/játékhoz. A késést méri is: a néző statisztikájában és a megosztó
+  nézőlistájában nézőnként látszik (kódolás + hálózat + fogadástól a megjelenésig).
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).
 - Ha a megosztó újratölti az oldalt vagy megszakad a nete, a szoba (és a link) 2 percig megmarad, a nézők maguktól
@@ -78,10 +83,21 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
 - Ha egy ablak megosztásakor nincs hang, oszd meg inkább a teljes képernyőt. A megosztó oldalon a **Hang** doboz
   csíkja mutatja, hogy megy-e hang.
 
+### Mac
+
+- Első megosztáskor engedélyezd a böngészőnek a képernyőfelvételt: *Rendszerbeállítások → Adatvédelem és biztonság →
+  Képernyőfelvétel* (újabb macOS-en *Képernyő- és rendszerhangfelvétel*), majd indítsd újra a böngészőt.
+- Hang: Chrome-ban egy böngészőlap hangja mindig megosztható (*Chrome-lap* fül → lap hangja). Teljes képernyőnél akkor
+  van hang, ha a Chrome felajánlja a *Rendszerhang megosztása* opciót. A Safari nem tud hangot megosztani.
+- A Mac a H.264-et hardveresen kódolja (VideoToolbox) – a Kodek maradjon „Automatikus”.
+
 ### Tippek, hogy ne akadjon
 
 - **Vezetékes net** a megosztó gépen, és elég feltöltési sávszélesség: 4K60-hoz kb. 20–30 Mbit/s nézőnként.
-- Chrome / Edge: legyen bekapcsolva a *Beállítások → Rendszer → Grafikus gyorsítás használata, ha rendelkezésre áll* (hardveres kódolás).
+- Chrome / Edge: legyen bekapcsolva a *Beállítások → Rendszer → Grafikus gyorsítás használata, ha rendelkezésre áll*,
+  és legyen friss a videókártya illesztőprogramja – a **Kódolás** dobozban látszik, hogy a videókártya kódol-e.
+  Szoftveres kódolásnál a késés a többszöröse is lehet.
+- NVIDIA: a GeForce kártyák egyszerre kb. 8 hardveres kódolást bírnak (nézőnként egyet); afölött a processzor kódol.
 - Filmhez / játékhoz a **Tartalom: Film / játék** mód kell, szöveghez / kódhoz a **Szöveg / prezentáció**.
 - Minden néző külön kódolt adatfolyamot kap, ezért sok nézőnél (4–5 felett) érdemes 1080p-re vagy kisebb bitrátára váltani.
 - A néző statisztikájában (**S** billentyű) a **Kapcsolat: TURN relé** azt jelenti, hogy a kép a szerveren keresztül

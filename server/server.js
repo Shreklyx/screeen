@@ -22,8 +22,8 @@ const STATIC_FILES = {
 const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 const CODE_RE = /^[a-z0-9]{4,12}$/;
 const CODECS = ['AV1', 'VP9', 'H264', 'VP8'];
-const HOST_SIGNALS = new Set(['offer', 'candidate']);
-const VIEWER_SIGNALS = new Set(['answer', 'candidate', 'recall']);
+const HOST_SIGNALS = new Set(['offer', 'candidate', 'stats']);
+const VIEWER_SIGNALS = new Set(['answer', 'candidate', 'recall', 'stats']);
 
 const LIMITS = {
   rooms: 100,

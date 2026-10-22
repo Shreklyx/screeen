@@ -40,6 +40,7 @@
             <button id="btnShare" class="btn btn-primary btn-lg" type="submit">Képernyő megosztása</button>
             <p id="shareError" class="hint error" role="alert" hidden></p>
           </form>
+          <p id="macHint" class="hint" hidden>Mac: első megosztáskor engedélyezd a böngészőnek a képernyőfelvételt (Rendszerbeállítások → Adatvédelem és biztonság → Képernyőfelvétel), majd indítsd újra a böngészőt.</p>
           <p id="shareUnsupported" class="hint warn" hidden>Ez a böngésző nem tud képernyőt megosztani. Számítógépen használj Chrome-ot vagy Edge-et.</p>
         </article>
 
@@ -60,7 +61,7 @@
         <li><strong>4K · 60 FPS</strong><span>Natív felbontás, akár 80 Mbit/s</span></li>
         <li><strong>Rendszerhang</strong><span>Sztereó, 510 kbit/s Opus</span></li>
         <li><strong>Minimális késés</strong><span>Közvetlen kapcsolat, saját relé szerver</span></li>
-        <li><strong>Hardveres kódolás</strong><span>Automatikus kodekválasztás</span></li>
+        <li><strong>Hardveres kódolás</strong><span>NVIDIA NVENC, Apple, Intel, AMD</span></li>
       </ul>
 
       <section class="howto" aria-labelledby="howto-title">
@@ -69,6 +70,7 @@
           <li>Nyisd meg az oldalt <b>Chrome</b>-ban vagy <b>Edge</b>-ben, és kattints a <b>Képernyő megosztása</b> gombra.</li>
           <li>A felugró ablakban válaszd a <b>Teljes képernyő</b> lehetőséget, és pipáld be a <b>Rendszerhang megosztása</b> négyzetet.</li>
           <li>Csak egy böngészőfül hangja kell (pl. egy film)? Válaszd a <b>Chrome-lap</b> fület, és kapcsold be a <b>lap hangjának megosztását</b>.</li>
+          <li><b>Mac:</b> Chrome-ban egy böngészőlap hangja mindig megosztható; teljes képernyőnél akkor van hang, ha a Chrome felajánlja a <b>Rendszerhang megosztása</b> opciót. A Safari nem tud hangot megosztani.</li>
         </ol>
         <p class="hint">Ha egyetlen ablak megosztásakor nincs hang, oszd meg inkább a teljes képernyőt. A nézők bármilyen böngészőben nézhetik, telefonon is.</p>
       </section>
@@ -121,12 +123,18 @@
         </section>
 
         <section class="box">
+          <h3>Kódolás</h3>
+          <p id="gpuName" class="enc-gpu"></p>
+          <p id="encoderStatus" class="hint">Az első néző csatlakozásakor kiderül, hogy a videókártya kódol-e.</p>
+        </section>
+
+        <section class="box">
           <h3>Minőség</h3>
           <div class="field">
             <label for="setRes">Felbontás</label>
             <select id="setRes">
-              <option value="native">Natív (akár 4K)</option>
-              <option value="2160">4K – 2160p</option>
+              <option value="2160">4K – 2160p (ajánlott)</option>
+              <option value="native">Natív (Retina: akár 5K)</option>
               <option value="1440">1440p</option>
               <option value="1080">1080p</option>
               <option value="720">720p</option>
@@ -163,6 +171,7 @@
             <select id="setCodec">
               <option value="auto">Automatikus (hardveres)</option>
               <option value="AV1">AV1</option>
+              <option value="H265">H.265</option>
               <option value="VP9">VP9</option>
               <option value="H264">H.264</option>
               <option value="VP8">VP8</option>

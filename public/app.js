@@ -12,15 +12,18 @@
 const RES_TARGETS = { native: null, 2160: [3840, 2160], 1440: [2560, 1440], 1080: [1920, 1080], 720: [1280, 720] };
 const CONTENT_HINT = { motion: 'motion', detail: 'detail', balanced: '' };
 const DEGRADATION = { motion: 'maintain-framerate', detail: 'maintain-resolution', balanced: 'balanced' };
-const CODECS = ['AV1', 'VP9', 'H264', 'VP8'];
-const CODEC_LABEL = { AV1: 'AV1', VP9: 'VP9', H264: 'H.264', VP8: 'VP8' };
+const CODECS = ['AV1', 'H265', 'VP9', 'H264', 'VP8']; // best compression first
+const CODEC_LABEL = { AV1: 'AV1', H265: 'H.265', VP9: 'VP9', H264: 'H.264', VP8: 'VP8' };
 const OPUS_PARAMS = {
   stereo: 1, 'sprop-stereo': 1, maxaveragebitrate: 510000, maxplaybackrate: 48000,
   'sprop-maxcapturerate': 48000, useinbandfec: 1, usedtx: 0, cbr: 0,
 };
 const AUDIO_MAX_BPS = 510000;
 const START_KBPS_CAP = 12000;
-const DEFAULT_SETTINGS = { res: 'native', fps: 60, kbps: 30000, mode: 'motion', codec: 'auto', audio: true };
+// 4K cap by default: a 5K/6K Retina screen at full size only adds encoding load and delay
+const DEFAULT_SETTINGS = { res: '2160', fps: 60, kbps: 30000, mode: 'motion', codec: 'auto', audio: true };
+const IS_MAC = /Macintosh/.test(navigator.userAgent);
+const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
 
 const ERROR_TEXT = {
   auth: 'Hibás jelszó.',
@@ -206,13 +209,82 @@ async function codecSupport(direction) {
 }
 
 // Prefer a codec that is hardware-accelerated on both ends, then one with a
-// hardware encoder, then the cheapest software codec.
+// hardware encoder (what this machine actually did beats the browser's
+// prediction), then H.264 – hardware on most PCs and Macs, fast in software.
 function pickCodec(enc, dec) {
   const usable = CODECS.filter((c) => isAvailable(enc, c) && isAvailable(dec, c));
-  return usable.find((c) => enc?.[c]?.hw && dec?.[c]?.hw)
-    || ['H264', 'VP9', 'AV1', 'VP8'].find((c) => usable.includes(c) && enc?.[c]?.hw)
-    || ['H264', 'VP8', 'VP9', 'AV1'].find((c) => usable.includes(c))
+  const seen = gpu.seen;
+  const encHw = (c) => seen[c] ?? enc?.[c]?.hw ?? false;
+  return usable.find((c) => encHw(c) && dec?.[c]?.hw)
+    || usable.find((c) => seen[c] === true)
+    || ['H264', 'H265', 'AV1', 'VP9'].find((c) => usable.includes(c) && encHw(c))
+    || ['H264'].find((c) => usable.includes(c) && seen[c] !== false)
+    || ['H264', 'VP8', 'VP9', 'AV1', 'H265'].find((c) => usable.includes(c))
     || 'VP8';
+}
+
+/* ---- graphics card / hardware encoder ---- */
+
+function detectGpu() {
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    if (!gl) return '';
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const name = String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || '');
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return name;
+  } catch {
+    return '';
+  }
+}
+
+// "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 (0x00002484) Direct3D11 …)" → "NVIDIA GeForce RTX 3070"
+function prettyGpu(raw) {
+  const m = /^ANGLE \([^,]+, (.+?)(?: \(0x[0-9a-f]+\))?(?: Direct3D| OpenGL| Vulkan|, |\)$)/i.exec(raw);
+  return (m ? m[1] : raw).replace(/^ANGLE Metal Renderer: /, '').trim();
+}
+
+function gpuVendor(name) {
+  if (/nvidia|geforce|quadro/i.test(name)) return 'nvidia';
+  if (/\bamd\b|radeon/i.test(name)) return 'amd';
+  if (/intel/i.test(name)) return 'intel';
+  if (/apple/i.test(name)) return 'apple';
+  return '';
+}
+
+const HW_ENCODER = { nvidia: 'NVIDIA NVENC', amd: 'AMD VCN', intel: 'Intel Quick Sync', apple: 'Apple VideoToolbox' };
+
+const gpu = {
+  raw: '',
+  name: '',
+  vendor: '',
+  key: '',
+  seen: {}, // codec → true (hardware) / false (software), learned from real encoding
+  init() {
+    if (this.key) return;
+    this.raw = detectGpu();
+    this.name = prettyGpu(this.raw);
+    this.vendor = IS_MAC ? 'apple' : gpuVendor(this.raw);
+    const browser = /(?:Chrome|Firefox|Version)\/(\d+)/.exec(navigator.userAgent)?.[1] || '';
+    this.key = `${this.raw}|${browser}`;
+    this.seen = store.get('ss-hw', {})[this.key] || {};
+  },
+  note(codec, isHw) {
+    if (typeof isHw !== 'boolean' || this.seen[codec] === isHw) return;
+    this.seen[codec] = isHw;
+    const all = store.get('ss-hw', {});
+    all[this.key] = this.seen;
+    store.set('ss-hw', all);
+  },
+  get encoderName() { return HW_ENCODER[this.vendor] || 'hardveres kódoló'; },
+};
+
+function encoderIsHw(out) {
+  if (typeof out.powerEfficientEncoder === 'boolean') return out.powerEfficientEncoder;
+  const impl = out.encoderImplementation || '';
+  if (/MediaFoundation|VideoToolbox|Vaapi|NVENC|V4L2|D3D12|EncodeAccelerator/i.test(impl)) return true;
+  if (/libvpx|OpenH264|libaom|SVT|rav1e/i.test(impl)) return false;
+  return null;
 }
 
 function mergeFmtp(line, params) {
@@ -229,7 +301,7 @@ function mergeFmtp(line, params) {
 
 /**
  * Tunes the viewer's answer before the host applies it:
- *  - Opus: stereo, 510 kbit/s, no DTX, in-band FEC.
+ *  - Opus: stereo, 510 kbit/s, 10 ms frames, no DTX, in-band FEC.
  *  - video: `preferCodec` first, high start bitrate, and libwebrtc's 2.5 Mbit/s
  *    default ceiling lifted (the real cap is set with setParameters()).
  */
@@ -256,6 +328,10 @@ function mungeSdp(sdp, { preferCodec, startKbps } = {}) {
 
     if (kind === 'audio') {
       for (const [pt, name] of Object.entries(names)) if (name === 'OPUS') setParams(pt, OPUS_PARAMS);
+      // 10 ms Opus frames instead of 20 ms: less audio delay
+      const ptime = lines.findIndex((l) => l.startsWith('a=ptime:'));
+      if (ptime >= 0) lines[ptime] = 'a=ptime:10';
+      else if (Object.values(names).includes('OPUS')) lines.splice(lines.findIndex((l) => /^a=rtpmap:\d+ opus\//i.test(l)) + 1, 0, 'a=ptime:10');
     } else if (kind === 'video') {
       if (startKbps) {
         for (const [pt, name] of Object.entries(names)) {
@@ -319,6 +395,7 @@ const host = {
   dims: '',
   previewOn: true,
   active: false,
+  tick: 0,
 };
 
 const isLive = () => Boolean(host.video && host.video.readyState === 'live');
@@ -404,6 +481,7 @@ async function startHosting(e) {
   const errorEl = $('#shareError');
   errorEl.hidden = true;
   ensureAudioCtx(); // must happen inside the click gesture
+  gpu.init();
   const encCaps = host.encCaps ? Promise.resolve(host.encCaps) : codecSupport('encode');
   const capture = captureScreen(); // the screen picker needs the gesture: start it right away
   const room = openRoom(password);
@@ -420,7 +498,7 @@ async function startHosting(e) {
       host.token = null;
       store.remove('ss-host-room', 'session');
     }, () => {});
-    if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') showShareError(`A megosztás nem indult el: ${err.message}`);
+    showCaptureError(err, showShareError);
     return;
   }
   try {
@@ -444,6 +522,15 @@ async function startHosting(e) {
   updateCodecOptions();
   setHostTracks(tracks);
   if (!host.statsTimer) host.statsTimer = setInterval(hostStatsTick, 1000);
+}
+
+const PERMISSION_TEXT = IS_MAC
+  ? 'A macOS nem engedi a képernyőfelvételt. Rendszerbeállítások → Adatvédelem és biztonság → Képernyőfelvétel (újabb macOS-en: Képernyő- és rendszerhangfelvétel) → kapcsold be a böngészőt, majd indítsd újra.'
+  : 'Az operációs rendszer nem engedi a képernyőfelvételt – nézd meg az adatvédelmi beállításokat.';
+
+function showCaptureError(err, show) {
+  if (err.name === 'NotAllowedError' && /by system/i.test(err.message)) show(PERMISSION_TEXT);
+  else if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') show(`A megosztás nem indult el: ${err.message}`);
 }
 
 function showShareError(text) {
@@ -513,6 +600,9 @@ function createViewerPc(v) {
   host.msid ||= new MediaStream();
   v.session = randomId();
   v.createdAt = Date.now();
+  v.codecSince = Date.now();
+  v.hwTrialDone = false;
+  v.remote = null;
   v.codec = settings.codec === 'auto' ? pickCodec(host.encCaps, v.caps) : settings.codec;
   v.negotiating = false;
   v.pendingNegotiation = false;
@@ -604,6 +694,11 @@ async function onViewerSignal(id, data) {
   }
   if (data.session !== v.session) return;
   const pc = v.pc;
+  if (data.type === 'stats') {
+    const num = (x) => (Number.isFinite(x) && x >= 0 && x < 1e6 ? x : null);
+    v.remote = { lat: num(data.lat), fps: num(data.fps), loss: num(data.loss) };
+    return;
+  }
   if (data.type === 'answer' && typeof data.sdp === 'string') {
     if (pc.signalingState !== 'have-local-offer') return;
     clearTimeout(v.answerTimer);
@@ -751,7 +846,7 @@ async function switchSource() {
   try {
     setHostTracks(await captureScreen());
   } catch (err) {
-    if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') toast(`Nem sikerült forrást váltani: ${err.message}`, 'error');
+    showCaptureError(err, (text) => toast(text, 'error', 8000));
   }
 }
 
@@ -789,9 +884,15 @@ function updateCaptureInfo() {
     el.textContent = 'A hangmegosztás ki van kapcsolva a beállításokban.';
     el.className = 'hint';
   } else {
-    el.textContent = s.displaySurface === 'window'
-      ? 'Nincs hang: ablak megosztásakor a Windows nem ad hangot. Válts „Teljes képernyő”-re, és pipáld be a „Rendszerhang megosztása” opciót.'
-      : 'Nincs hang! A Forrás váltása gombbal válaszd újra a képernyőt, és pipáld be a „Rendszerhang megosztása” (vagy lapnál a lap hangja) opciót.';
+    if (IS_SAFARI) {
+      el.textContent = 'A Safari nem tud hangot megosztani. Ha hang is kell, oszd meg Chrome-ból.';
+    } else if (IS_MAC) {
+      el.textContent = 'Nincs hang. Macen egy böngészőlap hangja biztosan megosztható: Forrás váltása → „Chrome-lap” fül → lap hangjának megosztása. Teljes képernyőnél akkor van hang, ha a Chrome felajánlja a „Rendszerhang megosztása” opciót (újabb macOS).';
+    } else {
+      el.textContent = s.displaySurface === 'window'
+        ? 'Nincs hang: ablak megosztásakor a Windows nem ad hangot. Válts „Teljes képernyő”-re, és pipáld be a „Rendszerhang megosztása” opciót.'
+        : 'Nincs hang! A Forrás váltása gombbal válaszd újra a képernyőt, és pipáld be a „Rendszerhang megosztása” (vagy lapnál a lap hangja) opciót.';
+    }
     el.className = 'hint warn';
   }
 }
@@ -836,9 +937,8 @@ function updateSetting(key, value) {
   if (key === 'codec') {
     for (const v of host.viewers.values()) {
       if (!v.pc) continue;
-      v.codec = value === 'auto' ? pickCodec(host.encCaps, v.caps) : value;
-      applyCodecPreference(v);
-      negotiate(v);
+      v.hwTrialDone = false;
+      switchCodec(v, value === 'auto' ? pickCodec(host.encCaps, v.caps) : value);
     }
     renderViewers();
     return;
@@ -851,12 +951,41 @@ function updateSetting(key, value) {
   updateCaptureInfo();
 }
 
+function switchCodec(v, codec) {
+  v.codec = codec;
+  v.codecSince = Date.now();
+  applyCodecPreference(v);
+  negotiate(v);
+}
+
+/**
+ * The browser's hardware prediction can be wrong. Once a viewer has received a
+ * few seconds of video, check whether the GPU (NVENC, VideoToolbox, Quick Sync,
+ * VCN) really encodes; if not, move to the next candidate and remember the result.
+ */
+function checkHardware(v, out, codec) {
+  const isHw = encoderIsHw(out);
+  if (isHw == null || codec !== v.codec || Date.now() - v.codecSince < 3000 || !(out.framesEncoded > 30)) return;
+  // Software while another viewer gets the same codec in hardware: the GPU's encoder
+  // sessions are used up (GeForce: ~8) – not a property of the codec, so don't learn it.
+  if (!isHw && [...host.viewers.values()].some((o) => o !== v && o.stats?.hw === true && o.stats?.codec === codec)) {
+    v.hwTrialDone = true;
+    return;
+  }
+  gpu.note(v.codec, isHw);
+  if (isHw || settings.codec !== 'auto' || v.hwTrialDone) return;
+  const next = pickCodec(host.encCaps, v.caps);
+  if (next !== v.codec && gpu.seen[next] !== false) switchCodec(v, next);
+  else v.hwTrialDone = true;
+}
+
 function updateCodecOptions() {
   for (const opt of $('#setCodec').options) {
     if (opt.value === 'auto') continue;
     const c = host.encCaps?.[opt.value];
     opt.disabled = c ? !c.supported : false;
-    opt.textContent = `${CODEC_LABEL[opt.value]}${c?.hw ? ' – hardveres' : ''}${c && !c.supported ? ' (nem támogatott)' : ''}`;
+    const hw = gpu.seen[opt.value] ?? c?.hw;
+    opt.textContent = `${CODEC_LABEL[opt.value]}${hw ? ' – hardveres' : ''}${c && !c.supported ? ' (nem támogatott)' : ''}`;
   }
 }
 
@@ -882,22 +1011,71 @@ async function hostStatsTick() {
     });
     if (!out) continue;
     const pair = selectedPair(report);
-    const codec = report.get(out.codecId)?.mimeType?.split('/')[1];
+    const codec = report.get(out.codecId)?.mimeType?.split('/')[1]?.toUpperCase() || null;
+    const dFrames = rate(out, v.prev, 'framesEncoded');
     v.stats = {
       w: out.frameWidth,
       h: out.frameHeight,
       fps: out.framesPerSecond,
       kbps: kbpsBetween(out, v.prev, 'bytesSent'),
-      codec: codec ? codec.toUpperCase() : null,
-      hw: out.powerEfficientEncoder,
+      codec,
+      hw: encoderIsHw(out),
       impl: out.encoderImplementation,
+      encodeMs: dFrames ? (rate(out, v.prev, 'totalEncodeTime') / dFrames) * 1000 : v.stats?.encodeMs ?? null,
       limit: out.qualityLimitationReason,
       rtt: pair?.currentRoundTripTime != null ? pair.currentRoundTripTime * 1000 : (remoteIn?.roundTripTime ?? NaN) * 1000,
       relay: isRelayed(report, pair),
     };
     v.prev = out;
+    checkHardware(v, out, codec);
+    if (host.tick % 2 === 0) {
+      const { encodeMs, hw } = v.stats;
+      host.signal?.send({ t: 'signal', to: v.id, data: { type: 'stats', session: v.session, encodeMs, hw, encoder: hw ? gpu.encoderName : null, codec } });
+    }
   }
+  host.tick++;
   renderViewers();
+  renderEncoderStatus();
+}
+
+function hwTip() {
+  if (IS_MAC) return 'Macen a H.264-et a gép hardveresen kódolja – a Kodek legyen „Automatikus” vagy „H.264”.';
+  const driver = gpu.vendor === 'nvidia' ? 'az NVIDIA illesztőprogramot' : 'a videókártya illesztőprogramját';
+  return `Chrome/Edge → Beállítások → Rendszer → „Grafikus gyorsítás használata” legyen bekapcsolva, és frissítsd ${driver}.`;
+}
+
+function renderEncoderStatus() {
+  $('#gpuName').textContent = `Videókártya: ${gpu.name || 'ismeretlen'}`;
+  const el = $('#encoderStatus');
+  const sending = [...host.viewers.values()].map((v) => v.stats).filter(Boolean);
+  const active = sending.filter((x) => x.hw != null);
+  if (!isLive() || !sending.length) {
+    el.textContent = 'Az első néző csatlakozásakor kiderül, hogy a videókártya kódol-e.';
+    el.className = 'hint';
+    return;
+  }
+  if (!active.length) {
+    const x = sending[0];
+    const ms = x.encodeMs != null ? ` · ${nf1.format(x.encodeMs)} ms/kép` : '';
+    el.textContent = `Kódolás: ${CODEC_LABEL[x.codec] || x.codec || '?'}${ms} – ez a böngésző nem árulja el, hogy a videókártya kódol-e.`;
+    el.className = 'hint';
+    return;
+  }
+  const hw = active.filter((x) => x.hw);
+  const sample = hw[0] || active[0];
+  const codec = CODEC_LABEL[sample.codec] || sample.codec || '';
+  const ms = sample.encodeMs != null ? ` · ${nf1.format(sample.encodeMs)} ms/kép` : '';
+  if (hw.length === active.length) {
+    el.textContent = `Hardveres kódolás: ${gpu.encoderName} · ${codec}${ms}`;
+    el.className = 'hint ok';
+  } else if (hw.length) {
+    const limit = gpu.vendor === 'nvidia' ? ' (a GeForce kártyák egyszerre kb. 8 hardveres kódolást bírnak)' : '';
+    el.textContent = `${hw.length}/${active.length} néző hardveresen kódolva (${gpu.encoderName}), a többinél a processzor kódol${limit}.`;
+    el.className = 'hint warn';
+  } else {
+    el.textContent = `Szoftveres kódolás (${codec}${ms}): a processzor kódol, ez lassabb és több késést okoz. ${hwTip()}`;
+    el.className = 'hint warn';
+  }
 }
 
 const LIMIT_LABEL = { cpu: 'CPU', bandwidth: 'sávszélesség', other: 'egyéb' };
@@ -923,14 +1101,21 @@ function renderViewers() {
     if (s && isLive()) {
       const stats = document.createElement('div');
       stats.className = 'viewer-stats';
-      const codec = s.codec || CODEC_LABEL[v.codec] || '';
-      const hw = s.hw === true ? ' (HW)' : s.hw === false ? ' (SW)' : '';
+      const codec = CODEC_LABEL[s.codec] || s.codec || CODEC_LABEL[v.codec] || '';
+      const enc = s.hw === true ? ` · ${gpu.encoderName}` : s.hw === false ? ' · szoftveres' : '';
       const line1 = document.createElement('div');
       line1.textContent = `${s.w || '?'}×${s.h || '?'} · ${s.fps != null ? Math.round(s.fps) : '–'} FPS · ${fmtKbps(s.kbps)}`;
       const line2 = document.createElement('div');
-      line2.textContent = `${codec}${hw} · RTT ${fmtMs(s.rtt)}`;
+      line2.textContent = `${codec}${enc} · RTT ${fmtMs(s.rtt)}`;
       if (s.impl) line2.title = s.impl;
       stats.append(line1, line2);
+      if (v.remote?.lat != null) {
+        const total = v.remote.lat + (s.encodeMs || 0);
+        const line = document.createElement('div');
+        line.textContent = `Késés: ~${Math.round(total)} ms`;
+        if (total > 150) line.className = 'warn';
+        stats.append(line);
+      }
       if (s.limit && s.limit !== 'none') {
         const line3 = document.createElement('div');
         line3.className = 'warn';
@@ -994,6 +1179,8 @@ function initHostUi() {
   if (!navigator.mediaDevices?.getDisplayMedia || !window.RTCPeerConnection) {
     $('#btnShare').disabled = true;
     $('#shareUnsupported').hidden = false;
+  } else if (IS_MAC) {
+    $('#macHint').hidden = false;
   }
 }
 
@@ -1020,9 +1207,33 @@ const viewer = {
   muted: false,
   wakeLock: null,
   idleTimer: null,
+  hostStats: null, // the sender's encoder info (codec, hardware, encode time)
+  frameDelays: [], // receive → display time of recent frames (ms)
+  frameTimer: null,
+  tick: 0,
 };
 
 const video = () => $('#remoteVideo');
+
+// Per-frame receive → display delay (jitter buffer + decode + render), measured by the browser.
+function startFrameTiming() {
+  const el = video();
+  if (viewer.frameTimer != null || !el.requestVideoFrameCallback) return;
+  const onFrame = (_now, md) => {
+    if (md.receiveTime != null && md.expectedDisplayTime != null) {
+      viewer.frameDelays.push(md.expectedDisplayTime - md.receiveTime);
+      if (viewer.frameDelays.length > 60) viewer.frameDelays.shift();
+    }
+    viewer.frameTimer = el.requestVideoFrameCallback(onFrame);
+  };
+  viewer.frameTimer = el.requestVideoFrameCallback(onFrame);
+}
+
+function median(list) {
+  if (!list.length) return null;
+  const sorted = [...list].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
 
 async function startViewing(code) {
   showView('view-viewer');
@@ -1112,6 +1323,8 @@ function newViewerPc(session) {
   viewer.pendingCandidates = [];
   viewer.prev = null;
   viewer.prevAudio = null;
+  viewer.hostStats = null;
+  viewer.frameDelays = [];
   const pc = new RTCPeerConnection(rtcConfig(viewer.iceServers));
   viewer.pc = pc;
   pc.ontrack = (e) => {
@@ -1166,6 +1379,8 @@ async function onHostSignal(data) {
       await pc.setLocalDescription(answer); // a browser that refuses the tuned SDP still gets audio
     }
     if (viewer.pc === pc) sendToHost({ type: 'answer', sdp: pc.localDescription.sdp });
+  } else if (data.type === 'stats') {
+    if (data.session === viewer.session) viewer.hostStats = data;
   } else if (data.type === 'candidate' && data.candidate) {
     if (data.session !== viewer.session || !viewer.pc) return;
     if (viewer.pc.remoteDescription) await viewer.pc.addIceCandidate(data.candidate).catch(() => {});
@@ -1184,6 +1399,7 @@ async function attachStream(stream) {
   const el = video();
   if (el.srcObject !== stream) el.srcObject = stream;
   for (const r of viewer.pc?.getReceivers() || []) tuneReceiver(r);
+  startFrameTiming();
   await playVideo();
 }
 
@@ -1265,7 +1481,11 @@ async function viewerStatsTick() {
   const dLost = rate(v, p, 'packetsLost') ?? 0;
   const dRecv = rate(v, p, 'packetsReceived') ?? 0;
   const loss = dRecv + dLost > 0 ? (dLost / (dRecv + dLost)) * 100 : 0;
-  const latency = rtt != null && jb != null ? rtt / 2 + jb + (decode || 0) : null;
+  // network (RTT/2) + receive→display as measured per frame (fallback: jitter buffer + decode)
+  const toDisplay = median(viewer.frameDelays) ?? (jb != null ? jb + (decode || 0) : null);
+  const netLatency = rtt != null && toDisplay != null ? rtt / 2 + toDisplay : null;
+  const encodeMs = Number.isFinite(viewer.hostStats?.encodeMs) ? viewer.hostStats.encodeMs : 0;
+  const latency = netLatency != null ? netLatency + encodeMs : null;
   const codec = report.get(v.codecId)?.mimeType?.split('/')[1]?.toUpperCase();
   const fps = v.framesPerSecond;
   const kbps = kbpsBetween(v, p, 'bytesReceived');
@@ -1273,6 +1493,9 @@ async function viewerStatsTick() {
   const relay = isRelayed(report, pair);
   viewer.prev = v;
   viewer.prevAudio = a;
+  if (viewer.tick++ % 2 === 0 && netLatency != null) {
+    sendToHost({ type: 'stats', lat: Math.round(netLatency), fps: fps != null ? Math.round(fps) : null, loss: Math.round(loss * 10) / 10 });
+  }
 
   const res = v.frameWidth && v.frameHeight ? `${v.frameWidth}×${v.frameHeight}` : '–';
   $('#viewerInfo').textContent = hasPicture()
@@ -1285,9 +1508,11 @@ async function viewerStatsTick() {
     ['Felbontás', res],
     ['FPS', fps != null ? String(Math.round(fps)) : '–'],
     ['Bitráta', fmtKbps(kbps)],
-    ['Kodek', codec ? `${codec}${hw}` : '–'],
-    ['Becsült késés', latency != null ? `~${Math.round(latency)} ms` : '–'],
+    ['Kodek', codec ? `${CODEC_LABEL[codec] || codec}${hw}` : '–'],
+    ['Küldő kódolója', senderEncoderText(viewer.hostStats), viewer.hostStats?.hw === false],
+    ['Becsült késés', latency != null ? `~${Math.round(latency)} ms` : '–', latency > 150],
     ['RTT', fmtMs(rtt)],
+    ['Fogadás → kép', fmtMs(toDisplay)],
     ['Jitter puffer', fmtMs(jb)],
     ['Dekódolás', decode != null ? `${nf1.format(decode)} ms` : '–'],
     ['Csomagvesztés', `${nf1.format(loss)} %`, loss > 2],
@@ -1305,6 +1530,12 @@ async function viewerStatsTick() {
     dl.append(dt, dd);
   }
   $('#stats').replaceChildren(dl);
+}
+
+function senderEncoderText(st) {
+  if (!st) return '–';
+  const name = st.hw === true ? st.encoder || 'hardveres' : st.hw === false ? 'szoftveres' : 'ismeretlen';
+  return `${name}${Number.isFinite(st.encodeMs) ? ` · ${nf1.format(st.encodeMs)} ms` : ''}`;
 }
 
 function syncMuteUi() {
