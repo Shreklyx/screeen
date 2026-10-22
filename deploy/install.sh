@@ -114,7 +114,7 @@ wait_for_apt() {
 # ---------------------------------------------------------------- ellenőrzések
 
 [ "$(id -u)" -eq 0 ] || die "Rootként futtasd:  sudo bash deploy/install.sh"
-[ -f docker-compose.yml ] && [ -f deploy/Caddyfile ] || die "A scriptet a letöltött screeen mappából futtasd."
+[ -f docker-compose.yml ] && [ -f deploy/caddy/Caddyfile ] || die "A scriptet a letöltött screeen mappából futtasd."
 
 if [ -r /etc/os-release ]; then
   . /etc/os-release
@@ -197,8 +197,8 @@ env_set TURN_SECRET "$TURN_SECRET"
 
 TURN_MIN_PORT="$(env_get TURN_MIN_PORT)"
 TURN_MAX_PORT="$(env_get TURN_MAX_PORT)"
-[[ "$TURN_MIN_PORT" =~ ^[0-9]+$ ]] || TURN_MIN_PORT=49160
-[[ "$TURN_MAX_PORT" =~ ^[0-9]+$ ]] || TURN_MAX_PORT=49200
+[[ "$TURN_MIN_PORT" =~ ^[0-9]+$ ]] || TURN_MIN_PORT=49152
+[[ "$TURN_MAX_PORT" =~ ^[0-9]+$ ]] || TURN_MAX_PORT=50151
 [ "$TURN_MIN_PORT" -lt "$TURN_MAX_PORT" ] || die "Hibás TURN porttartomány: $TURN_MIN_PORT-$TURN_MAX_PORT"
 env_set TURN_MIN_PORT "$TURN_MIN_PORT"
 env_set TURN_MAX_PORT "$TURN_MAX_PORT"
@@ -246,6 +246,14 @@ if [ "$DOMAIN" != "localhost" ]; then
   done
   dns_points_here "$DOMAIN" && ok "$DOMAIN → $SERVER_IP"
 fi
+
+# ---------------------------------------------------------------- letöltés, build
+
+# Minden letöltés és build még azelőtt, hogy bármit leállítanánk: ha ez elbukik, a régi oldal tovább fut
+say "Képek letöltése és az oldal lefordítása (az első alkalommal pár perc)"
+docker compose pull caddy turn || die "A Docker képek letöltése nem sikerült (hálózati hiba?). Semmit nem állítottam le – futtasd újra a telepítőt."
+docker compose build --pull app || die "Az oldal fordítása nem sikerült. Semmit nem állítottam le – futtasd újra a telepítőt."
+ok "Kész a letöltés és a build"
 
 # ---------------------------------------------------------------- a 80/443-as port felszabadítása
 
@@ -306,8 +314,11 @@ warn "Ha a szolgáltatód webes felületén is van tűzfal, ott is engedd: 80 é
 
 # ---------------------------------------------------------------- indítás
 
-say "Indítás (az első build pár perc)"
-docker compose up -d --build --remove-orphans
+say "Indítás"
+docker compose up -d --remove-orphans
+# a Caddy a frissített beállítást kapcsolatbontás nélkül tölti újra (ha nem változott, nem csinál semmit)
+docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 ||
+  docker compose restart caddy >/dev/null 2>&1 || true
 
 APP_OK=0
 for _ in $(seq 1 60); do
@@ -317,7 +328,7 @@ for _ in $(seq 1 60); do
   fi
   sleep 2
 done
-if [ "$APP_OK" = "1" ]; then ok "Az oldal fut"; else warn "Az oldal nem indult el rendben. Napló: docker compose logs app --tail 50"; fi
+if [ "$APP_OK" = "1" ]; then ok "Az oldal fut"; else warn "Az oldal nem indult el rendben. Napló: sudo docker compose logs app --tail 50"; fi
 
 TURN_OK=0
 for _ in $(seq 1 15); do
@@ -327,7 +338,7 @@ for _ in $(seq 1 15); do
   fi
   sleep 2
 done
-if [ "$TURN_OK" = "1" ]; then ok "A TURN relé fut"; else warn "A TURN relé nem indult el. Napló: docker compose logs turn --tail 50"; fi
+if [ "$TURN_OK" = "1" ]; then ok "A TURN relé fut"; else warn "A TURN relé nem indult el. Napló: sudo docker compose logs turn --tail 50"; fi
 
 HTTPS_OK=0
 if [ "$DOMAIN" != "localhost" ]; then
@@ -345,12 +356,12 @@ if [ "$HTTPS_OK" = "1" ]; then
   ok "Elérhető: https://$DOMAIN"
 elif [ "$DOMAIN" != "localhost" ]; then
   warn "A https://$DOMAIN még nem válaszol. Ha a DNS most állt be, adj neki pár percet."
-  warn "Napló: docker compose logs caddy --tail 50"
+  warn "Napló: sudo docker compose logs caddy --tail 50"
 fi
 if [ -n "$GENERATED_PASSWORD" ]; then
   echo "  Generált megosztási jelszó: $GENERATED_PASSWORD   (jegyezd fel; a .env fájlban is megtalálod)"
 else
-  echo "  A megosztási jelszó a .env fájlban van:  grep HOST_PASSWORD .env"
+  echo "  A megosztási jelszó a .env fájlban van:  sudo grep HOST_PASSWORD .env"
 fi
 for entry in "${STOPPED_PROJECTS[@]}"; do
   proj="${entry%%|*}"

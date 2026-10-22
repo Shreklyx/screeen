@@ -75,6 +75,40 @@ test('serves the page with security headers', async () => {
   assert.equal((await fetch(`http://${base}/healthz`)).status, 200);
 });
 
+test('odd request lines do not crash the server', async () => {
+  const net = await import('node:net');
+  const [host, port] = base.split(':');
+  const reply = await new Promise((resolve, reject) => {
+    const sock = net.connect(Number(port), host, () => sock.write('GET // HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'));
+    let data = '';
+    sock.on('data', (d) => { data += d; });
+    sock.on('end', () => resolve(data));
+    sock.on('error', reject);
+  });
+  assert.match(reply, /^HTTP\/1\.1 (400|404)/);
+  assert.equal((await fetch(`http://${base}/healthz`)).status, 200);
+});
+
+test('relay only forwards the expected message types', async () => {
+  const h = await client();
+  h.send({ t: 'host', password: 'titok123' });
+  const { code } = await h.next(is('hosted'));
+  const v = await client();
+  v.send({ t: 'join', code });
+  const { id } = await v.next(is('joined'));
+  await h.next(is('viewer'));
+  v.send({ t: 'signal', to: 'host', data: { type: 'offer', sdp: 'x' } });
+  v.send({ t: 'signal', to: 'host', data: { type: 'answer', sdp: 'y'.repeat(40 * 1024) } });
+  h.send({ t: 'signal', to: id, data: { type: 'answer', sdp: 'z' } });
+  await h.nothing((m) => m.t === 'signal');
+  await v.nothing((m) => m.t === 'signal');
+  v.send({ t: 'signal', to: 'host', data: { type: 'recall' } });
+  assert.deepEqual((await h.next(is('signal'))).data, { type: 'recall' });
+  h.send({ t: 'close' });
+  h.close();
+  v.close();
+});
+
 test('rejects WebSocket connections from other sites', async () => {
   await assert.rejects(client({ Origin: 'https://evil.example' }));
 });

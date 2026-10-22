@@ -354,7 +354,7 @@ function hostSignal() {
   if (!host.signal) {
     host.signal = createSignal({
       onMessage: onHostMessage,
-      onOpen: () => { if (host.code) reclaimRoom(); },
+      onOpen: () => { if (host.code && host.active) reclaimRoom(); },
       onClose: () => { if (host.code) setSignalStatus('Megszakadt a kapcsolat a szerverrel, újracsatlakozás… (a nézők látnak tovább)', 'warn'); },
     });
   }
@@ -367,6 +367,7 @@ async function openRoom(password) {
   const resume = store.get('ss-host-room', null, 'session');
   const res = await signal.request({ t: 'host', password, resume: resume || undefined }, ['hosted']);
   applyHosted(res);
+  return Boolean(resume && res.code === resume.code);
 }
 
 // After a lost server connection: take the room back with its token (password as fallback).
@@ -392,6 +393,8 @@ function applyHosted(res) {
   $('#btnCopy').disabled = false;
   setSignalStatus('Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.', 'ok');
   host.signal.send({ t: 'state', live: isLive() });
+  const present = new Set((res.viewers || []).map((v) => v.id));
+  for (const id of [...host.viewers.keys()]) if (!present.has(id)) dropViewer(id);
   for (const v of res.viewers || []) ensureViewer(v.id, v.caps);
 }
 
@@ -409,7 +412,14 @@ async function startHosting(e) {
   try {
     tracks = await capture;
   } catch (err) {
-    room.then(() => host.signal.send({ t: 'close' }), () => {});
+    room.then((resumed) => {
+      for (const id of [...host.viewers.keys()]) dropViewer(id);
+      if (resumed) return; // viewers of a resumed room keep waiting ("szünetel")
+      host.signal.send({ t: 'close' });
+      host.code = null;
+      host.token = null;
+      store.remove('ss-host-room', 'session');
+    }, () => {});
     if (err.name !== 'NotAllowedError' && err.name !== 'AbortError') showShareError(`A megosztás nem indult el: ${err.message}`);
     return;
   }
@@ -502,6 +512,7 @@ function createViewerPc(v) {
   closeViewerPc(v);
   host.msid ||= new MediaStream();
   v.session = randomId();
+  v.createdAt = Date.now();
   v.codec = settings.codec === 'auto' ? pickCodec(host.encCaps, v.caps) : settings.codec;
   v.negotiating = false;
   v.pendingNegotiation = false;
@@ -588,7 +599,7 @@ async function onViewerSignal(id, data) {
   const v = host.viewers.get(id);
   if (!v || !v.pc || !data || typeof data !== 'object') return;
   if (data.type === 'recall') {
-    createViewerPc(v);
+    if (Date.now() - (v.createdAt || 0) > 5000) createViewerPc(v);
     return;
   }
   if (data.session !== v.session) return;
@@ -664,10 +675,16 @@ async function applySenderParams(v) {
     try {
       await sender.setParameters(p);
     } catch {
-      delete p.degradationPreference;
-      delete enc.priority;
-      delete enc.networkPriority;
-      try { await sender.setParameters(p); } catch (err) { console.warn('setParameters failed', err); }
+      // retry with fresh parameters and only the essential fields
+      const q = sender.getParameters();
+      if (!q.encodings?.length) continue;
+      const e = q.encodings[0];
+      e.maxBitrate = enc.maxBitrate;
+      if (kind === 'video') {
+        e.maxFramerate = enc.maxFramerate;
+        e.scaleResolutionDownBy = enc.scaleResolutionDownBy;
+      }
+      try { await sender.setParameters(q); } catch (err) { console.warn('setParameters failed', err); }
     }
   }
 }
@@ -1116,8 +1133,9 @@ function newViewerPc(session) {
       viewer.failTimer = setTimeout(() => {
         if (viewer.pc === pc && pc.connectionState === 'failed') sendToHost({ type: 'recall' });
       }, 8000);
-    } else if (pc.connectionState === 'connected' && viewer.live && hasPicture()) {
-      hideOverlay();
+    } else if (pc.connectionState === 'connected') {
+      if (!viewer.live) setOverlay('A megosztás szünetel. Amint folytatódik, itt lesz a kép.');
+      else if (hasPicture()) hideOverlay();
     }
   };
   return pc;
@@ -1142,7 +1160,11 @@ async function onHostSignal(data) {
     await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
     for (const c of viewer.pendingCandidates.splice(0)) await pc.addIceCandidate(c).catch(() => {});
     const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+    try {
+      await pc.setLocalDescription({ type: 'answer', sdp: mungeSdp(answer.sdp) });
+    } catch {
+      await pc.setLocalDescription(answer); // a browser that refuses the tuned SDP still gets audio
+    }
     if (viewer.pc === pc) sendToHost({ type: 'answer', sdp: pc.localDescription.sdp });
   } else if (data.type === 'candidate' && data.candidate) {
     if (data.session !== viewer.session || !viewer.pc) return;

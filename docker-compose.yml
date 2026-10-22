@@ -34,7 +34,8 @@ services:
     environment:
       DOMAIN: ${DOMAIN:-mozizas.hu}
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # mappát csatolunk (nem egy fájlt), így a frissített Caddyfile a futó Caddy-ben is látszik
+      - ./deploy/caddy:/etc/caddy:ro
       - caddy_data:/data
       - caddy_config:/config
 
@@ -51,8 +52,8 @@ services:
       - --pidfile=/tmp/turnserver.pid
       - --log-file=stdout
       - --listening-port=3478
-      - --min-port=${TURN_MIN_PORT:-49160}
-      - --max-port=${TURN_MAX_PORT:-49200}
+      - --min-port=${TURN_MIN_PORT:-49152}
+      - --max-port=${TURN_MAX_PORT:-50151}
       - --external-ip=${TURN_EXTERNAL_IP:?Hiányzik a TURN_EXTERNAL_IP a .env fájlból (sudo bash deploy/install.sh)}
       - --use-auth-secret
       - --static-auth-secret=${TURN_SECRET:?Hiányzik a TURN_SECRET a .env fájlból (sudo bash deploy/install.sh)}

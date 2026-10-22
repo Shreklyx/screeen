@@ -40,6 +40,8 @@ A telepítő:
 Pár perc múlva él a **https://mozizas.hu**.
 
 **DNS:** a domain `A` rekordja a szerver IP-jére mutasson, Cloudflare-nél **„DNS only”** (szürke felhő) módban.
+`AAAA` (IPv6) rekordot ne vegyél fel: a Docker hálózat IPv4-es, IPv6-on minden látogató ugyanazzal a belső címmel
+érkezne, és közös próbálkozási korláton osztoznának.
 
 **Tűzfal:** ha a szolgáltató webes felületén is van tűzfal, ott ezeket engedd:
 
@@ -48,19 +50,19 @@ Pár perc múlva él a **https://mozizas.hu**.
 | 80, 443 | TCP | weboldal (HTTPS) |
 | 443 | UDP | HTTP/3 |
 | 3478 | TCP + UDP | TURN relé |
-| 49160–49200 | UDP | TURN relé adatforgalma |
+| 49152–50151 | UDP | TURN relé adatforgalma |
 
 ### Frissítés, napló, jelszócsere
 
 ```bash
 sudo bash deploy/install.sh          # frissítés: új kód letöltése + újraindítás
-docker compose logs -f app           # napló (caddy, turn is)
+sudo docker compose logs -f app      # napló (caddy, turn is)
 ```
 
 - **Jelszócsere:** futtasd újra a telepítőt, és a „Megtartod a jelenlegi megosztási jelszót?” kérdésre válaszolj `n`-nel.
-  A jelszó a `.env` fájlban is megtalálható: `grep HOST_PASSWORD .env`.
-- **A Sori újraindítása** (ha valaha kell): `docker compose down` ebben a mappában, majd a Sori mappájában
-  `docker compose up -d`.
+  A jelszó a `.env` fájlban is megtalálható: `sudo grep HOST_PASSWORD .env`.
+- **A Sori újraindítása** (ha valaha kell): `sudo docker compose down` ebben a mappában, majd a Sori mappájában
+  `sudo docker compose up -d`.
 
 ## Használat
 
@@ -105,5 +107,5 @@ A képernyőmegosztás csak HTTPS-en vagy `localhost`-on működik. TURN relé n
   a minőséget `RTCRtpSender.setParameters()` (bitráta, FPS, felbontás-skálázás, degradáció, prioritás),
   `setCodecPreferences()` és az SDP hangolása (Opus sztereó/510k, kezdő bitráta) állítja. Forrásváltáskor
   `replaceTrack()`, kodekváltáskor újratárgyalás ugyanazon a kapcsolaton, megszakadáskor ICE restart.
-- `docker-compose.yml` – `app` (Node), `caddy` (HTTPS), `turn` (coturn, host hálózaton; a belső/foglalt címek felé
-  tiltott relézéssel).
+- `docker-compose.yml` – `app` (Node), `caddy` (HTTPS, beállítás: `deploy/caddy/Caddyfile`), `turn` (coturn, host
+  hálózaton; a belső/foglalt címek felé tiltott relézéssel).

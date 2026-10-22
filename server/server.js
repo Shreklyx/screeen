@@ -22,6 +22,8 @@ const STATIC_FILES = {
 const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 const CODE_RE = /^[a-z0-9]{4,12}$/;
 const CODECS = ['AV1', 'VP9', 'H264', 'VP8'];
+const HOST_SIGNALS = new Set(['offer', 'candidate']);
+const VIEWER_SIGNALS = new Set(['answer', 'candidate', 'recall']);
 
 const LIMITS = {
   rooms: 100,
@@ -31,9 +33,13 @@ const LIMITS = {
   authWindowMs: 15 * 60 * 1000, // … per 15 minutes
   joins: 30, // join attempts per IP …
   joinWindowMs: 60 * 1000, // … per minute
-  msgBurst: 600, // messages a socket may send in a burst (ICE candidates come in bursts)
-  msgPerSec: 120,
+  hostBurst: 600, // messages a host may send in a burst (offers + ICE candidates for every viewer)
+  hostPerSec: 120,
+  viewerBurst: 100, // everyone else (viewers, sockets that have not joined yet)
+  viewerPerSec: 20,
   maxPayload: 64 * 1024,
+  maxSignal: 32 * 1024, // one SDP or ICE message
+  maxBuffered: 1 << 20, // skip sending to a socket that does not keep up
   turnTtlSec: 24 * 3600,
 };
 
@@ -152,8 +158,43 @@ function securityHeaders(req) {
   };
 }
 
+// The few page files are small: keep them in memory, re-read only when they change on disk.
+const fileCache = new Map();
+function loadFile(name) {
+  const file = path.join(PUBLIC_DIR, name);
+  const stat = fs.statSync(file);
+  const cached = fileCache.get(name);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached;
+  const body = fs.readFileSync(file);
+  const entry = {
+    body,
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    etag: `"${crypto.createHash('sha1').update(body).digest('base64url').slice(0, 16)}"`,
+  };
+  fileCache.set(name, entry);
+  return entry;
+}
+
 function serveStatic(req, res) {
-  const url = new URL(req.url, 'http://x');
+  try {
+    handleStatic(req, res);
+  } catch (err) {
+    console.error('[screenshare] request error', err);
+    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end();
+  }
+}
+
+function handleStatic(req, res) {
+  let url;
+  try {
+    url = new URL(req.url, 'http://x');
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad request');
+    return;
+  }
   if (url.pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
     res.end('ok');
@@ -165,27 +206,15 @@ function serveStatic(req, res) {
     res.end(entry ? 'Method not allowed' : 'Nincs ilyen oldal');
     return;
   }
-  const file = path.join(PUBLIC_DIR, entry[0]);
-  fs.stat(file, (err, stat) => {
-    if (err) {
-      res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end('Hiányzó fájl');
-      return;
-    }
-    const etag = `"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
-    const headers = { 'Content-Type': entry[1], 'Cache-Control': 'no-cache', ETag: etag, ...securityHeaders(req) };
-    if (req.headers['if-none-match'] === etag) {
-      res.writeHead(304, headers);
-      res.end();
-      return;
-    }
-    res.writeHead(200, { ...headers, 'Content-Length': stat.size });
-    if (req.method === 'HEAD') {
-      res.end();
-      return;
-    }
-    fs.createReadStream(file).pipe(res);
-  });
+  const file = loadFile(entry[0]);
+  const headers = { 'Content-Type': entry[1], 'Cache-Control': 'no-cache', ETag: file.etag, ...securityHeaders(req) };
+  if (req.headers['if-none-match'] === file.etag) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
+  res.writeHead(200, { ...headers, 'Content-Length': file.body.length });
+  res.end(req.method === 'HEAD' ? undefined : file.body);
 }
 
 /* ------------------------------------------------------------ signaling */
@@ -216,7 +245,7 @@ export function createApp(config = loadConfig()) {
   });
 
   const send = (conn, msg) => {
-    if (conn.ws.readyState === conn.ws.OPEN) conn.ws.send(JSON.stringify(msg));
+    if (conn.ws.readyState === conn.ws.OPEN && conn.ws.bufferedAmount < LIMITS.maxBuffered) conn.ws.send(JSON.stringify(msg));
   };
 
   const broadcastCount = (room) => {
@@ -291,8 +320,9 @@ export function createApp(config = loadConfig()) {
         }
       }
       if (config.hostPassword) {
+        if (typeof msg.password !== 'string' || !msg.password) return send(conn, { t: 'error', code: 'auth' });
         if (authLimiter.limited(conn.ip)) return send(conn, { t: 'error', code: 'rate' });
-        if (typeof msg.password !== 'string' || !passwordMatches(msg.password, config.hostPassword)) {
+        if (!passwordMatches(msg.password, config.hostPassword)) {
           authLimiter.hit(conn.ip);
           return send(conn, { t: 'error', code: 'auth' });
         }
@@ -330,14 +360,15 @@ export function createApp(config = loadConfig()) {
       broadcastCount(room);
     },
 
-    signal(conn, msg) {
+    signal(conn, msg, size) {
       const room = conn.room;
-      if (!room || !msg.data || typeof msg.data !== 'object') return;
+      const data = msg.data;
+      if (!room || !data || typeof data !== 'object' || size > LIMITS.maxSignal) return;
       if (conn.role === 'host' && room.host === conn) {
         const target = room.viewers.get(msg.to);
-        if (target) send(target, { t: 'signal', from: 'host', data: msg.data });
-      } else if (conn.role === 'viewer' && msg.to === 'host' && room.host) {
-        send(room.host, { t: 'signal', from: conn.id, data: msg.data });
+        if (target && HOST_SIGNALS.has(data.type)) send(target, { t: 'signal', from: 'host', data });
+      } else if (conn.role === 'viewer' && msg.to === 'host' && room.host && VIEWER_SIGNALS.has(data.type)) {
+        send(room.host, { t: 'signal', from: conn.id, data });
       }
     },
 
@@ -366,7 +397,7 @@ export function createApp(config = loadConfig()) {
       room: null,
       role: null,
       caps: null,
-      tokens: LIMITS.msgBurst,
+      tokens: LIMITS.viewerBurst,
       lastRefill: Date.now(),
     };
 
@@ -377,7 +408,8 @@ export function createApp(config = loadConfig()) {
 
     ws.on('message', (raw, isBinary) => {
       const now = Date.now();
-      conn.tokens = Math.min(LIMITS.msgBurst, conn.tokens + ((now - conn.lastRefill) / 1000) * LIMITS.msgPerSec);
+      const [burst, perSec] = conn.role === 'host' ? [LIMITS.hostBurst, LIMITS.hostPerSec] : [LIMITS.viewerBurst, LIMITS.viewerPerSec];
+      conn.tokens = Math.min(burst, conn.tokens + ((now - conn.lastRefill) / 1000) * perSec);
       conn.lastRefill = now;
       if (conn.tokens < 1) return; // flooding – drop
       conn.tokens -= 1;
@@ -390,7 +422,7 @@ export function createApp(config = loadConfig()) {
       }
       if (!msg || typeof msg !== 'object' || typeof msg.t !== 'string' || !Object.hasOwn(handlers, msg.t)) return;
       try {
-        handlers[msg.t](conn, msg);
+        handlers[msg.t](conn, msg, raw.length);
       } catch (err) {
         console.error('[screenshare] handler error', err);
       }
