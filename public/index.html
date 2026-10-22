@@ -58,7 +58,7 @@
       </div>
 
       <ul class="features">
-        <li><strong>4K · 60 FPS</strong><span>Natív felbontás, akár 80 Mbit/s</span></li>
+        <li><strong>4K · 60 FPS</strong><span>Akár 250 Mbit/s, a gépedhez igazítva</span></li>
         <li><strong>Rendszerhang</strong><span>Sztereó, 510 kbit/s Opus</span></li>
         <li><strong>Minimális késés</strong><span>Közvetlen kapcsolat, saját relé szerver</span></li>
         <li><strong>Hardveres kódolás</strong><span>NVIDIA NVENC, Apple, Intel, AMD</span></li>
@@ -154,6 +154,10 @@
             <label for="setKbps">Max. bitráta</label>
             <select id="setKbps">
               <option value="auto">Automatikus (legjobb)</option>
+              <option value="250000">250 Mbit/s (helyi hálózat, gigabites net)</option>
+              <option value="200000">200 Mbit/s</option>
+              <option value="150000">150 Mbit/s</option>
+              <option value="100000">100 Mbit/s</option>
               <option value="80000">80 Mbit/s</option>
               <option value="50000">50 Mbit/s</option>
               <option value="30000">30 Mbit/s</option>

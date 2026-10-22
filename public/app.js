@@ -19,19 +19,20 @@ const OPUS_PARAMS = {
   'sprop-maxcapturerate': 48000, useinbandfec: 1, usedtx: 0, cbr: 0,
 };
 const AUDIO_MAX_BPS = 510000;
+const MAX_KBPS = 300000; // SDP ceiling, above the highest selectable rate (250 Mbit/s)
 const START_KBPS_CAP = 12000;
 // "auto" = chosen per viewer from what this machine can do (see autoTarget)
 const DEFAULT_SETTINGS = { res: 'auto', fps: 'auto', kbps: 'auto', mode: 'motion', codec: 'auto', audio: true };
 const SETTINGS_VERSION = 2; // older saved settings are dropped so everyone starts from the best defaults
 const NUMERIC_SETTINGS = new Set(['fps', 'kbps']);
 // GPU encoding: the maximum (4K cap – a 5K/6K Retina screen at full size only adds load and delay)
-const HW_TARGET = { res: '2160', fps: 60, kbps: 80000 };
+const HW_TARGET = { res: '2160', fps: 60, kbps: 150000 };
 // CPU encoding: what a processor can encode without falling behind (falling behind = delay)
 const SW_TIERS = [
-  { res: '720', fps: 30, kbps: 6000 },
-  { res: '1080', fps: 30, kbps: 12000 },
-  { res: '1080', fps: 60, kbps: 20000 },
-  { res: '1440', fps: 60, kbps: 30000 },
+  { res: '720', fps: 30, kbps: 10000 },
+  { res: '1080', fps: 30, kbps: 20000 },
+  { res: '1080', fps: 60, kbps: 35000 },
+  { res: '1440', fps: 60, kbps: 50000 },
 ];
 const IS_MAC = /Macintosh/.test(navigator.userAgent);
 const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
@@ -346,7 +347,7 @@ function mungeSdp(sdp, { preferCodec, startKbps } = {}) {
     } else if (kind === 'video') {
       if (startKbps) {
         for (const [pt, name] of Object.entries(names)) {
-          if (CODECS.includes(name)) setParams(pt, { 'x-google-start-bitrate': startKbps, 'x-google-max-bitrate': 100000 });
+          if (CODECS.includes(name)) setParams(pt, { 'x-google-start-bitrate': startKbps, 'x-google-max-bitrate': MAX_KBPS });
         }
       }
       if (preferCodec) {

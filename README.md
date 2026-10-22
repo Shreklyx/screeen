@@ -6,19 +6,20 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
 - **WebRTC, közvetlen kapcsolat** – a kép és a hang közvetlenül a gépek között megy, titkosítva (DTLS-SRTP).
   A szerver csak a kapcsolat felépítését intézi, illetve **TURN relével** segít, ha a két gép nem éri el egymást
   közvetlenül (pl. mobilnet, szigorú NAT).
-- **Alapból a legjobb beállítás, a gép alapján (Automatikus):** ha a videókártya kódol, **4K · 60 FPS · max. 80 Mbit/s**
+- **Alapból a legjobb beállítás, a gép alapján (Automatikus):** ha a videókártya kódol, **4K · 60 FPS · max. 150 Mbit/s**
   (4K-ra korlátozva, így egy 5K-s Retina kijelző sem terheli feleslegesen a gépet). Ha a processzor kódol, a szálak
   száma szerint annyit, amennyit késés nélkül bír (pl. 12+ szál: 1440p60, 8 szál: 1080p60, kevesebb: 1080p30), és
   több néző esetén egy fokozattal lejjebb. Nézőnként külön dönt: aki a processzorra szorul (pl. a GeForce kb. 8-as
   korlátja fölött), csak az kap könnyebb beállítást. A tényleges sebességhez a WebRTC folyamatosan igazodik.
-  Kézzel minden felülírható (felbontás, FPS, 6–80 Mbit/s). A WebRTC alapértelmezett 2,5 Mbit/s-os plafonja fel van
+  Kézzel minden felülírható (felbontás, FPS, 6–250 Mbit/s; 150 Mbit/s fölött helyi hálózat vagy gigabites net kell). A WebRTC alapértelmezett 2,5 Mbit/s-os plafonja fel van
   oldva, és a kapcsolat rögtön magas bitrátáról indul.
 - **Hardveres kódolás a videókártyán**: NVIDIA NVENC, Apple VideoToolbox (Mac), Intel Quick Sync, AMD VCN. Automatikusan
   azt a kodeket választja (AV1 / H.265 / VP9 / H.264 / VP8), amelyiket a videókártya kódol – megosztás közben
   **ellenőrzi**, hogy tényleg a videókártya kódol-e, ha nem, kodeket vált, és a gépre megjegyzi az eredményt.
   A megosztó panelen látszik: *Videókártya: NVIDIA GeForce …* · *Hardveres kódolás: NVIDIA NVENC · H.264 · 3 ms/kép*.
 - **Rendszerhang**: Opus, sztereó, 510 kbit/s, 10 ms-os csomagok, zajszűrés / visszhangszűrés / hangerő-szabályzás
-  nélkül (filmhez, zenéhez).
+  nélkül (filmhez, zenéhez). 5.1 / 7.1 térhang böngészőből nem vihető át: a böngészők a megosztott hangot sztereóban
+  adják, és a WebRTC hangja is legfeljebb sztereó – a térhangzású filmhang sztereóra keverve szól a nézőknél.
 - **Alacsony késleltetés**: hardveres kódolás, minimális jitter puffer a nézőnél (rossz hálózaton „Simább” / „Stabil”
   módra állítható), mozgásra hangolt kódolás filmhez/játékhoz. A késést méri is: a néző statisztikájában és a megosztó
   nézőlistájában nézőnként látszik (kódolás + hálózat + fogadástól a megjelenésig).
