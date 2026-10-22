@@ -20,8 +20,19 @@ const OPUS_PARAMS = {
 };
 const AUDIO_MAX_BPS = 510000;
 const START_KBPS_CAP = 12000;
-// 4K cap by default: a 5K/6K Retina screen at full size only adds encoding load and delay
-const DEFAULT_SETTINGS = { res: '2160', fps: 60, kbps: 30000, mode: 'motion', codec: 'auto', audio: true };
+// "auto" = chosen per viewer from what this machine can do (see autoTarget)
+const DEFAULT_SETTINGS = { res: 'auto', fps: 'auto', kbps: 'auto', mode: 'motion', codec: 'auto', audio: true };
+const SETTINGS_VERSION = 2; // older saved settings are dropped so everyone starts from the best defaults
+const NUMERIC_SETTINGS = new Set(['fps', 'kbps']);
+// GPU encoding: the maximum (4K cap – a 5K/6K Retina screen at full size only adds load and delay)
+const HW_TARGET = { res: '2160', fps: 60, kbps: 80000 };
+// CPU encoding: what a processor can encode without falling behind (falling behind = delay)
+const SW_TIERS = [
+  { res: '720', fps: 30, kbps: 6000 },
+  { res: '1080', fps: 30, kbps: 12000 },
+  { res: '1080', fps: 60, kbps: 20000 },
+  { res: '1440', fps: 60, kbps: 30000 },
+];
 const IS_MAC = /Macintosh/.test(navigator.userAgent);
 const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
 
@@ -376,7 +387,8 @@ const kbpsBetween = (cur, prev, key) => {
 
 /* ============================== HOST ============================== */
 
-const settings = { ...DEFAULT_SETTINGS, ...store.get('ss-settings', {}) };
+const savedSettings = store.get('ss-settings', {});
+const settings = { ...DEFAULT_SETTINGS, ...(savedSettings.v === SETTINGS_VERSION ? savedSettings : {}), v: SETTINGS_VERSION };
 
 const host = {
   signal: null,
@@ -400,8 +412,10 @@ const host = {
 
 const isLive = () => Boolean(host.video && host.video.readyState === 'live');
 
+const captureFps = () => (settings.fps === 'auto' ? HW_TARGET.fps : settings.fps);
+
 async function captureScreen() {
-  const fps = settings.fps;
+  const fps = captureFps();
   const video = { frameRate: { ideal: fps, max: fps }, cursor: 'always' };
   const audio = settings.audio
     ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 }, sampleRate: { ideal: 48000 }, suppressLocalAudioPlayback: false }
@@ -565,11 +579,43 @@ function onHostMessage(msg) {
 
 /* ---- one RTCPeerConnection per viewer ---- */
 
-function videoEncoding() {
+// Does this viewer's video get encoded by the GPU? Measured if possible, otherwise predicted.
+function encoderHwFor(v) {
+  const codec = v?.codec || pickCodec(host.encCaps, null);
+  if (v?.stats && v.stats.hw != null && v.stats.codec === codec) return v.stats.hw;
+  if (gpu.seen[codec] != null) return gpu.seen[codec];
+  if (IS_MAC && (codec === 'H264' || codec === 'H265')) return true; // VideoToolbox on every Mac
+  return Boolean(host.encCaps?.[codec]?.hw);
+}
+
+// Best settings this machine can sustain for one viewer.
+function autoTarget(v) {
+  if (encoderHwFor(v)) return { ...HW_TARGET, hw: true };
+  const cores = navigator.hardwareConcurrency || 4;
+  let tier = cores >= 12 ? 3 : cores >= 8 ? 2 : 1;
+  // every CPU-encoded viewer is a separate encode: step down as they add up
+  const cpuViewers = [...host.viewers.values()].filter((x) => x === v || !encoderHwFor(x)).length;
+  if (cpuViewers >= 3) tier--;
+  if (cpuViewers >= 6) tier--;
+  return { ...SW_TIERS[Math.max(0, tier)], hw: false, cores };
+}
+
+function targetFor(v) {
+  const auto = autoTarget(v);
   return {
-    maxBitrate: settings.kbps * 1000,
-    maxFramerate: settings.fps,
-    scaleResolutionDownBy: scaleFor(host.video),
+    res: settings.res === 'auto' ? auto.res : settings.res,
+    fps: settings.fps === 'auto' ? auto.fps : settings.fps,
+    kbps: settings.kbps === 'auto' ? auto.kbps : settings.kbps,
+    auto,
+  };
+}
+
+function videoEncoding(v) {
+  const t = targetFor(v);
+  return {
+    maxBitrate: t.kbps * 1000,
+    maxFramerate: t.fps,
+    scaleResolutionDownBy: scaleFor(host.video, t.res),
     priority: 'high',
     networkPriority: 'high',
   };
@@ -614,7 +660,7 @@ function createViewerPc(v) {
 
   const pc = new RTCPeerConnection(rtcConfig(host.iceServers));
   v.pc = pc;
-  v.videoTx = addSendTransceiver(pc, host.video || 'video', videoEncoding());
+  v.videoTx = addSendTransceiver(pc, host.video || 'video', videoEncoding(v));
   v.audioTx = addSendTransceiver(pc, host.audio || 'audio', { maxBitrate: AUDIO_MAX_BPS, priority: 'high', networkPriority: 'high' });
   applyCodecPreference(v);
 
@@ -703,7 +749,7 @@ async function onViewerSignal(id, data) {
     if (pc.signalingState !== 'have-local-offer') return;
     clearTimeout(v.answerTimer);
     try {
-      await pc.setRemoteDescription({ type: 'answer', sdp: mungeSdp(data.sdp, { preferCodec: v.codec, startKbps: Math.min(settings.kbps, START_KBPS_CAP) }) });
+      await pc.setRemoteDescription({ type: 'answer', sdp: mungeSdp(data.sdp, { preferCodec: v.codec, startKbps: Math.min(targetFor(v).kbps, START_KBPS_CAP) }) });
     } catch (err) {
       console.warn('answer rejected', err);
       if (v.pc === pc) createViewerPc(v);
@@ -745,8 +791,8 @@ function restartIce(v) {
   else negotiate(v, { iceRestart: true });
 }
 
-function scaleFor(track) {
-  const target = RES_TARGETS[settings.res];
+function scaleFor(track, res) {
+  const target = RES_TARGETS[res];
   const s = track?.getSettings?.() || {};
   if (!target || !s.width || !s.height) return 1;
   const [tw, th] = s.width >= s.height ? target : [target[1], target[0]];
@@ -762,7 +808,9 @@ async function applySenderParams(v) {
     if (!p.encodings?.length) continue; // not negotiated yet
     const enc = p.encodings[0];
     if (kind === 'video') {
-      Object.assign(enc, videoEncoding());
+      const target = videoEncoding(v);
+      Object.assign(enc, target);
+      v.appliedTarget = JSON.stringify(target);
       p.degradationPreference = DEGRADATION[settings.mode];
     } else {
       Object.assign(enc, { maxBitrate: AUDIO_MAX_BPS, priority: 'high', networkPriority: 'high' });
@@ -866,13 +914,30 @@ function confirmLeave(e) {
   e.returnValue = '';
 }
 
+const RES_LABEL = { native: 'natív', 2160: '4K', 1440: '1440p', 1080: '1080p', 720: '720p' };
+
+// What "Automatikus" picked for this machine, in words.
+function renderAutoProfile() {
+  const el = $('#autoProfile');
+  if (!el) return;
+  const viewers = [...host.viewers.values()];
+  const t = targetFor(viewers[0]);
+  const a = t.auto;
+  const why = a.hw
+    ? `a videókártya kódol (${gpu.encoderName})`
+    : `a processzor kódol (${a.cores} szál${viewers.length > 1 ? `, ${viewers.length} néző` : ''})`;
+  el.textContent = `Automatikus: ${RES_LABEL[t.res] || t.res} · ${t.fps} FPS · max. ${fmtKbps(t.kbps)} – ${why}.`;
+}
+
 function updateCaptureInfo() {
   const s = host.video?.getSettings?.() || {};
-  const scale = scaleFor(host.video);
+  const t = targetFor([...host.viewers.values()][0]);
+  const scale = scaleFor(host.video, t.res);
   const w = s.width ? Math.round(s.width / scale) : null;
   const h = s.height ? Math.round(s.height / scale) : null;
-  const fps = s.frameRate ? Math.round(s.frameRate) : settings.fps;
+  const fps = Math.min(s.frameRate ? Math.round(s.frameRate) : t.fps, t.fps);
   $('#captureInfo').textContent = w && h ? `${w}×${h} · ${fps} FPS` : '';
+  renderAutoProfile();
 
   const el = $('#audioStatus');
   if (!host.video) {
@@ -931,7 +996,8 @@ function updateSetting(key, value) {
   settings[key] = value;
   store.set('ss-settings', settings);
   if (key === 'fps' && isLive()) {
-    host.video.applyConstraints({ frameRate: { ideal: value, max: value } }).catch(() => {});
+    const fps = captureFps();
+    host.video.applyConstraints({ frameRate: { ideal: fps, max: fps } }).catch(() => {});
   }
   if (key === 'mode' && host.video) host.video.contentHint = CONTENT_HINT[value];
   if (key === 'codec') {
@@ -1028,6 +1094,7 @@ async function hostStatsTick() {
     };
     v.prev = out;
     checkHardware(v, out, codec);
+    if (v.appliedTarget && v.appliedTarget !== JSON.stringify(videoEncoding(v))) applySenderParams(v);
     if (host.tick % 2 === 0) {
       const { encodeMs, hw } = v.stats;
       host.signal?.send({ t: 'signal', to: v.id, data: { type: 'stats', session: v.session, encodeMs, hw, encoder: hw ? gpu.encoderName : null, codec } });
@@ -1036,6 +1103,7 @@ async function hostStatsTick() {
   host.tick++;
   renderViewers();
   renderEncoderStatus();
+  renderAutoProfile();
 }
 
 function hwTip() {
@@ -1158,7 +1226,7 @@ function initHostUi() {
       settings[key] = DEFAULT_SETTINGS[key];
       el.value = String(settings[key]);
     }
-    el.addEventListener('change', () => updateSetting(key, typeof DEFAULT_SETTINGS[key] === 'number' ? Number(el.value) : el.value));
+    el.addEventListener('change', () => updateSetting(key, NUMERIC_SETTINGS.has(key) && el.value !== 'auto' ? Number(el.value) : el.value));
   }
   const audio = $('#setAudio');
   audio.checked = settings.audio;

@@ -130,10 +130,12 @@
 
         <section class="box">
           <h3>Minőség</h3>
+          <p id="autoProfile" class="hint ok auto-profile"></p>
           <div class="field">
             <label for="setRes">Felbontás</label>
             <select id="setRes">
-              <option value="2160">4K – 2160p (ajánlott)</option>
+              <option value="auto">Automatikus – a gép alapján (legjobb)</option>
+              <option value="2160">4K – 2160p</option>
               <option value="native">Natív (Retina: akár 5K)</option>
               <option value="1440">1440p</option>
               <option value="1080">1080p</option>
@@ -143,6 +145,7 @@
           <div class="field">
             <label for="setFps">Képkocka/mp</label>
             <select id="setFps">
+              <option value="auto">Automatikus (legjobb)</option>
               <option value="60">60 FPS</option>
               <option value="30">30 FPS</option>
             </select>
@@ -150,7 +153,8 @@
           <div class="field">
             <label for="setKbps">Max. bitráta</label>
             <select id="setKbps">
-              <option value="80000">80 Mbit/s (helyi hálózat)</option>
+              <option value="auto">Automatikus (legjobb)</option>
+              <option value="80000">80 Mbit/s</option>
               <option value="50000">50 Mbit/s</option>
               <option value="30000">30 Mbit/s</option>
               <option value="20000">20 Mbit/s</option>
@@ -161,7 +165,7 @@
           <div class="field">
             <label for="setMode">Tartalom</label>
             <select id="setMode">
-              <option value="motion">Film / játék – folyamatos mozgás</option>
+              <option value="motion">Film / játék – folyamatos mozgás (legjobb)</option>
               <option value="detail">Szöveg / prezentáció – élesség</option>
               <option value="balanced">Kiegyensúlyozott</option>
             </select>
@@ -169,7 +173,7 @@
           <div class="field">
             <label for="setCodec">Kodek</label>
             <select id="setCodec">
-              <option value="auto">Automatikus (hardveres)</option>
+              <option value="auto">Automatikus – hardveres (legjobb)</option>
               <option value="AV1">AV1</option>
               <option value="H265">H.265</option>
               <option value="VP9">VP9</option>
