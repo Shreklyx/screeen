@@ -49,7 +49,7 @@ jobs:
         working-directory: desktop
         run: npx electron-builder ${{ matrix.builder }} --publish never
 
-      - name: Smoke test (app starts, loads the site, Windows: captures the screen)
+      - name: "Smoke test (app starts, loads the site; on Windows it also captures the screen)"
         shell: bash
         run: |
           HOST_PASSWORD=ci PORT=8080 node server/server.js &
