@@ -410,6 +410,22 @@ function acceptMultiopus(answer, offer) {
   return insertAudioCodec(answer, m[1], m[2], fmtp ? fmtp[1] : MULTIOPUS.fmtp);
 }
 
+/*
+ * Viewer, "Minimális késés": every frame is shown the moment it is decoded.
+ *  - The app as host sends a zero playout delay with each frame (RTP extension, see
+ *    desktop/main.js); "Simább"/"Stabil" leave the extension out so their buffer applies.
+ *  - The audio gets its own stream id, so the picture is not held back to wait for the
+ *    audio's (longer) jitter buffer; the sound may trail by a few tens of ms.
+ */
+const PLAYOUT_DELAY_EXT = /^a=extmap:\d+(\/\w+)? http:\/\/www\.webrtc\.org\/experiments\/rtp-hdrext\/playout-delay\r?$/;
+const withoutPlayoutDelay = (sdp) => sdp.split('\r\n').filter((l) => !PLAYOUT_DELAY_EXT.test(l)).join('\r\n');
+
+function ownAudioStream(sdp) {
+  return sdp.split(/\r\n(?=m=)/)
+    .map((section) => (section.startsWith('m=audio') ? section.replace(/^(a=(?:ssrc:\d+ )?msid:)(\S+) /gm, '$1$2-audio ') : section))
+    .join('\r\n');
+}
+
 /* ----------------------------- stats ----------------------------- */
 
 function selectedPair(report) {
@@ -1743,8 +1759,10 @@ function newViewerPc(session) {
   pc.ontrack = (e) => {
     if (viewer.pc !== pc) return;
     tuneReceiver(e.receiver);
-    const stream = e.streams[0] || (viewer.fallbackStream ||= new MediaStream());
-    if (!e.streams[0]) stream.addTrack(e.track);
+    // one stream for the player, whatever stream ids the tracks came with
+    const stream = (viewer.stream ||= new MediaStream());
+    for (const t of stream.getTracks()) if (t.kind === e.track.kind && t !== e.track) stream.removeTrack(t);
+    if (!stream.getTracks().includes(e.track)) stream.addTrack(e.track);
     attachStream(stream);
   };
   pc.onicecandidate = (e) => {
@@ -1776,18 +1794,21 @@ function closeViewerConnection() {
     viewer.pc.close();
     viewer.pc = null;
   }
-  viewer.fallbackStream = null;
+  viewer.stream = null;
 }
 
 async function onHostSignal(data) {
   if (data.type === 'offer' && typeof data.sdp === 'string') {
     if (!viewer.pc || viewer.session !== data.session || viewer.pc.signalingState === 'closed') newViewerPc(data.session);
     const pc = viewer.pc;
-    await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+    const lowLatency = viewer.bufferMs === 0;
+    viewer.lowLatency = lowLatency;
+    await pc.setRemoteDescription({ type: 'offer', sdp: lowLatency ? ownAudioStream(data.sdp) : data.sdp });
     for (const c of viewer.pendingCandidates.splice(0)) await pc.addIceCandidate(c).catch(() => {});
     const answer = await pc.createAnswer();
-    const tuned = mungeSdp(answer.sdp);
-    const surround = viewer.caps?.surround ? mungeSdp(acceptMultiopus(answer.sdp, data.sdp)) : tuned;
+    const base = lowLatency ? answer.sdp : withoutPlayoutDelay(answer.sdp);
+    const tuned = mungeSdp(base);
+    const surround = viewer.caps?.surround ? mungeSdp(acceptMultiopus(base, data.sdp)) : tuned;
     let applied = false;
     for (const sdp of new Set([surround, tuned])) {
       try {
@@ -2034,6 +2055,8 @@ function initViewerUi() {
     viewer.bufferMs = Number(lat.value);
     store.set('ss-buffer', viewer.bufferMs);
     for (const r of viewer.pc?.getReceivers() || []) tuneReceiver(r);
+    // to or from "Minimális": the connection is set up differently (see ownAudioStream)
+    if (viewer.pc && viewer.lowLatency !== (viewer.bufferMs === 0)) sendToHost({ type: 'recall' });
   });
 
   $('#btnMute').addEventListener('click', toggleMute);

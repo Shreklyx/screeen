@@ -42,6 +42,9 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 app.commandLine.appendSwitch('enable-features', 'WebRtcAllowH265Send,WebRtcAllowH265Receive,PlatformHEVCEncoderSupport');
 // Windows: a covered window must not be treated as hidden.
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+// Viewers show every frame the moment it is decoded: zero playout delay, sent with the
+// video (RTP header extension). Viewers that pick a buffer ("Simább") leave it out.
+app.commandLine.appendSwitch('force-fieldtrials', 'WebRTC-ForceSendPlayoutDelay/min_ms:0,max_ms:0/');
 
 /* ------------------------------------------------ settings */
 

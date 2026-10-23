@@ -26,7 +26,9 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   Safari, telefon) helyesen lekevert sztereót – a középső (párbeszéd) csatornával együtt. Böngészőből megosztva csak
   sztereó megy (a böngészők a rendszerhangot sztereóban adják).
 - **Alacsony késleltetés**: hardveres kódolás, minimális jitter puffer a nézőnél (rossz hálózaton „Simább” / „Stabil”
-  módra állítható), mozgásra hangolt kódolás filmhez/játékhoz. A késést méri is: a néző statisztikájában és a megosztó
+  módra állítható), mozgásra hangolt kódolás filmhez/játékhoz. „Minimális késés” módban a néző minden képkockát
+  azonnal megjelenít, amint dekódolta: az alkalmazásból megosztva a kép „nulla lejátszási késleltetéssel” megy
+  (RTP playout-delay), és a kép nem vár a hang (hosszabb) pufferére – a tesztben kb. 48 → 36 ms képtől képig. A késést méri is: a néző statisztikájában és a megosztó
   nézőlistájában nézőnként látszik (kódolás + hálózat + fogadástól a megjelenésig).
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).
@@ -150,7 +152,8 @@ nézőlistában pedig, ki kapja térhangban. A néző statisztikájában (**S**)
 
 A `desktop/` mappában van (Electron). Az installereket a GitHub Actions (`.github/workflows/desktop.yml`)
 Windows és Mac gépen építi és teszteli minden változásnál; kézzel: `npm ci --prefix desktop`, majd
-`npm run dist:win --prefix desktop` (Windowson, előtte `desktop/native/build.sh` a 7.1 segédprogramhoz) vagy
+`npm run dist:win --prefix desktop` (Windowson, előtte a 7.1 segédprogram: `desktop/native/build.sh` MinGW-vel, vagy
+Visual Studio parancssorban `cl /std:c++17 /O2 /EHsc /MT /Fe:desktop\native\ss-audio.exe desktop\native\ss-audio.cpp ole32.lib avrt.lib winmm.lib`) vagy
 `npm run dist:mac --prefix desktop` (Macen).
 
 ## Fejlesztés

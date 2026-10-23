@@ -1,6 +1,7 @@
-# Builds the Windows and macOS desktop app, tests that it starts (and on Windows
-# that screen capture and the 5.1/7.1 audio helper work), and publishes the
-# installers to the "desktop-latest" release that the website links to.
+# Builds the Windows and macOS desktop app (on Windows also the 5.1/7.1 audio
+# helper), tests that it starts (and on Windows that screen capture and the
+# helper work), and publishes the installers to the "desktop-latest" release
+# that the website links to.
 name: Desktop app
 
 on:
@@ -14,35 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  audio-helper:
-    # ss-audio.exe: Windows 5.1/7.1 system audio (desktop/native), built with MinGW-w64
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      # rebuilt only when its source changes (the Ubuntu mirror can be very slow)
-      - name: Cached build
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: desktop/native/ss-audio.exe
-          key: ss-audio-${{ hashFiles('desktop/native/ss-audio.cpp', 'desktop/native/build.sh') }}
-      - name: Build ss-audio.exe
-        if: steps.cache.outputs.cache-hit != 'true'
-        env:
-          CXX: x86_64-w64-mingw32-g++-win32
-        run: |
-          sudo apt-get -o Acquire::Retries=5 update -q
-          sudo apt-get -o Acquire::Retries=5 install -y -q --no-install-recommends g++-mingw-w64-x86-64-win32
-          desktop/native/build.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ss-audio
-          path: desktop/native/ss-audio.exe
-          if-no-files-found: error
-
   build:
-    needs: audio-helper
     strategy:
       fail-fast: false
       matrix:
@@ -73,12 +46,14 @@ jobs:
           npm ci
           npm ci --prefix desktop
 
-      - name: Get the audio helper
+      # ss-audio.exe: Windows 5.1/7.1 system audio (desktop/native); /MT = no VC++ runtime needed
+      - name: Build the audio helper
         if: runner.os == 'Windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: ss-audio
-          path: desktop/native
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cl /nologo /std:c++17 /O2 /EHsc /W3 /MT /Fo:desktop\native\ /Fe:desktop\native\ss-audio.exe desktop\native\ss-audio.cpp ole32.lib avrt.lib winmm.lib || exit /b 1
 
       - name: Build
         working-directory: desktop
@@ -110,7 +85,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: screenshare-*  # the installers only (ss-audio.exe is inside the Windows one)
+          pattern: screenshare-*
           path: out
           merge-multiple: true
       - name: Publish to the "desktop-latest" release
