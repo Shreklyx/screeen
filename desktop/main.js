@@ -13,7 +13,7 @@
 //    running next to it cannot starve them),
 //  - the computer does not go to sleep while sharing.
 
-const { app, BrowserWindow, Menu, desktopCapturer, dialog, ipcMain, powerSaveBlocker, session, shell, systemPreferences } = require('electron');
+const { app, BrowserWindow, Menu, desktopCapturer, dialog, ipcMain, powerSaveBlocker, screen, session, shell, systemPreferences } = require('electron');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -90,8 +90,17 @@ function loadServer() {
   mainWindow.loadURL(serverUrl);
 }
 
+// Last window position, unless that monitor is gone.
+function savedBounds() {
+  const b = loadConfig().bounds;
+  if (!b || !b.width || !b.height) return {};
+  const visible = screen.getAllDisplays().some(({ workArea: w }) =>
+    b.x < w.x + w.width - 80 && b.x + b.width > w.x + 80 && b.y >= w.y - 20 && b.y < w.y + w.height - 80);
+  return visible ? b : { width: b.width, height: b.height };
+}
+
 function createMainWindow() {
-  const bounds = loadConfig().bounds || {};
+  const bounds = savedBounds();
   mainWindow = new BrowserWindow({
     width: bounds.width || 1360,
     height: bounds.height || 880,
