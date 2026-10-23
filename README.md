@@ -109,6 +109,39 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
   megy – ilyenkor a szerver sávszélessége is számít.
 - Hibakereséshez: a link elé írt `?relay=1` (pl. `https://mozizas.hu/?relay=1#kod`) mindenképp a TURN relén át küldi a képet.
 
+## Asztali alkalmazás (Windows, Mac)
+
+Letöltés: a weboldal főoldalán, vagy <https://github.com/Shreklyx/screeen/releases/tag/desktop-latest>
+(**ScreenShare-Setup.exe** Windowsra, **ScreenShare-mac.dmg** Macre – Intel és Apple Silicon is).
+
+Ugyanaz az oldal, mint a böngészőben (a szerverről töltődik, így mindig friss), plusz:
+
+- **saját képernyő-/ablakválasztó**, Windowson a **rendszerhang magától megy** (nem kell pipát keresni),
+- **két videókártyás laptopon az erősebbet használja** (NVIDIA → NVENC hardveres kódolás), és engedi a **H.265**
+  hardveres kódolást, ha a túloldal is támogatja,
+- a megosztás **nem lassul le**, ha az ablak kicsinyítve vagy takarásban van, és megosztás közben a kódoló
+  folyamatok **magasabb prioritást** kapnak (egy mellette futó játék nem fojtja el),
+- megosztás közben **nem alszik el** a gép.
+
+**Telepítés:** az alkalmazás nincs Microsofttal / Apple-lel aláírva (ahhoz fizetős fejlesztői fiók kell), ezért:
+
+- Windows: „A Windows megvédte a számítógépet” → **További információ → Futtatás mindenképp**.
+- Mac: első indításkor jobb klikk az alkalmazáson → **Megnyitás** (vagy *Rendszerbeállítások → Adatvédelem és
+  biztonság → Megnyitás mindenképp*), majd engedélyezd a **Képernyőfelvételt** és indítsd újra.
+
+**Mac hang (BlackHole):** a macOS nem enged rendszerhangot rögzíteni sem böngészőnek, sem az alkalmazásnak, ezért:
+
+1. Telepítsd az ingyenes **BlackHole 2ch**-t: <https://existential.audio/blackhole/>.
+2. *Audio MIDI beállítás* → bal lent **+** → **Több kimenetes eszköz létrehozása** → pipáld be a hangszórót /
+   fejhallgatót **és** a BlackHole 2ch-t, majd válaszd ki ezt kimenetnek (így te is hallod).
+3. Megosztás közben a **Hang → Hangforrás** listában válaszd a **BlackHole 2ch**-t (böngészőben is működik).
+
+**Szerver címe:** *Fájl → Szerver címe…* (alap: `https://mozizas.hu`).
+
+A `desktop/` mappában van (Electron). Az installereket a GitHub Actions (`.github/workflows/desktop.yml`)
+Windows és Mac gépen építi és teszteli minden változásnál; kézzel: `npm ci --prefix desktop`, majd
+`npm run dist:win --prefix desktop` (Windowson) vagy `npm run dist:mac --prefix desktop` (Macen).
+
 ## Fejlesztés
 
 ```bash

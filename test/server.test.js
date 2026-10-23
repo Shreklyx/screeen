@@ -69,6 +69,8 @@ test('serves the page with security headers', async () => {
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-type'), /text\/html/);
   assert.match(res.headers.get('content-security-policy'), /script-src 'self'/);
+  assert.match(res.headers.get('permissions-policy'), /display-capture=\(self\)/);
+  assert.match(res.headers.get('permissions-policy'), /microphone=\(self\)/); // audio source picker
   assert.equal((await fetch(`http://${base}/app.js`)).status, 200);
   assert.equal((await fetch(`http://${base}/../server/server.js`)).status, 404);
   assert.equal((await fetch(`http://${base}/server/server.js`)).status, 404);

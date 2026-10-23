@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'">
+  <title>Szerver címe</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="settings.js" defer></script>
+</head>
+<body>
+  <form id="form" class="form">
+    <h1>Szerver címe</h1>
+    <p class="muted">A Screen Share szerver, amihez az alkalmazás kapcsolódik.</p>
+    <input id="url" type="text" spellcheck="false" placeholder="https://mozizas.hu">
+    <div id="error" class="error"></div>
+    <div class="actions">
+      <button id="cancel" class="btn" type="button">Mégse</button>
+      <button class="btn btn-primary" type="submit">Mentés</button>
+    </div>
+  </form>
+</body>
+</html>

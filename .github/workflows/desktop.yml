@@ -1,0 +1,95 @@
+# Builds the Windows and macOS desktop app, tests that it starts (and on Windows
+# that screen capture works), and publishes the installers to the
+# "desktop-latest" release that the website links to.
+name: Desktop app
+
+on:
+  push:
+    branches: [claude/elegant-gauss-mi4rl5, main]
+    paths: ['desktop/**', 'public/**', 'server/**', '.github/workflows/desktop.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            builder: --win --x64
+            app: desktop/dist/win-unpacked/Screen Share.exe
+            smoke: --smoke-capture
+          - os: macos-latest
+            builder: --mac --universal
+            app: desktop/dist/mac-universal/Screen Share.app/Contents/MacOS/Screen Share
+            smoke: ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+
+      - name: Install
+        run: |
+          npm ci
+          npm ci --prefix desktop
+
+      - name: Build
+        working-directory: desktop
+        run: npx electron-builder ${{ matrix.builder }} --publish never
+
+      - name: Smoke test (app starts, loads the site, Windows: captures the screen)
+        shell: bash
+        run: |
+          HOST_PASSWORD=ci PORT=8080 node server/server.js &
+          sleep 3
+          "${{ matrix.app }}" --url=http://127.0.0.1:8080/ --smoke-test ${{ matrix.smoke }} --smoke-log="$RUNNER_TEMP/smoke.log" || status=$?
+          cat "$RUNNER_TEMP/smoke.log" || true
+          exit ${status:-0}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshare-${{ runner.os }}
+          path: |
+            desktop/dist/ScreenShare-Setup.exe
+            desktop/dist/ScreenShare-mac.dmg
+            desktop/dist/ScreenShare-mac.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish to the "desktop-latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: desktop-latest
+          target_commitish: ${{ github.sha }}
+          name: Screen Share – asztali alkalmazás
+          body: |
+            Windows: **ScreenShare-Setup.exe** · Mac (Intel és Apple Silicon): **ScreenShare-mac.dmg**
+
+            Az alkalmazás nincs Microsofttal / Apple-lel aláírva:
+            - Windows: „A Windows megvédte a számítógépet” ablaknál → **További információ → Futtatás mindenképp**.
+            - Mac: az első indításnál jobb klikk az alkalmazáson → **Megnyitás**, vagy Rendszerbeállítások → Adatvédelem és biztonság → **Megnyitás mindenképp**.
+
+            Készült: ${{ github.sha }}
+          files: out/*
+          make_latest: true

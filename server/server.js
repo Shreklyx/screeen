@@ -154,7 +154,8 @@ function securityHeaders(req) {
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
     'X-Frame-Options': 'DENY',
-    'Permissions-Policy': 'display-capture=(self), camera=(), microphone=(), geolocation=()',
+    // microphone: an audio input can be the shared sound source (e.g. BlackHole on a Mac)
+    'Permissions-Policy': 'display-capture=(self), microphone=(self), camera=(), geolocation=()',
   };
 }
 

@@ -192,6 +192,24 @@ input[type="password"] {
 .features strong { display: block; font-size: 15px; }
 .features span { color: var(--text-muted); font-size: 13px; }
 
+.downloads {
+  max-width: 920px;
+  margin: 28px auto 0;
+  padding: 20px 26px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.downloads h2 { margin: 0 0 4px; font-size: 18px; }
+.downloads .hint { margin: 0; max-width: 520px; }
+.dl-buttons { display: flex; gap: 10px; }
+.dl-buttons .btn { text-decoration: none; }
+
 .howto {
   max-width: 920px;
   margin: 28px auto 0;

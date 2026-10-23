@@ -64,13 +64,24 @@
         <li><strong>Hardveres kódolás</strong><span>NVIDIA NVENC, Apple, Intel, AMD</span></li>
       </ul>
 
+      <section id="downloads" class="downloads" hidden aria-labelledby="dl-title">
+        <div>
+          <h2 id="dl-title">Asztali alkalmazás</h2>
+          <p class="hint">Windowson a rendszerhangot magától megosztja, laptopon az erősebb videókártyát használja (NVIDIA), és a háttérben sem lassul le a megosztás.</p>
+        </div>
+        <div class="dl-buttons">
+          <a id="dlWin" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-Setup.exe">Windows</a>
+          <a id="dlMac" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-mac.dmg">Mac</a>
+        </div>
+      </section>
+
       <section class="howto" aria-labelledby="howto-title">
         <h2 id="howto-title">Így megy a hang Windows 10 / 11 alatt</h2>
         <ol>
           <li>Nyisd meg az oldalt <b>Chrome</b>-ban vagy <b>Edge</b>-ben, és kattints a <b>Képernyő megosztása</b> gombra.</li>
           <li>A felugró ablakban válaszd a <b>Teljes képernyő</b> lehetőséget, és pipáld be a <b>Rendszerhang megosztása</b> négyzetet.</li>
           <li>Csak egy böngészőfül hangja kell (pl. egy film)? Válaszd a <b>Chrome-lap</b> fület, és kapcsold be a <b>lap hangjának megosztását</b>.</li>
-          <li><b>Mac:</b> Chrome-ban egy böngészőlap hangja mindig megosztható; teljes képernyőnél akkor van hang, ha a Chrome felajánlja a <b>Rendszerhang megosztása</b> opciót. A Safari nem tud hangot megosztani.</li>
+          <li><b>Mac:</b> Chrome-ban egy böngészőlap hangja mindig megosztható; teljes képernyőnél akkor van hang, ha a Chrome felajánlja a <b>Rendszerhang megosztása</b> opciót. A Mac teljes rendszerhangjához telepítsd az ingyenes <b>BlackHole</b>-t, és megosztás közben válaszd a <b>Hangforrás</b> listában. A Safari nem tud hangot megosztani.</li>
         </ol>
         <p class="hint">Ha egyetlen ablak megosztásakor nincs hang, oszd meg inkább a teljes képernyőt. A nézők bármilyen böngészőben nézhetik, telefonon is.</p>
       </section>
@@ -118,6 +129,10 @@
 
         <section class="box">
           <h3>Hang</h3>
+          <div class="field">
+            <label for="setAudioSource">Hangforrás</label>
+            <select id="setAudioSource"><option value="display">Képernyő / rendszerhang</option></select>
+          </div>
           <div class="meter" aria-hidden="true"><div id="audioMeter" class="meter-fill"></div></div>
           <p id="audioStatus" class="hint"></p>
         </section>

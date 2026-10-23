@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'">
+  <title>Screen Share</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="offline.js" defer></script>
+</head>
+<body>
+  <div class="center">
+    <div class="box">
+      <h1>Nem érhető el a szerver</h1>
+      <p class="muted"><span id="url"></span><br><span id="error"></span></p>
+      <div class="actions">
+        <button id="settings" class="btn" type="button">Szerver címe…</button>
+        <button id="retry" class="btn btn-primary" type="button">Újrapróbálás</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

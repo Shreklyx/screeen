@@ -1,0 +1,65 @@
+{
+  "name": "screenshare-desktop",
+  "productName": "Screen Share",
+  "version": "1.0.0",
+  "description": "Screen Share – 4K képernyőmegosztás hanggal, Windowsra és Macre",
+  "main": "main.js",
+  "author": "Shreklyx",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win --x64 --publish never",
+    "dist:mac": "electron-builder --mac --universal --publish never"
+  },
+  "devDependencies": {
+    "electron": "44.7.0",
+    "electron-builder": "26.17.0"
+  },
+  "build": {
+    "appId": "hu.mozizas.screenshare",
+    "productName": "Screen Share",
+    "copyright": "Shreklyx",
+    "files": [
+      "main.js",
+      "preload.js",
+      "picker-preload.js",
+      "pages/**"
+    ],
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "electronLanguages": ["hu", "en-US", "en"],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "build/icon.png",
+      "artifactName": "ScreenShare-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Screen Share"
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["universal"] },
+        { "target": "zip", "arch": ["universal"] }
+      ],
+      "icon": "build/icon.png",
+      "category": "public.app-category.video",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "artifactName": "ScreenShare-mac.${ext}",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "A kiválasztott hangforrás (pl. BlackHole) megosztásához.",
+        "NSAudioCaptureUsageDescription": "A rendszerhang megosztásához."
+      }
+    },
+    "dmg": {
+      "title": "Screen Share"
+    }
+  }
+}

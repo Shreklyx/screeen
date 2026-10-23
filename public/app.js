@@ -22,7 +22,7 @@ const AUDIO_MAX_BPS = 510000;
 const MAX_KBPS = 300000; // SDP ceiling, above the highest selectable rate (250 Mbit/s)
 const START_KBPS_CAP = 12000;
 // "auto" = chosen per viewer from what this machine can do (see autoTarget)
-const DEFAULT_SETTINGS = { res: 'auto', fps: 'auto', kbps: 'auto', mode: 'motion', codec: 'auto', audio: true };
+const DEFAULT_SETTINGS = { res: 'auto', fps: 'auto', kbps: 'auto', mode: 'motion', codec: 'auto', audio: true, audioSource: 'display' };
 const SETTINGS_VERSION = 2; // older saved settings are dropped so everyone starts from the best defaults
 const NUMERIC_SETTINGS = new Set(['fps', 'kbps']);
 // GPU encoding: the maximum (4K cap – a 5K/6K Retina screen at full size only adds load and delay)
@@ -35,6 +35,8 @@ const SW_TIERS = [
   { res: '1440', fps: 60, kbps: 50000 },
 ];
 const IS_MAC = /Macintosh/.test(navigator.userAgent);
+// The Windows/Mac desktop app (desktop/preload.js) exposes a small API; null in a plain browser.
+const APP = window.screenshareApp || null;
 const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
 
 const ERROR_TEXT = {
@@ -415,14 +417,28 @@ const isLive = () => Boolean(host.video && host.video.readyState === 'live');
 
 const captureFps = () => (settings.fps === 'auto' ? HW_TARGET.fps : settings.fps);
 
+const RAW_AUDIO = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 }, sampleRate: { ideal: 48000 } };
+const useDeviceAudio = () => settings.audio && settings.audioSource !== 'display';
+
+// Audio from an input device instead of the shared screen (e.g. BlackHole on a Mac).
+async function captureDeviceAudio() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { ...RAW_AUDIO, deviceId: { exact: settings.audioSource } } });
+    const track = stream.getAudioTracks()[0];
+    track.contentHint = 'music';
+    return track;
+  } catch (err) {
+    toast(`A kiválasztott hangforrás nem érhető el (${err.name}). Hang nélkül megy tovább.`, 'warn', 8000);
+    return null;
+  }
+}
+
 async function captureScreen() {
   const fps = captureFps();
   const video = { frameRate: { ideal: fps, max: fps }, cursor: 'always' };
-  const audio = settings.audio
-    ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 }, sampleRate: { ideal: 48000 }, suppressLocalAudioPlayback: false }
-    : false;
+  const audio = settings.audio && !useDeviceAudio() ? { ...RAW_AUDIO, suppressLocalAudioPlayback: false } : false;
   const extras = {
-    systemAudio: settings.audio ? 'include' : 'exclude',
+    systemAudio: audio ? 'include' : 'exclude',
     selfBrowserSurface: 'exclude',
     surfaceSwitching: 'include',
     monitorTypeSurfaces: 'include',
@@ -436,10 +452,51 @@ async function captureScreen() {
     stream = await navigator.mediaDevices.getDisplayMedia({ video, ...extras });
   }
   const videoTrack = stream.getVideoTracks()[0];
-  const audioTrack = stream.getAudioTracks()[0] || null;
+  let audioTrack = stream.getAudioTracks()[0] || null;
   videoTrack.contentHint = CONTENT_HINT[settings.mode];
   if (audioTrack) audioTrack.contentHint = 'music';
+  if (useDeviceAudio()) audioTrack = await captureDeviceAudio();
   return { video: videoTrack, audio: audioTrack };
+}
+
+// Swap only the audio (another source picked while sharing).
+function setHostAudio(track) {
+  const old = host.audio;
+  host.audio = track;
+  for (const v of host.viewers.values()) v.audioTx?.sender.replaceTrack(track).catch((err) => console.warn('replaceTrack failed', err));
+  if (old && old !== track) old.stop();
+  startMeter(track);
+  updateCaptureInfo();
+}
+
+async function populateAudioSources() {
+  const select = $('#setAudioSource');
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+  let inputs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput' && d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
+  const options = [new Option('Képernyő / rendszerhang', 'display')];
+  inputs.forEach((d, i) => options.push(new Option(d.label || `Hangbemenet ${i + 1}`, d.deviceId)));
+  if (!inputs.some((d) => d.label)) options.push(new Option('Eszközök listázása…', 'list'));
+  select.replaceChildren(...options);
+  select.value = settings.audioSource;
+  if (select.value !== settings.audioSource) select.value = 'display';
+}
+
+async function onAudioSourceChange(e) {
+  const value = e.target.value;
+  if (value === 'list') {
+    // device names are only visible after an audio permission
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      s.getTracks().forEach((t) => t.stop());
+    } catch { /* permission refused */ }
+    await populateAudioSources();
+    return;
+  }
+  settings.audioSource = value;
+  store.set('ss-settings', settings);
+  if (!isLive() || !settings.audio) return;
+  if (useDeviceAudio()) setHostAudio(await captureDeviceAudio());
+  else switchSource(); // display audio only comes with a new screen pick
 }
 
 function hostSignal() {
@@ -860,6 +917,7 @@ function setHostTracks({ video, audio }) {
   $('#liveBadge').textContent = 'ÉLŐ';
   $('#btnStop').hidden = false;
   host.signal?.send({ t: 'state', live: true });
+  APP?.setSharing?.(true);
   startMeter(audio);
   updateCaptureInfo();
   renderViewers();
@@ -871,6 +929,7 @@ function stopTracks() {
   host.video = null;
   host.audio = null;
   stopMeter();
+  APP?.setSharing?.(false);
 }
 
 function pauseSharing() {
@@ -950,7 +1009,13 @@ function updateCaptureInfo() {
     el.textContent = 'A hangmegosztás ki van kapcsolva a beállításokban.';
     el.className = 'hint';
   } else {
-    if (IS_SAFARI) {
+    if (useDeviceAudio()) {
+      el.textContent = 'A kiválasztott hangforrás nem érhető el – válassz másikat a Hangforrás listában.';
+    } else if (APP && !IS_MAC) {
+      el.textContent = 'Nincs hang: a választóban hagyd bekapcsolva a „Rendszerhang megosztása” opciót (Forrás váltása).';
+    } else if (APP && IS_MAC) {
+      el.textContent = 'Macen a rendszerhanghoz telepítsd az ingyenes BlackHole-t (existential.audio/blackhole), állítsd be kimenetnek egy „Több kimenetes eszközben”, és válaszd ki itt a Hangforrás listában.';
+    } else if (IS_SAFARI) {
       el.textContent = 'A Safari nem tud hangot megosztani. Ha hang is kell, oszd meg Chrome-ból.';
     } else if (IS_MAC) {
       el.textContent = 'Nincs hang. Macen egy böngészőlap hangja biztosan megosztható: Forrás váltása → „Chrome-lap” fül → lap hangjának megosztása. Teljes képernyőnél akkor van hang, ha a Chrome felajánlja a „Rendszerhang megosztása” opciót (újabb macOS).';
@@ -1235,6 +1300,17 @@ function initHostUi() {
 
   const saved = store.get('ss-host-password', '');
   if (saved) $('#hostPassword').value = saved;
+
+  populateAudioSources();
+  $('#setAudioSource').addEventListener('change', onAudioSourceChange);
+  navigator.mediaDevices?.addEventListener?.('devicechange', populateAudioSources);
+
+  if (APP) {
+    document.documentElement.classList.add('in-app');
+  } else {
+    $('#downloads').hidden = false;
+    $(IS_MAC ? '#dlMac' : '#dlWin').classList.add('btn-primary');
+  }
 
   $('#shareForm').addEventListener('submit', startHosting);
   $('#btnSwitch').addEventListener('click', switchSource);
