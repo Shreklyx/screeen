@@ -19,6 +19,13 @@ const OPUS_PARAMS = {
   'sprop-maxcapturerate': 48000, useinbandfec: 1, usedtx: 0, cbr: 0,
 };
 const AUDIO_MAX_BPS = 510000;
+// 5.1/7.1 audio: multi-channel Opus ("multiopus" – Chromium: Chrome, Edge, the app).
+// Channel order L R C LFE BL BR SL SR (as on Windows and in Chromium); the pairs
+// L/R, BL/BR and SL/SR are coded as stereo streams, the centre and LFE as mono.
+const MULTIOPUS = {
+  channels: 8,
+  fmtp: 'channel_mapping=0,1,6,7,2,3,4,5;coupled_streams=3;num_streams=5;minptime=10;useinbandfec=1;maxaveragebitrate=510000',
+};
 const MAX_KBPS = 300000; // SDP ceiling, above the highest selectable rate (250 Mbit/s)
 const START_KBPS_CAP = 12000;
 // "auto" = chosen per viewer from what this machine can do (see autoTarget)
@@ -363,6 +370,46 @@ function mungeSdp(sdp, { preferCodec, startKbps } = {}) {
   }).join('\r\n');
 }
 
+// Adds a codec to the audio section and makes it the preferred one.
+function insertAudioCodec(sdp, pt, rtpmap, fmtp) {
+  return sdp.split(/\r\n(?=m=)/).map((section) => {
+    if (!section.startsWith('m=audio')) return section;
+    const lines = section.split('\r\n');
+    const parts = lines[0].split(' ');
+    lines[0] = [...parts.slice(0, 3), String(pt), ...parts.slice(3).filter((p) => p !== String(pt))].join(' ');
+    const at = lines.findIndex((l) => l.startsWith('a=rtpmap:'));
+    lines.splice(at < 0 ? lines.length : at, 0, `a=rtpmap:${pt} ${rtpmap}`, `a=fmtp:${pt} ${fmtp}`);
+    return lines.join('\r\n');
+  }).join('\r\n');
+}
+
+// Host: offer 5.1/7.1 Opus first (Chromium supports it but never offers it by itself).
+function offerMultiopus(sdp) {
+  if (/ multiopus\//i.test(sdp)) return sdp;
+  const used = new Set([...sdp.matchAll(/^a=rtpmap:(\d+) /gm)].map((m) => Number(m[1])));
+  const pt = Array.from({ length: 32 }, (_, i) => 96 + i).find((p) => !used.has(p));
+  return pt ? insertAudioCodec(sdp, pt, `multiopus/48000/${MULTIOPUS.channels}`, MULTIOPUS.fmtp) : sdp;
+}
+
+// Host: no 5.1/7.1 (any more) – Chromium keeps offering a codec that was negotiated before.
+function withoutMultiopus(sdp) {
+  const pts = [...sdp.matchAll(/^a=rtpmap:(\d+) multiopus\//gim)].map((m) => m[1]);
+  if (!pts.length) return sdp;
+  const owned = new RegExp(`^a=(rtpmap|fmtp|rtcp-fb):(${pts.join('|')}) `);
+  return sdp.split('\r\n')
+    .filter((l) => !owned.test(l))
+    .map((l) => (l.startsWith('m=audio') ? l.split(' ').filter((p, i) => i < 3 || !pts.includes(p)).join(' ') : l))
+    .join('\r\n');
+}
+
+// Viewer: take the offered 5.1/7.1 Opus into the answer (Chromium leaves it out by itself).
+function acceptMultiopus(answer, offer) {
+  const m = /^a=rtpmap:(\d+) (multiopus\/48000\/\d+)/im.exec(offer);
+  if (!m || / multiopus\//i.test(answer)) return answer;
+  const fmtp = new RegExp(`^a=fmtp:${m[1]} (.*)$`, 'm').exec(offer);
+  return insertAudioCodec(answer, m[1], m[2], fmtp ? fmtp[1] : MULTIOPUS.fmtp);
+}
+
 /* ----------------------------- stats ----------------------------- */
 
 function selectedPair(report) {
@@ -401,7 +448,11 @@ const host = {
   iceServers: [],
   msid: null, // groups audio + video into one stream on the viewer side (lip sync)
   video: null,
-  audio: null,
+  audio: null, // stereo – what every viewer gets unless it plays 5.1/7.1
+  audio8: null, // 7.1 track when the computer's output is 5.1/7.1 (Windows app)
+  stopSurround: null,
+  surroundLabel: '',
+  audioDenied: false, // macOS refused system audio recording
   viewers: new Map(),
   seq: 0,
   encCaps: null,
@@ -420,7 +471,7 @@ const captureFps = () => (settings.fps === 'auto' ? HW_TARGET.fps : settings.fps
 const RAW_AUDIO = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 }, sampleRate: { ideal: 48000 } };
 const useDeviceAudio = () => settings.audio && settings.audioSource !== 'display';
 
-// Audio from an input device instead of the shared screen (e.g. BlackHole on a Mac).
+// Audio from an input device instead of the shared screen (the Hangforrás list).
 async function captureDeviceAudio() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { ...RAW_AUDIO, deviceId: { exact: settings.audioSource } } });
@@ -433,6 +484,144 @@ async function captureDeviceAudio() {
   }
 }
 
+/* ---- 5.1 / 7.1 system audio (Windows app) ----
+ * Chromium records the system sound in stereo only. When the computer's output is
+ * 5.1/7.1, the app's helper (desktop/native/ss-audio.cpp) delivers every channel.
+ * It becomes two tracks: 7.1 for viewers with surround speakers (multi-channel
+ * Opus) and a stereo downmix – dialogue from the centre included – for the rest.
+ */
+
+// Windows channel-mask bits → our 7.1 channels (L R C LFE BL BR SL SR) with a gain.
+const SPEAKERS = [
+  [[0, 1]], [[1, 1]], [[2, 1]], [[3, 1]], [[4, 1]], [[5, 1]], // FL FR FC LFE BL BR
+  [[0, 0.707], [2, 0.707]], [[1, 0.707], [2, 0.707]], // FLC FRC
+  [[4, 0.707], [5, 0.707]], [[6, 1]], [[7, 1]], // BC SL SR
+  [[2, 0.707]], [[0, 0.707]], [[2, 0.707]], [[1, 0.707]], // TC TFL TFC TFR
+  [[4, 0.707]], [[4, 0.5], [5, 0.5]], [[5, 0.707]], // TBL TBC TBR
+];
+
+function speakerMap({ channels, mask }) {
+  const map = [];
+  for (let bit = 0, c = 0; c < channels; c++, bit++) {
+    while (bit < SPEAKERS.length && !(mask & (1 << bit))) bit++;
+    map.push((SPEAKERS[bit] || []).map(([dst, gain]) => [dst, gain]));
+  }
+  // 5.1 with "back" surrounds: on 7.1 speakers those are the side ones
+  if ((mask & 0x630) === 0x30) for (const targets of map) for (const t of targets) if (t[0] === 4 || t[0] === 5) t[0] += 2;
+  return map;
+}
+
+// Keeps the stereo downmix out of hard clipping when every channel is loud.
+const softClip = (x) => (Math.abs(x) <= 0.9 ? x : Math.sign(x) * (0.9 + 0.1 * Math.tanh((Math.abs(x) - 0.9) / 0.1)));
+
+const surroundName = (channels) => (channels >= 8 ? '7.1' : channels >= 6 ? '5.1' : `${channels} csatornás`);
+
+// Chromium treats AudioData timestamps as capture times (lip sync is built on them), on its
+// own clock: µs to add to performance.now() × 1000. Read from a Web Audio track, which
+// delivers even in silence (a system-audio track may not), else from `fallback`.
+async function audioClockOffset(fallback) {
+  if (!window.MediaStreamTrackProcessor) return 0;
+  const ctx = ensureAudioCtx();
+  let silence = null;
+  let track = fallback?.clone();
+  if (ctx?.state === 'running') {
+    const dest = ctx.createMediaStreamDestination();
+    silence = ctx.createConstantSource(); // a destination with no input delivers nothing
+    silence.offset.value = 0;
+    silence.connect(dest);
+    silence.start();
+    track?.stop();
+    track = dest.stream.getAudioTracks()[0];
+  }
+  if (!track) return 0;
+  const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+  try {
+    const data = (await Promise.race([reader.read(), sleep(1000).then(() => null)]))?.value;
+    if (!data) return 0;
+    const offset = data.timestamp + data.duration - performance.now() * 1000;
+    data.close();
+    return offset;
+  } catch {
+    return 0;
+  } finally {
+    reader.cancel().catch(() => {});
+    track.stop();
+    silence?.stop();
+    silence?.disconnect();
+  }
+}
+
+/**
+ * { surround, stereo, label, setClock, stop } when the output device has more than two
+ * channels, else null. Nothing is sent before setClock() (see audioClockOffset).
+ */
+async function startSurroundAudio() {
+  const api = APP?.systemAudio;
+  if (!api || !window.MediaStreamTrackGenerator || !window.AudioData) return null;
+  let fmt = await api.start().catch(() => null);
+  if (!fmt || fmt.error || fmt.channels <= 2 || fmt.rate > 96000) {
+    if (fmt?.id) api.stop(fmt.id);
+    return null;
+  }
+  const id = fmt.id;
+  const surround = new MediaStreamTrackGenerator({ kind: 'audio' });
+  const stereo = new MediaStreamTrackGenerator({ kind: 'audio' });
+  surround.contentHint = 'music';
+  stereo.contentHint = 'music';
+  const writers = [surround.writable.getWriter(), stereo.writable.getWriter()];
+  let map = speakerMap(fmt);
+  let clock = null; // µs, see audioClockOffset
+  let next = null; // capture time of the next sample, µs
+  api.onFormat((f) => {
+    if (f.id !== id) return;
+    fmt = f;
+    map = speakerMap(f);
+  });
+  api.onData((buffer) => {
+    const { channels, rate } = fmt;
+    const src = new Float32Array(buffer);
+    const n = Math.floor(src.length / channels);
+    if (!n || rate > 96000 || clock == null) return;
+    // sample-accurate timeline, re-anchored to the arrival time after a gap or drift
+    const duration = (n / rate) * 1e6;
+    const arrived = performance.now() * 1000 + clock - duration;
+    if (next == null || Math.abs(next - arrived) > 20000) next = arrived;
+    const timestamp = Math.round(next);
+    next += duration;
+    const s8 = new Float32Array(n * 8); // planar
+    for (let c = 0; c < channels; c++) {
+      for (const [dst, gain] of map[c]) {
+        const o = dst * n;
+        for (let i = 0, j = c; i < n; i++, j += channels) s8[o + i] += src[j] * gain;
+      }
+    }
+    // ITU downmix: centre and surrounds at -3 dB, LFE left out
+    const s2 = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      const centre = 0.707 * s8[2 * n + i];
+      s2[i] = softClip(s8[i] + centre + 0.707 * (s8[4 * n + i] + s8[6 * n + i]));
+      s2[n + i] = softClip(s8[n + i] + centre + 0.707 * (s8[5 * n + i] + s8[7 * n + i]));
+    }
+    [[s8, 8], [s2, 2]].forEach(([data, numberOfChannels], k) => {
+      writers[k].write(new AudioData({ format: 'f32-planar', sampleRate: rate, numberOfFrames: n, numberOfChannels, timestamp, data })).catch(() => {});
+    });
+  });
+  return {
+    surround,
+    stereo,
+    label: surroundName(fmt.channels),
+    async setClock(fallback) {
+      clock = await audioClockOffset(fallback);
+    },
+    stop() {
+      api.stop(id);
+      for (const w of writers) w.close().catch(() => {});
+      surround.stop();
+      stereo.stop();
+    },
+  };
+}
+
 async function captureScreen() {
   const fps = captureFps();
   const video = { frameRate: { ideal: fps, max: fps }, cursor: 'always' };
@@ -443,27 +632,51 @@ async function captureScreen() {
     surfaceSwitching: 'include',
     monitorTypeSurfaces: 'include',
   };
+  // runs while the picker is open
+  const surround = audio && APP?.systemAudio ? startSurroundAudio().catch(() => null) : Promise.resolve(null);
   let stream;
   try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video, audio, ...extras });
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({ video, audio, ...extras });
+    } catch (err) {
+      // Browsers without display-audio support may reject the audio constraints.
+      if (!audio || (err.name !== 'TypeError' && err.name !== 'NotSupportedError')) throw err;
+      stream = await navigator.mediaDevices.getDisplayMedia({ video, ...extras });
+    }
   } catch (err) {
-    // Browsers without display-audio support may reject the audio constraints.
-    if (!audio || (err.name !== 'TypeError' && err.name !== 'NotSupportedError')) throw err;
-    stream = await navigator.mediaDevices.getDisplayMedia({ video, ...extras });
+    surround.then((s) => s?.stop());
+    throw err;
   }
   const videoTrack = stream.getVideoTracks()[0];
   let audioTrack = stream.getAudioTracks()[0] || null;
   videoTrack.contentHint = CONTENT_HINT[settings.mode];
+  // macOS hands over an already ended track when "System Audio Recording" is refused
+  const audioDenied = audioTrack?.readyState === 'ended';
+  if (audioDenied) audioTrack = null;
   if (audioTrack) audioTrack.contentHint = 'music';
-  if (useDeviceAudio()) audioTrack = await captureDeviceAudio();
-  return { video: videoTrack, audio: audioTrack };
+  const result = { video: videoTrack, audio: audioTrack, audioDenied };
+  const sur = await surround;
+  if (sur && audioTrack) {
+    // system sound switched on in the picker and the output is 5.1/7.1: all channels from the helper
+    await sur.setClock(audioTrack);
+    audioTrack.stop();
+    Object.assign(result, { audio: sur.stereo, audio8: sur.surround, stopSurround: sur.stop, surroundLabel: sur.label });
+  } else {
+    sur?.stop();
+  }
+  if (useDeviceAudio()) result.audio = await captureDeviceAudio();
+  return result;
 }
 
 // Swap only the audio (another source picked while sharing).
 function setHostAudio(track) {
   const old = host.audio;
+  const hadSurround = dropSurround();
   host.audio = track;
-  for (const v of host.viewers.values()) v.audioTx?.sender.replaceTrack(track).catch((err) => console.warn('replaceTrack failed', err));
+  for (const v of host.viewers.values()) {
+    v.audioTx?.sender.replaceTrack(track).catch((err) => console.warn('replaceTrack failed', err));
+    if (hadSurround && v.pc && v.caps?.surround) negotiate(v); // back to stereo Opus
+  }
   if (old && old !== track) old.stop();
   startMeter(track);
   updateCaptureInfo();
@@ -715,11 +928,12 @@ function createViewerPc(v) {
   v.restarts = 0;
   v.prev = null;
   v.stats = null;
+  v.surroundActive = false;
 
   const pc = new RTCPeerConnection(rtcConfig(host.iceServers));
   v.pc = pc;
   v.videoTx = addSendTransceiver(pc, host.video || 'video', videoEncoding(v));
-  v.audioTx = addSendTransceiver(pc, host.audio || 'audio', { maxBitrate: AUDIO_MAX_BPS, priority: 'high', networkPriority: 'high' });
+  v.audioTx = addSendTransceiver(pc, audioTrackFor(v) || 'audio', { maxBitrate: AUDIO_MAX_BPS, priority: 'high', networkPriority: 'high' });
   applyCodecPreference(v);
 
   pc.onicecandidate = (e) => {
@@ -776,7 +990,14 @@ async function negotiate(v, { iceRestart = false } = {}) {
   try {
     const offer = await pc.createOffer({ iceRestart });
     if (v.pc !== pc) return;
-    await pc.setLocalDescription(offer);
+    // 5.1/7.1 for viewers with surround speakers, while the host has surround sound
+    const sdp = host.audio8 && v.caps?.surround ? offerMultiopus(offer.sdp) : withoutMultiopus(offer.sdp);
+    try {
+      await pc.setLocalDescription({ type: 'offer', sdp });
+    } catch (err) {
+      if (sdp === offer.sdp) throw err;
+      await pc.setLocalDescription(offer);
+    }
     host.signal.send({ t: 'signal', to: v.id, data: { type: 'offer', session: v.session, sdp: pc.localDescription.sdp } });
     clearTimeout(v.answerTimer);
     // No answer (lost message, viewer stuck): start over with a fresh connection.
@@ -816,6 +1037,7 @@ async function onViewerSignal(id, data) {
     if (v.pc !== pc) return;
     for (const c of v.remoteCandidates.splice(0)) pc.addIceCandidate(c).catch(() => {});
     v.negotiating = false;
+    updateSurround(v);
     if (pc.connectionState === 'connected') applySenderParams(v);
     if (v.pendingNegotiation) {
       const iceRestart = v.pendingRestart;
@@ -827,6 +1049,28 @@ async function onViewerSignal(id, data) {
     if (pc.remoteDescription) pc.addIceCandidate(data.candidate).catch(() => {});
     else v.remoteCandidates.push(data.candidate);
   }
+}
+
+// The 7.1 track goes to viewers whose connection agreed on multi-channel Opus.
+const audioTrackFor = (v) => (host.audio8 && v.surroundActive ? host.audio8 : host.audio);
+
+function updateSurround(v) {
+  const sender = v.audioTx?.sender;
+  if (!sender) return;
+  const codec = sender.getParameters().codecs?.[0]?.mimeType?.toLowerCase();
+  v.surroundActive = codec === 'audio/multiopus';
+  const track = audioTrackFor(v);
+  if (sender.track !== track) sender.replaceTrack(track).catch((err) => console.warn('replaceTrack failed', err));
+}
+
+// Stops the 5.1/7.1 capture; true if there was one.
+function dropSurround() {
+  if (!host.audio8) return false;
+  host.audio8.stop();
+  host.stopSurround?.();
+  host.audio8 = null;
+  host.stopSurround = null;
+  return true;
 }
 
 function onViewerPcState(v, pc) {
@@ -896,19 +1140,22 @@ function applyAllSenders() {
 
 /* ---- capture lifecycle ---- */
 
-function setHostTracks({ video, audio }) {
-  const old = [host.video, host.audio];
-  host.video = video;
-  host.audio = audio;
+function setHostTracks({ video, audio, audio8 = null, stopSurround = null, surroundLabel = '', audioDenied = false }) {
+  const old = [host.video, host.audio, host.audio8];
+  const oldStopSurround = host.stopSurround;
+  const surroundChanged = Boolean(host.audio8) !== Boolean(audio8);
+  Object.assign(host, { video, audio, audio8, stopSurround, surroundLabel, audioDenied });
   video.addEventListener('ended', () => { if (host.video === video) pauseSharing(); });
 
   for (const v of host.viewers.values()) {
     if (!v.pc) continue;
     v.videoTx?.sender.replaceTrack(video).catch((err) => console.warn('replaceTrack failed', err));
-    v.audioTx?.sender.replaceTrack(audio).catch((err) => console.warn('replaceTrack failed', err));
+    v.audioTx?.sender.replaceTrack(audioTrackFor(v)).catch((err) => console.warn('replaceTrack failed', err));
     applySenderParams(v);
+    if (surroundChanged && v.caps?.surround) negotiate(v); // offer or drop 5.1/7.1
   }
-  for (const t of old) if (t && t !== video && t !== audio) t.stop();
+  for (const t of old) if (t && t !== video && t !== audio && t !== audio8) t.stop();
+  if (oldStopSurround && oldStopSurround !== stopSurround) oldStopSurround();
 
   host.dims = '';
   if (host.previewOn) $('#preview').srcObject = new MediaStream([video]);
@@ -926,6 +1173,7 @@ function setHostTracks({ video, audio }) {
 function stopTracks() {
   host.video?.stop();
   host.audio?.stop();
+  dropSurround();
   host.video = null;
   host.audio = null;
   stopMeter();
@@ -1002,6 +1250,9 @@ function updateCaptureInfo() {
   const el = $('#audioStatus');
   if (!host.video) {
     el.textContent = '';
+  } else if (host.audio8) {
+    el.textContent = `Hang megosztva: ${host.surroundLabel} térhang. A térhangos hangszórójú nézők (Chrome, Edge, alkalmazás) ${host.surroundLabel}-et kapnak, a többiek sztereó keveréket. A csík mutatja, hogy jön-e hang.`;
+    el.className = 'hint ok';
   } else if (host.audio) {
     el.textContent = 'Hang megosztva (sztereó). A csík mutatja, hogy jön-e hang.';
     el.className = 'hint ok';
@@ -1014,11 +1265,13 @@ function updateCaptureInfo() {
     } else if (APP && !IS_MAC) {
       el.textContent = 'Nincs hang: a választóban hagyd bekapcsolva a „Rendszerhang megosztása” opciót (Forrás váltása).';
     } else if (APP && IS_MAC) {
-      el.textContent = 'Macen a rendszerhanghoz telepítsd az ingyenes BlackHole-t (existential.audio/blackhole), állítsd be kimenetnek egy „Több kimenetes eszközben”, és válaszd ki itt a Hangforrás listában.';
+      el.textContent = host.audioDenied
+        ? 'A macOS nem engedi a rendszerhangot: Rendszerbeállítások → Adatvédelem és biztonság → Képernyő- és rendszerhangfelvétel → a rendszerhang-felvételnél kapcsold be a Screen Share-t, majd indítsd újra az alkalmazást.'
+        : 'Nincs hang: a választóban hagyd bekapcsolva a „Rendszerhang megosztása” opciót (Forrás váltása). macOS 13 vagy újabb kell hozzá.';
     } else if (IS_SAFARI) {
       el.textContent = 'A Safari nem tud hangot megosztani. Ha hang is kell, oszd meg Chrome-ból.';
     } else if (IS_MAC) {
-      el.textContent = 'Nincs hang. Macen egy böngészőlap hangja biztosan megosztható: Forrás váltása → „Chrome-lap” fül → lap hangjának megosztása. Teljes képernyőnél akkor van hang, ha a Chrome felajánlja a „Rendszerhang megosztása” opciót (újabb macOS).';
+      el.textContent = 'Nincs hang. A Mac teljes rendszerhangjához használd a Screen Share alkalmazást (semmit nem kell mellé telepíteni). Böngészőből egy lap hangja megosztható: Forrás váltása → „Chrome-lap” fül → lap hangjának megosztása.';
     } else {
       el.textContent = s.displaySurface === 'window'
         ? 'Nincs hang: ablak megosztásakor a Windows nem ad hangot. Válts „Teljes képernyő”-re, és pipáld be a „Rendszerhang megosztása” opciót.'
@@ -1240,7 +1493,7 @@ function renderViewers() {
       const line1 = document.createElement('div');
       line1.textContent = `${s.w || '?'}×${s.h || '?'} · ${s.fps != null ? Math.round(s.fps) : '–'} FPS · ${fmtKbps(s.kbps)}`;
       const line2 = document.createElement('div');
-      line2.textContent = `${codec}${enc} · RTT ${fmtMs(s.rtt)}`;
+      line2.textContent = `${codec}${enc} · RTT ${fmtMs(s.rtt)}${v.surroundActive && host.audio8 ? ` · ${host.surroundLabel} hang` : ''}`;
       if (s.impl) line2.title = s.impl;
       stats.append(line1, line2);
       if (v.remote?.lat != null) {
@@ -1380,6 +1633,20 @@ function median(list) {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
+// 5.1/7.1 speakers in a Chromium browser (Chrome, Edge, the app): multi-channel
+// Opus plays there as real surround (Chromium opens the output with all channels).
+function surroundSpeakers() {
+  if (!navigator.userAgentData?.brands?.some((b) => /Chromium/i.test(b.brand))) return false;
+  try {
+    const ctx = new AudioContext();
+    const channels = ctx.destination.maxChannelCount;
+    ctx.close().catch(() => {});
+    return channels >= 6;
+  } catch {
+    return false;
+  }
+}
+
 async function startViewing(code) {
   showView('view-viewer');
   $('#viewerRoom').textContent = code;
@@ -1391,6 +1658,7 @@ async function startViewing(code) {
   viewer.code = code;
   setOverlay('Csatlakozás a szobához…');
   viewer.caps = await Promise.race([codecSupport('decode'), sleep(1500).then(() => null)]);
+  if (surroundSpeakers()) viewer.caps = { ...viewer.caps, surround: true };
   viewer.signal = createSignal({
     onMessage: onViewerMessage,
     onOpen: joinRoom,
@@ -1518,11 +1786,17 @@ async function onHostSignal(data) {
     await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
     for (const c of viewer.pendingCandidates.splice(0)) await pc.addIceCandidate(c).catch(() => {});
     const answer = await pc.createAnswer();
-    try {
-      await pc.setLocalDescription({ type: 'answer', sdp: mungeSdp(answer.sdp) });
-    } catch {
-      await pc.setLocalDescription(answer); // a browser that refuses the tuned SDP still gets audio
+    const tuned = mungeSdp(answer.sdp);
+    const surround = viewer.caps?.surround ? mungeSdp(acceptMultiopus(answer.sdp, data.sdp)) : tuned;
+    let applied = false;
+    for (const sdp of new Set([surround, tuned])) {
+      try {
+        await pc.setLocalDescription({ type: 'answer', sdp });
+        applied = true;
+        break;
+      } catch { /* try the next, simpler answer */ }
     }
+    if (!applied) await pc.setLocalDescription(answer); // a browser that refuses the tuned SDP still gets audio
     if (viewer.pc === pc) sendToHost({ type: 'answer', sdp: pc.localDescription.sdp });
   } else if (data.type === 'stats') {
     if (data.session === viewer.session) viewer.hostStats = data;
@@ -1635,6 +1909,8 @@ async function viewerStatsTick() {
   const fps = v.framesPerSecond;
   const kbps = kbpsBetween(v, p, 'bytesReceived');
   const audioKbps = kbpsBetween(a, viewer.prevAudio, 'bytesReceived');
+  const audioCodec = a ? report.get(a.codecId) : null;
+  const audioKind = /multiopus/i.test(audioCodec?.mimeType || '') ? `${surroundName(audioCodec.channels || 0)} térhang` : 'sztereó';
   const relay = isRelayed(report, pair);
   viewer.prev = v;
   viewer.prevAudio = a;
@@ -1663,7 +1939,7 @@ async function viewerStatsTick() {
     ['Csomagvesztés', `${nf1.format(loss)} %`, loss > 2],
     ['Eldobott képk.', String(v.framesDropped ?? 0)],
     ['Kapcsolat', relay == null ? '–' : relay ? 'TURN relé' : 'Közvetlen P2P'],
-    ['Hang', a && audioKbps ? fmtKbps(audioKbps) : 'nincs'],
+    ['Hang', a && audioKbps ? `${fmtKbps(audioKbps)} · ${audioKind}` : 'nincs'],
   ];
   const dl = document.createElement('dl');
   for (const [k, val, warn] of rows) {

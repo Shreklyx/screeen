@@ -8,7 +8,7 @@ let type = 'screen';
 let selected = null;
 
 document.getElementById('audioRow').hidden = !window.picker.audioAvailable;
-document.getElementById('macAudio').hidden = window.picker.platform !== 'darwin';
+document.getElementById('macAudio').hidden = !window.picker.oldMac;
 
 function render() {
   const list = sources.filter((s) => s.type === type);

@@ -1,6 +1,6 @@
 # Builds the Windows and macOS desktop app, tests that it starts (and on Windows
-# that screen capture works), and publishes the installers to the
-# "desktop-latest" release that the website links to.
+# that screen capture and the 5.1/7.1 audio helper work), and publishes the
+# installers to the "desktop-latest" release that the website links to.
 name: Desktop app
 
 on:
@@ -14,7 +14,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  audio-helper:
+    # ss-audio.exe: Windows 5.1/7.1 system audio (desktop/native), built with MinGW-w64
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ss-audio.exe
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q g++-mingw-w64-x86-64
+          desktop/native/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ss-audio
+          path: desktop/native/ss-audio.exe
+          if-no-files-found: error
+
   build:
+    needs: audio-helper
     strategy:
       fail-fast: false
       matrix:
@@ -45,11 +63,18 @@ jobs:
           npm ci
           npm ci --prefix desktop
 
+      - name: Get the audio helper
+        if: runner.os == 'Windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: ss-audio
+          path: desktop/native
+
       - name: Build
         working-directory: desktop
         run: npx electron-builder ${{ matrix.builder }} --publish never
 
-      - name: "Smoke test (app starts, loads the site; on Windows it also captures the screen)"
+      - name: "Smoke test (app starts, loads the site; on Windows also screen capture and the audio helper)"
         shell: bash
         run: |
           HOST_PASSWORD=ci PORT=8080 node server/server.js &
@@ -85,6 +110,9 @@ jobs:
           name: Screen Share – asztali alkalmazás
           body: |
             Windows: **ScreenShare-Setup.exe** · Mac (Intel és Apple Silicon): **ScreenShare-mac.dmg**
+
+            - A gép teljes hangját magától megosztja – Macen is, semmit nem kell mellé telepíteni (macOS 13 vagy újabb; első megosztáskor engedélyezd a rendszerhang-felvételt).
+            - Windowson 5.1 / 7.1 hangszóró (vagy 7.1-es fejhallgató) esetén minden csatornát átküld: a térhangos nézők térhangot kapnak.
 
             Az alkalmazás nincs Microsofttal / Apple-lel aláírva:
             - Windows: „A Windows megvédte a számítógépet” ablaknál → **További információ → Futtatás mindenképp**.

@@ -1,6 +1,7 @@
 # Screen Share – 4K képernyőmegosztás hanggal
 
-Saját szerveren futó képernyőmegosztó oldal: **4K / 60 FPS**, **rendszerhang** (sztereó), minimális késleltetés.
+Saját szerveren futó képernyőmegosztó oldal: **4K / 60 FPS**, **rendszerhang** (sztereó, az asztali alkalmazással
+**5.1 / 7.1 térhang** is), minimális késleltetés.
 Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel bárki tud – regisztráció és telepítés nélkül, telefonon is.
 
 - **WebRTC, közvetlen kapcsolat** – a kép és a hang közvetlenül a gépek között megy, titkosítva (DTLS-SRTP).
@@ -18,8 +19,12 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   **ellenőrzi**, hogy tényleg a videókártya kódol-e, ha nem, kodeket vált, és a gépre megjegyzi az eredményt.
   A megosztó panelen látszik: *Videókártya: NVIDIA GeForce …* · *Hardveres kódolás: NVIDIA NVENC · H.264 · 3 ms/kép*.
 - **Rendszerhang**: Opus, sztereó, 510 kbit/s, 10 ms-os csomagok, zajszűrés / visszhangszűrés / hangerő-szabályzás
-  nélkül (filmhez, zenéhez). 5.1 / 7.1 térhang böngészőből nem vihető át: a böngészők a megosztott hangot sztereóban
-  adják, és a WebRTC hangja is legfeljebb sztereó – a térhangzású filmhang sztereóra keverve szól a nézőknél.
+  nélkül (filmhez, zenéhez).
+- **5.1 / 7.1 térhang** (Windows alkalmazás): ha a megosztó gépen 5.1/7.1 hangszóró vagy 7.1-es fejhallgató van
+  beállítva, az alkalmazás mind a 8 csatornát átküldi (többcsatornás Opus, kb. 510 kbit/s). A térhangos
+  hangszórójú nézők Chrome-ban, Edge-ben vagy az alkalmazásban **térhangot** kapnak, a többiek (sztereó gép, Firefox,
+  Safari, telefon) helyesen lekevert sztereót – a középső (párbeszéd) csatornával együtt. Böngészőből megosztva csak
+  sztereó megy (a böngészők a rendszerhangot sztereóban adják).
 - **Alacsony késleltetés**: hardveres kódolás, minimális jitter puffer a nézőnél (rossz hálózaton „Simább” / „Stabil”
   módra állítható), mozgásra hangolt kódolás filmhez/játékhoz. A késést méri is: a néző statisztikájában és a megosztó
   nézőlistájában nézőnként látszik (kódolás + hálózat + fogadástól a megjelenésig).
@@ -92,8 +97,8 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
 
 - Első megosztáskor engedélyezd a böngészőnek a képernyőfelvételt: *Rendszerbeállítások → Adatvédelem és biztonság →
   Képernyőfelvétel* (újabb macOS-en *Képernyő- és rendszerhangfelvétel*), majd indítsd újra a böngészőt.
-- Hang: Chrome-ban egy böngészőlap hangja mindig megosztható (*Chrome-lap* fül → lap hangja). Teljes képernyőnél akkor
-  van hang, ha a Chrome felajánlja a *Rendszerhang megosztása* opciót. A Safari nem tud hangot megosztani.
+- Hang: a Mac **teljes rendszerhangjához az asztali alkalmazás** kell (lent) – semmit nem kell mellé telepíteni.
+  Böngészőből egy Chrome-lap hangja megosztható (*Chrome-lap* fül → lap hangja); a Safari nem tud hangot megosztani.
 - A Mac a H.264-et hardveresen kódolja (VideoToolbox) – a Kodek maradjon „Automatikus”.
 
 ### Tippek, hogy ne akadjon
@@ -116,7 +121,11 @@ Letöltés: a weboldal főoldalán, vagy <https://github.com/Shreklyx/screeen/re
 
 Ugyanaz az oldal, mint a böngészőben (a szerverről töltődik, így mindig friss), plusz:
 
-- **saját képernyő-/ablakválasztó**, Windowson a **rendszerhang magától megy** (nem kell pipát keresni),
+- **saját képernyő-/ablakválasztó**, a **rendszerhang magától megy** Windowson és Macen is (nem kell pipát keresni,
+  Macen semmit nem kell mellé telepíteni),
+- **5.1 / 7.1 térhang** Windowson (lásd fent) – egy kis beépített segédprogram (`desktop/native/ss-audio.cpp`) a
+  Windows hangmotorjából (WASAPI loopback, „Pro Audio” prioritással) minden csatornát felvesz; sztereó hangszórónál
+  a megszokott sztereó megy,
 - **két videókártyás laptopon az erősebbet használja** (NVIDIA → NVENC hardveres kódolás), és engedi a **H.265**
   hardveres kódolást, ha a túloldal is támogatja,
 - a megosztás **nem lassul le**, ha az ablak kicsinyítve vagy takarásban van, és megosztás közben a kódoló
@@ -129,18 +138,20 @@ Ugyanaz az oldal, mint a böngészőben (a szerverről töltődik, így mindig f
 - Mac: első indításkor jobb klikk az alkalmazáson → **Megnyitás** (vagy *Rendszerbeállítások → Adatvédelem és
   biztonság → Megnyitás mindenképp*), majd engedélyezd a **Képernyőfelvételt** és indítsd újra.
 
-**Mac hang (BlackHole):** a macOS nem enged rendszerhangot rögzíteni sem böngészőnek, sem az alkalmazásnak, ezért:
+**Mac hang:** macOS 13 vagy újabb kell, külön program nem. Első megosztáskor a macOS rákérdez a
+**rendszerhang-felvételre** – engedélyezd. Ha korábban elutasítottad: *Rendszerbeállítások → Adatvédelem és biztonság →
+Képernyő- és rendszerhangfelvétel* → kapcsold be a Screen Share-t a rendszerhang-felvételnél, majd indítsd újra.
 
-1. Telepítsd az ingyenes **BlackHole 2ch**-t: <https://existential.audio/blackhole/>.
-2. *Audio MIDI beállítás* → bal lent **+** → **Több kimenetes eszköz létrehozása** → pipáld be a hangszórót /
-   fejhallgatót **és** a BlackHole 2ch-t, majd válaszd ki ezt kimenetnek (így te is hallod).
-3. Megosztás közben a **Hang → Hangforrás** listában válaszd a **BlackHole 2ch**-t (böngészőben is működik).
+**7.1 hang Windowson:** *Gépház → Rendszer → Hang → (kimeneti eszköz) → Formátum / Hangszóró-beállítás*: 7.1 vagy
+5.1 – ha ez sztereó, sztereó megy. A megosztó panel **Hang** dobozában látszik: *Hang megosztva: 7.1 térhang*, a
+nézőlistában pedig, ki kapja térhangban. A néző statisztikájában (**S**) a *Hang* sorban: *7.1 térhang*.
 
 **Szerver címe:** *Fájl → Szerver címe…* (alap: `https://mozizas.hu`).
 
 A `desktop/` mappában van (Electron). Az installereket a GitHub Actions (`.github/workflows/desktop.yml`)
 Windows és Mac gépen építi és teszteli minden változásnál; kézzel: `npm ci --prefix desktop`, majd
-`npm run dist:win --prefix desktop` (Windowson) vagy `npm run dist:mac --prefix desktop` (Macen).
+`npm run dist:win --prefix desktop` (Windowson, előtte `desktop/native/build.sh` a 7.1 segédprogramhoz) vagy
+`npm run dist:mac --prefix desktop` (Macen).
 
 ## Fejlesztés
 

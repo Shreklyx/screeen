@@ -6,7 +6,7 @@ const argValue = (name) => (process.argv.find((a) => a.startsWith(`--${name}=`))
 
 contextBridge.exposeInMainWorld('picker', {
   audioAvailable: argValue('ss-audio') === '1',
-  platform: argValue('ss-platform'),
+  oldMac: argValue('ss-old-mac') === '1',
   sources: () => ipcRenderer.invoke('picker:sources'),
   choose: (id, audio) => ipcRenderer.send('picker:choose', { id, audio }),
   cancel: () => ipcRenderer.send('picker:choose', null),

@@ -13,4 +13,19 @@ contextBridge.exposeInMainWorld('screenshareApp', {
   openSettings: () => ipcRenderer.send('app:settings'),
   getServerUrl: () => ipcRenderer.invoke('app:get-url'),
   setServerUrl: (url) => ipcRenderer.invoke('app:set-url', String(url)),
+  // 5.1 / 7.1 system audio (Windows): float32 samples from the native helper
+  systemAudio: process.argv.includes('--ss-surround')
+    ? {
+      start: () => ipcRenderer.invoke('audio:start'),
+      stop: (id) => ipcRenderer.send('audio:stop', Number(id)),
+      onFormat: (cb) => {
+        ipcRenderer.removeAllListeners('audio:format');
+        ipcRenderer.on('audio:format', (_e, format) => cb(format));
+      },
+      onData: (cb) => {
+        ipcRenderer.removeAllListeners('audio:data');
+        ipcRenderer.on('audio:data', (_e, bytes) => cb(bytes.buffer.byteLength === bytes.byteLength ? bytes.buffer : bytes.slice().buffer));
+      },
+    }
+    : null,
 });

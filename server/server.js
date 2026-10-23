@@ -132,6 +132,7 @@ function sanitizeCaps(caps) {
     const v = caps[c];
     if (v && typeof v === 'object') out[c] = { supported: v.supported !== false, hw: v.hw === true };
   }
+  if (caps.surround === true) out.surround = true; // 5.1/7.1 speakers that can play multi-channel Opus
   return out;
 }
 

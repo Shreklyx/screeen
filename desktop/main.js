@@ -4,8 +4,9 @@
 //
 // The UI and the WebRTC code are the website itself (loaded from the server),
 // so the app always matches the server. What the app adds on top of a browser:
-//  - its own screen/window picker, and on Windows the system audio comes along
-//    automatically (no checkbox to forget),
+//  - its own screen/window picker, and the system audio comes along
+//    automatically (Windows, and macOS 13+ – no extra audio driver needed),
+//  - 5.1 / 7.1 surround system audio on Windows (native/ss-audio.cpp),
 //  - laptops with two GPUs use the strong one (NVIDIA NVENC instead of the
 //    integrated chip), H.265 hardware encoding is allowed,
 //  - sharing is never throttled when the window is minimised or covered, and the
@@ -14,6 +15,7 @@
 //  - the computer does not go to sleep while sharing.
 
 const { app, BrowserWindow, Menu, desktopCapturer, dialog, ipcMain, powerSaveBlocker, screen, session, shell, systemPreferences } = require('electron');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -21,6 +23,12 @@ const path = require('node:path');
 const DEFAULT_URL = 'https://mozizas.hu/';
 const IS_MAC = process.platform === 'darwin';
 const IS_WIN = process.platform === 'win32';
+// System audio of the whole computer: Windows, and macOS 13+ (CoreAudio tap / ScreenCaptureKit).
+const SYSTEM_AUDIO = IS_WIN || (IS_MAC && Number(os.release().split('.')[0]) >= 22);
+// 5.1 / 7.1 capture helper (Windows): every channel of what the computer plays.
+const AUDIO_HELPER = process.env.SS_AUDIO_HELPER
+  || (IS_WIN ? path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, 'native'), 'ss-audio.exe') : '');
+const HAS_AUDIO_HELPER = Boolean(AUDIO_HELPER) && fs.existsSync(AUDIO_HELPER);
 
 /* ------------------------------------------------ Chromium switches (before 'ready') */
 
@@ -119,7 +127,7 @@ function createMainWindow() {
       nodeIntegration: false,
       backgroundThrottling: false,
       spellcheck: false,
-      additionalArguments: [`--ss-version=${app.getVersion()}`],
+      additionalArguments: [`--ss-version=${app.getVersion()}`, ...(HAS_AUDIO_HELPER ? ['--ss-surround'] : [])],
     },
   });
 
@@ -129,9 +137,14 @@ function createMainWindow() {
   mainWindow.on('close', () => saveConfig({ bounds: mainWindow.getNormalBounds() }));
   mainWindow.on('closed', () => {
     mainWindow = null;
+    stopAudioHelper();
   });
 
   const wc = mainWindow.webContents;
+  wc.on('did-start-navigation', (details) => {
+    if (details.isMainFrame && !details.isSameDocument) stopAudioHelper();
+  });
+  wc.on('render-process-gone', () => stopAudioHelper());
   // Server not reachable → local page with a retry button.
   wc.on('did-fail-load', (_e, code, description, url, isMainFrame) => {
     if (!isMainFrame || code === -3 /* aborted */ || isLocalPage(url)) return;
@@ -159,7 +172,7 @@ function setupPermissions(ses) {
   ses.setPermissionRequestHandler((wc, permission, callback, details) => {
     const url = details?.requestingUrl || wc.getURL();
     let ok = isServerUrl(url) && ALLOWED_PERMISSIONS.has(permission);
-    // audio inputs (e.g. BlackHole on a Mac) yes, camera no
+    // audio inputs (the Hangforrás list) yes, camera no
     if (permission === 'media' && (details?.mediaTypes || []).includes('video')) ok = false;
     callback(ok);
   });
@@ -209,7 +222,7 @@ function pickSource(audioRequested) {
   if (SMOKE) {
     return listSources().then((list) => {
       const screen = list.find((s) => s.type === 'screen') || list[0];
-      return screen ? { id: screen.id, audio: audioRequested && IS_WIN } : null;
+      return screen ? { id: screen.id, audio: audioRequested && SYSTEM_AUDIO } : null;
     });
   }
   if (pickerWindow) {
@@ -242,7 +255,10 @@ function pickSource(audioRequested) {
         contextIsolation: true,
         sandbox: true,
         nodeIntegration: false,
-        additionalArguments: [`--ss-audio=${audioRequested && IS_WIN ? '1' : '0'}`, `--ss-platform=${process.platform}`],
+        additionalArguments: [
+          `--ss-audio=${audioRequested && SYSTEM_AUDIO ? '1' : '0'}`,
+          `--ss-old-mac=${IS_MAC && !SYSTEM_AUDIO ? '1' : '0'}`,
+        ],
       },
     });
     ipcMain.handle('picker:sources', () => listSources());
@@ -270,8 +286,9 @@ function setupDisplayMedia(ses) {
       if (!source) return callback(null);
       const streams = { video: source };
       if (process.env.SS_DEBUG) console.log('display media:', JSON.stringify({ choice, source: source.id, audioRequested: request.audioRequested }));
-      // Windows: the whole system sound ("loopback"); macOS has no loopback – use an audio input (BlackHole)
-      if (IS_WIN && choice.audio && request.audioRequested) streams.audio = 'loopback';
+      // The whole system sound ("loopback"). macOS asks once for "System Audio Recording";
+      // if it is refused, the page gets an ended audio track and says what to do.
+      if (SYSTEM_AUDIO && choice.audio && request.audioRequested) streams.audio = 'loopback';
       callback(streams);
     } catch (err) {
       console.error('display media request failed', err);
@@ -312,6 +329,75 @@ function setSharing(on) {
   }
 }
 
+/* ------------------------------------------------ 5.1 / 7.1 system audio (Windows) */
+
+// Chromium records the system sound in stereo. When the output device is 5.1/7.1,
+// the page asks for the helper, which streams every channel (see native/ss-audio.cpp).
+let audioHelper = null; // { id, proc, wc }
+let audioHelperSeq = 0;
+
+function stopAudioHelper(id) {
+  if (!audioHelper || (id != null && audioHelper.id !== id)) return;
+  const { proc } = audioHelper;
+  audioHelper = null;
+  proc.stdin.end(); // the helper exits when its stdin closes
+  setTimeout(() => {
+    if (proc.exitCode == null && proc.signalCode == null) proc.kill();
+  }, 1000);
+}
+
+/** Starts the helper; resolves to { id, rate, channels, mask } or { error }. */
+function startAudioHelper(wc) {
+  stopAudioHelper();
+  return new Promise((resolve) => {
+    let proc;
+    try {
+      proc = spawn(AUDIO_HELPER, [], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+    } catch (err) {
+      resolve({ error: err.message });
+      return;
+    }
+    const self = { id: ++audioHelperSeq, proc, wc };
+    audioHelper = self;
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (value.error) stopAudioHelper(self.id);
+      resolve(value);
+    };
+    const timer = setTimeout(() => settle({ error: 'timeout' }), 3000);
+    proc.on('error', (err) => settle({ error: err.message }));
+    proc.on('exit', () => {
+      settle({ error: 'exited' });
+      if (audioHelper === self) audioHelper = null;
+    });
+    proc.stdin.on('error', () => {}); // already gone
+    let pending = Buffer.alloc(0);
+    proc.stdout.on('data', (chunk) => {
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      while (pending.length >= 8) {
+        const size = pending.readUInt32LE(4);
+        if (pending.length < 8 + size) break;
+        const tag = pending.toString('latin1', 0, 4);
+        const body = pending.subarray(8, 8 + size);
+        pending = pending.subarray(8 + size);
+        if (audioHelper !== self || wc.isDestroyed()) continue;
+        if (tag === 'PCM1') {
+          wc.send('audio:data', new Uint8Array(body)); // exact-size copy for the IPC
+        } else if (tag === 'FMT1' && size >= 12) {
+          const format = { id: self.id, rate: body.readUInt32LE(0), channels: body.readUInt32LE(4), mask: body.readUInt32LE(8) };
+          wc.send('audio:format', format);
+          settle(format);
+        } else if (tag === 'ERR1') {
+          settle({ error: body.toString('utf8') });
+        }
+      }
+    });
+  });
+}
+
 /* ------------------------------------------------ IPC from the pages */
 
 function setupIpc() {
@@ -322,6 +408,13 @@ function setupIpc() {
     if (isLocalPage(e.senderFrame?.url) && mainWindow) loadServer();
   });
   ipcMain.on('app:settings', () => openSettings());
+  ipcMain.handle('audio:start', (e) => {
+    if (!HAS_AUDIO_HELPER || e.sender !== mainWindow?.webContents || !isServerUrl(e.senderFrame?.url)) return { error: 'unavailable' };
+    return startAudioHelper(e.sender);
+  });
+  ipcMain.on('audio:stop', (e, id) => {
+    if (audioHelper?.wc === e.sender) stopAudioHelper(Number(id));
+  });
   ipcMain.handle('app:get-url', () => serverUrl);
   ipcMain.handle('app:set-url', (e, raw) => {
     if (!isLocalPage(e.senderFrame?.url)) return { ok: false };
@@ -435,6 +528,22 @@ async function runSmokeTest() {
       log('capture', JSON.stringify(cap));
       if (cap.video !== 'live' || !cap.width) throw new Error(`screen capture failed: ${cap.error || ''}`);
     }
+    if (IS_WIN) {
+      // the 5.1/7.1 helper is packaged and runs (a runner may have no audio device: that is reported, not fatal)
+      if (!HAS_AUDIO_HELPER) throw new Error(`audio helper missing: ${AUDIO_HELPER}`);
+      const probe = spawnSync(AUDIO_HELPER, ['--probe'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+      log('audio helper probe', (probe.stdout || '').trim(), `exit ${probe.status}`);
+      try {
+        JSON.parse(probe.stdout);
+      } catch {
+        throw new Error(`audio helper did not run: ${probe.error?.message || probe.stderr || probe.status}`);
+      }
+      const started = await wc.executeJavaScript(`window.screenshareApp.systemAudio.start().then((r) => {
+        window.screenshareApp.systemAudio.stop(r.id);
+        return r;
+      })`, true);
+      log('audio helper start', JSON.stringify(started));
+    }
     log('SMOKE OK');
     clearTimeout(timer);
     app.exit(0);
@@ -471,6 +580,7 @@ if (!SMOKE && !app.requestSingleInstanceLock()) {
     });
   });
 
+  app.on('will-quit', () => stopAudioHelper());
   app.on('window-all-closed', () => {
     setSharing(false);
     if (!IS_MAC) app.quit();

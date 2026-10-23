@@ -134,12 +134,12 @@ test('full host/viewer flow with relay, state and close', async () => {
   assert.ok(turn.urls.some((u) => u.startsWith('turn:example.test:3478')));
 
   const v = await client();
-  v.send({ t: 'join', code: hosted.code.toUpperCase(), caps: { H264: { supported: true, hw: true }, junk: 1 } });
+  v.send({ t: 'join', code: hosted.code.toUpperCase(), caps: { H264: { supported: true, hw: true }, junk: 1, surround: true } });
   const joined = await v.next(is('joined'));
   assert.equal(joined.hostPresent, true);
   const announced = await h.next(is('viewer'));
   assert.equal(announced.id, joined.id);
-  assert.deepEqual(announced.caps, { H264: { supported: true, hw: true } });
+  assert.deepEqual(announced.caps, { H264: { supported: true, hw: true }, surround: true });
   assert.equal((await v.next(is('count'))).n, 1);
 
   h.send({ t: 'signal', to: joined.id, data: { type: 'offer', sdp: 'x' } });
@@ -152,8 +152,9 @@ test('full host/viewer flow with relay, state and close', async () => {
 
   // a second viewer cannot talk to the first one, and viewers cannot change state
   const v2 = await client();
-  v2.send({ t: 'join', code: hosted.code });
+  v2.send({ t: 'join', code: hosted.code, caps: { surround: 'yes' } });
   const joined2 = await v2.next(is('joined'));
+  assert.deepEqual((await h.next(is('viewer'))).caps, {});
   v2.send({ t: 'signal', to: joined.id, data: { type: 'offer', sdp: 'evil' } });
   v2.send({ t: 'state', live: false });
   await v.nothing((m) => m.t === 'signal' || m.t === 'state');
