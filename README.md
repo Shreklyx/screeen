@@ -28,7 +28,11 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
 - **Alacsony késleltetés**: hardveres kódolás, minimális jitter puffer a nézőnél (rossz hálózaton „Simább” / „Stabil”
   módra állítható), mozgásra hangolt kódolás filmhez/játékhoz. „Minimális késés” módban a néző minden képkockát
   azonnal megjelenít, amint dekódolta: az alkalmazásból megosztva a kép „nulla lejátszási késleltetéssel” megy
-  (RTP playout-delay), és a kép nem vár a hang (hosszabb) pufferére – a tesztben kb. 48 → 36 ms képtől képig. A késést méri is: a néző statisztikájában és a megosztó
+  (RTP playout-delay), és a kép nem vár a hang (hosszabb) pufferére – a tesztben kb. 48 → 36 ms képtől képig.
+  Az alkalmazás (asztali és iOS) egy képkockát a célbitráta 3-szorosával küld ki (a WebRTC alapból 1,1-szeresével,
+  ami 4K-ban egy képkockát majdnem a teljes képkocka-időre szétteríti), és a küldési sor legfeljebb 200 ms lehet –
+  nagy bitrátán a küldő oldali várakozás a tesztben ~50 → ~5 ms. 120/144 Hz-es monitorhoz kézzel **120 FPS** is
+  választható (kétszer gyakoribb képkocka, de a kódolót is kétszer annyira terheli). A késést méri is: a néző statisztikájában és a megosztó
   nézőlistájában nézőnként látszik (kódolás + hálózat + fogadástól a megjelenésig).
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).

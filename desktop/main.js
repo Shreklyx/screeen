@@ -42,9 +42,15 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 app.commandLine.appendSwitch('enable-features', 'WebRtcAllowH265Send,WebRtcAllowH265Receive,PlatformHEVCEncoderSupport');
 // Windows: a covered window must not be treated as hidden.
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
-// Viewers show every frame the moment it is decoded: zero playout delay, sent with the
-// video (RTP header extension). Viewers that pick a buffer ("Simább") leave it out.
-app.commandLine.appendSwitch('force-fieldtrials', 'WebRTC-ForceSendPlayoutDelay/min_ms:0,max_ms:0/');
+// Less delay:
+//  - viewers show every frame the moment it is decoded: zero playout delay, sent with the
+//    video (RTP header extension); viewers that pick a buffer ("Simább") leave it out,
+//  - a frame leaves at 3× the target bitrate instead of 1.1× (libwebrtc's default spreads
+//    one 4K frame over most of the frame interval), and the send queue is kept under 200 ms.
+app.commandLine.appendSwitch('force-fieldtrials', [
+  'WebRTC-ForceSendPlayoutDelay/min_ms:0,max_ms:0/',
+  'WebRTC-Video-Pacing/factor:3,max_delay:200ms/',
+].join(''));
 
 /* ------------------------------------------------ settings */
 

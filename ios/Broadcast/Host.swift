@@ -60,8 +60,12 @@ final class Host: NSObject {
         self.server = server
         self.password = password
         self.onFatal = onFatal
-        // Viewers show every frame the moment it is decoded (same as the desktop app).
-        RTCInitFieldTrialDictionary(["WebRTC-ForceSendPlayoutDelay": "min_ms:0,max_ms:0"])
+        // Less delay, as in the desktop app: viewers show every frame the moment it is decoded,
+        // and a frame leaves at 3× the target bitrate (libwebrtc's default: 1.1×).
+        RTCInitFieldTrialDictionary([
+            "WebRTC-ForceSendPlayoutDelay": "min_ms:0,max_ms:0",
+            "WebRTC-Video-Pacing": "factor:3,max_delay:200ms",
+        ])
         RTCInitializeSSL()
         let device = AppAudioDevice()
         audioDevice = device
