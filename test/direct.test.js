@@ -216,3 +216,62 @@ test('clock: the viewer learns the round trip and the clock offset', async () =>
     close();
   }
 });
+
+test('STUN encoding: XOR addresses round-trip, attributes parse back', () => {
+  const addr = { address: '94.156.37.47', port: 49152 };
+  assert.deepEqual(t.xorDecode(t.xorEncode(addr)), addr);
+  const tid = crypto.randomBytes(12);
+  const msg = t.stunEncode(0x0003, tid, [[0x0019, Buffer.from([17, 0, 0, 0])], [0x0006, Buffer.from('abc')]], Buffer.alloc(16, 1));
+  const m = t.stunParse(msg);
+  assert.equal(m.type, 0x0003);
+  assert.equal(m.tid, tid.toString('hex'));
+  assert.equal(m.attrs.get(0x0006).toString(), 'abc');
+  assert.equal(m.attrs.get(0x0008).length, 20, 'message integrity');
+  assert.equal(msg.length % 4, 0);
+});
+
+// Against a real TURN server (coturn), when it is installed: the path when only the TURN port is open.
+const { execFileSync, spawn } = await import('node:child_process');
+let turnserver = null;
+try { turnserver = execFileSync('which', ['turnserver'], { encoding: 'utf8' }).trim(); } catch { /* not installed */ }
+
+test('TURN: direct mode through the TURN server (coturn) when nothing else gets through', { skip: !turnserver && 'coturn not installed' }, async () => {
+  const { turnCredentials } = await import('../server/server.js');
+  const dgram = await import('node:dgram');
+  const free = dgram.createSocket('udp4');
+  await new Promise((r) => free.bind(0, '127.0.0.1', r));
+  const turnPort = free.address().port;
+  free.close();
+  const proc = spawn(turnserver, ['-n', '--no-cli', '--log-file=stdout', `--listening-port=${turnPort}`, '--listening-ip=127.0.0.1', '--relay-ip=127.0.0.1',
+    '--min-port=51000', '--max-port=51100', '--use-auth-secret', '--static-auth-secret=s3cret', '--realm=test', '--fingerprint',
+    '--no-tls', '--no-dtls', '--no-tcp-relay', '--allow-loopback-peers', `--pidfile=/tmp/turn-${turnPort}.pid`], { stdio: 'ignore' });
+  await sleep(700);
+  const relay = createRelay({ port: 0, host: '127.0.0.1' });
+  const port = await relay.listen();
+  const { session, secret } = relay.create({ room: 'r', viewer: 'v1' });
+  const turnInfo = () => ({ host: '127.0.0.1', port: turnPort, ...turnCredentials('s3cret') });
+  const host = new DirectEndpoint({ role: 'host', serverHost: '127.0.0.1', forceTurn: true });
+  const viewer = new DirectEndpoint({ role: 'viewer', serverHost: '127.0.0.1', forceTurn: true });
+  try {
+    await host.open();
+    await viewer.open();
+    const states = [];
+    viewer.on('state', (id, s) => states.push(s));
+    const offer = await host.addPeer('v1', { session, secret, port, turn: turnInfo() });
+    const answer = await viewer.addPeer('host', { session, secret, port, turn: turnInfo() });
+    assert.ok(offer.cands.some((c) => c.turn), 'the sharer offers its TURN address');
+    assert.ok(answer.cands.some((c) => c.turn), 'the viewer offers its TURN address');
+    viewer.connectPeer('host', offer);
+    host.connectPeer('v1', answer);
+    await until(() => states.some((s) => s.state === 'connected'), 8000);
+    assert.equal(states.at(-1).path, 'turn');
+    const got = await stream(host, viewer, { frames: 15, size: 4 * MAX_DATA });
+    await until(() => got.length === 15);
+    assert.ok(got.every((g) => g.ok));
+  } finally {
+    host.close();
+    viewer.close();
+    relay.close();
+    proc.kill();
+  }
+});

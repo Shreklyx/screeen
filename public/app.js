@@ -1032,7 +1032,7 @@ async function negotiate(v, { iceRestart = false } = {}) {
       if (sdp === offer.sdp) throw err;
       await pc.setLocalDescription(offer);
     }
-    host.signal.send({ t: 'signal', to: v.id, data: { type: 'offer', session: v.session, sdp: pc.localDescription.sdp } });
+    host.signal.send({ t: 'signal', to: v.id, data: { type: 'offer', session: v.session, sdp: pc.localDescription.sdp, why: directWhy(v) } });
     clearTimeout(v.answerTimer);
     // No answer (lost message, viewer stuck): start over with a fresh connection.
     v.answerTimer = setTimeout(() => {
@@ -1557,11 +1557,18 @@ function renderViewers() {
     const cs = v.direct ? (v.direct.state === 'connected' ? 'direct' : 'connecting') : v.pc?.connectionState;
     if (!isLive()) { state.textContent = 'vár (szünet)'; state.className = 'viewer-state'; }
     else if (cs === 'direct') { state.textContent = `közvetlen mód · ${PATH_LABEL[v.direct.path] || ''}`; state.className = 'viewer-state ok'; }
-    else if (cs === 'connected') { state.textContent = v.stats?.relay ? 'kapcsolódva · TURN relé' : 'kapcsolódva · közvetlen'; state.className = 'viewer-state ok'; }
+    else if (cs === 'connected') { state.textContent = v.stats?.relay ? 'WebRTC · TURN relé' : 'WebRTC · P2P'; state.className = 'viewer-state ok'; }
     else if (cs === 'failed' || cs === 'disconnected') { state.textContent = 'kapcsolat gond…'; state.className = 'viewer-state warn'; }
     else { state.textContent = 'kapcsolódik…'; state.className = 'viewer-state'; }
     head.append(name, state);
     li.append(head);
+    const why = !v.direct && v.caps?.direct ? directWhy(v) : null;
+    if (why && isLive()) {
+      const note = document.createElement('div');
+      note.className = `viewer-stats${['setting', 'buffer'].includes(why) ? '' : ' warn'}`;
+      note.textContent = `Közvetlen mód helyett WebRTC: ${WHY_TEXT[why]}`;
+      li.append(note);
+    }
 
     const s = v.stats;
     if (s && isLive()) {
@@ -1886,6 +1893,7 @@ async function onHostSignal(data) {
   }
   if (data.type === 'offer' && typeof data.sdp === 'string') {
     closeDirectView(); // the sharer chose WebRTC for this viewer
+    noteWhyWebrtc(typeof data.why === 'string' ? data.why : null);
     if (!viewer.pc || viewer.session !== data.session || viewer.pc.signalingState === 'closed') newViewerPc(data.session);
     const pc = viewer.pc;
     const lowLatency = viewer.bufferMs === 0;
@@ -2038,6 +2046,7 @@ async function viewerStatsTick() {
   if ($('#stats').hidden) return;
   const hw = v.powerEfficientDecoder === true ? ' (HW)' : v.powerEfficientDecoder === false ? ' (SW)' : '';
   const rows = [
+    ['Mód', viewer.whyWebrtc ? `WebRTC – ${WHY_TEXT[viewer.whyWebrtc]}` : 'WebRTC', Boolean(DIRECT && viewer.whyWebrtc && !['buffer', 'setting'].includes(viewer.whyWebrtc))],
     ['Felbontás', res],
     ['FPS', fps != null ? String(Math.round(fps)) : '–'],
     ['Bitráta', fmtKbps(kbps)],
@@ -2151,7 +2160,7 @@ function initViewerUi() {
     if (viewer.direct && viewer.bufferMs > 0) {
       // direct mode has no buffer: WebRTC with the chosen one
       closeDirectView();
-      sendToHost({ type: 'direct-fail' });
+      sendToHost({ type: 'direct-fail', why: 'buffer' });
     } else if (viewer.pc && viewer.lowLatency !== (viewer.bufferMs === 0)) {
       // to or from "Minimális": the connection is set up differently (see ownAudioStream), or direct mode
       sendToHost({ type: 'recall', direct: viewer.bufferMs === 0 && Boolean(DIRECT) });
@@ -2195,7 +2204,43 @@ function initViewerUi() {
 const DIRECT = APP?.direct || null;
 const DIRECT_CODEC = 'avc1.640034'; // H.264 High 5.2 (up to 4K 60): every GPU decodes it
 const DIRECT_MIN_KBPS = 3000;
-const PATH_LABEL = { lan: 'helyi hálózat', internet: 'interneten át', relay: 'a szerveren át' };
+const PATH_LABEL = { lan: 'helyi hálózat', internet: 'interneten át', relay: 'a szerveren át', turn: 'TURN relén át' };
+// why an app viewer gets WebRTC instead of direct mode – shown to both sides
+const WHY_TEXT = {
+  'host-browser': 'a megosztó böngészőből oszt meg (közvetlen mód csak az alkalmazásból megy)',
+  'viewer-browser': 'a néző böngészőben néz (közvetlen mód csak az alkalmazásban van)',
+  setting: 'a megosztó beállításaiban a WebRTC van kiválasztva',
+  server: 'a szerver még nem ismeri – futtasd rajta újra: sudo bash deploy/install.sh',
+  buffer: '„Simább” / „Stabil” puffer van kiválasztva',
+  udp: 'a két gép nem érte el egymást UDP-n',
+  'udp-blocked': 'UDP-n sem a szerver (3479), sem a TURN relé (3478) nem érhető el – tűzfal?',
+  timeout: 'a közvetlen kapcsolat nem jött létre időben',
+  encoder: 'nincs használható H.264 kódoló',
+  unavailable: 'a közvetlen átvitel nem indult el',
+  failed: 'a közvetlen kapcsolat nem jött létre',
+};
+
+/** The TURN server (from the page's ICE servers) for direct mode's last-resort relay. */
+function turnInfo(iceServers) {
+  for (const s of iceServers || []) {
+    if (!s.username || !s.credential) continue;
+    for (const url of [].concat(s.urls || [])) {
+      const m = /^turn:([^:?]+)(?::(\d+))?(?:\?transport=(\w+))?$/i.exec(url);
+      if (m && (!m[3] || m[3].toLowerCase() === 'udp')) return { host: m[1], port: Number(m[2] || 3478), username: s.username, credential: s.credential };
+    }
+  }
+  return null;
+}
+
+/** Why this viewer gets WebRTC (null: it gets direct mode). */
+function directWhy(v) {
+  if (!DIRECT) return 'host-browser';
+  if (!v.caps?.direct) return 'viewer-browser';
+  if (settings.link === 'webrtc') return 'setting';
+  if (!host.serverDirect) return 'server';
+  if (v.noDirect) return v.noDirectWhy || 'failed';
+  return null;
+}
 
 const direct = {
   video: null, // the sharer's encoding pipelines
@@ -2227,7 +2272,7 @@ function startDirectViewer(v) {
   v.direct = { state: 'starting', path: null, rtt: null, report: null, minRtt: Infinity };
   host.signal?.send({ t: 'direct', to: v.id });
   // no direct picture in time (e.g. UDP blocked): WebRTC
-  v.directTimer = setTimeout(() => { if (v.direct && v.direct.state !== 'connected') directFallback(v); }, 10000);
+  v.directTimer = setTimeout(() => { if (v.direct && v.direct.state !== 'connected') directFallback(v, 'timeout'); }, 10000);
 }
 
 function stopDirectViewer(v) {
@@ -2238,10 +2283,11 @@ function stopDirectViewer(v) {
   updateDirectPipelines();
 }
 
-function directFallback(v) {
+function directFallback(v, why = 'failed') {
   if (host.viewers.get(v.id) !== v) return;
   stopDirectViewer(v);
   v.noDirect = true;
+  v.noDirectWhy = why;
   createViewerPc(v);
   renderViewers();
 }
@@ -2250,10 +2296,10 @@ async function onDirectSession(msg) {
   const v = host.viewers.get(msg.viewer);
   const d = v?.direct;
   if (!d || d.state !== 'starting') return;
-  const res = await DIRECT.add('host', v.id, { session: msg.session, secret: msg.secret, port: msg.port });
+  const res = await DIRECT.add('host', v.id, { session: msg.session, secret: msg.secret, port: msg.port, turn: turnInfo(host.iceServers) });
   if (v.direct !== d) return;
   if (!res || res.error) {
-    directFallback(v);
+    directFallback(v, 'unavailable');
     return;
   }
   d.state = 'connecting';
@@ -2269,7 +2315,7 @@ function onDirectViewerSignal(v, data) {
   if (data.type === 'direct-answer' && v.direct?.state === 'connecting') {
     DIRECT.connect(v.id, { pub: data.pub, cands: data.cands });
   } else if (data.type === 'direct-fail') {
-    directFallback(v);
+    directFallback(v, typeof data.why === 'string' && WHY_TEXT[data.why] ? data.why : 'failed');
   } else if (data.type === 'stats') {
     const num = (x) => (Number.isFinite(x) && x >= 0 && x < 1e6 ? x : null);
     v.remote = { lat: num(data.lat), fps: num(data.fps), loss: num(data.loss), measured: data.measured === true };
@@ -2292,11 +2338,11 @@ function onHostDirectEvent(name, id, info) {
       updateDirectPipelines();
       direct.forceKey = true;
     } else if (info.state === 'failed') {
-      directFallback(v);
+      directFallback(v, info.diag && !info.diag.server && !info.diag.turn ? 'udp-blocked' : 'udp');
     } else if (info.state === 'lost' || info.state === 'closed') {
       // the viewer's network changed or the app reloaded: try again, then WebRTC
       v.directRetries = (v.directRetries || 0) + 1;
-      if (v.directRetries > 2) directFallback(v);
+      if (v.directRetries > 2) directFallback(v, 'udp');
       else startDirectViewer(v);
     }
     renderViewers();
@@ -2375,7 +2421,7 @@ function startDirectVideo(track) {
       if (pipe.stopped) return;
       console.warn('direct video', err);
       // no encoder at all: these viewers get WebRTC
-      for (const v of [...host.viewers.values()]) if (v.direct) directFallback(v);
+      for (const v of [...host.viewers.values()]) if (v.direct) directFallback(v, 'encoder');
     }
   })();
 }
@@ -2632,7 +2678,7 @@ function onViewerDirectSession(msg) {
   viewer.direct = {
     udp: msg.session,
     state: 'starting',
-    ready: DIRECT.add('viewer', 'host', { session: msg.session, secret: msg.secret, port: msg.port }),
+    ready: DIRECT.add('viewer', 'host', { session: msg.session, secret: msg.secret, port: msg.port, turn: turnInfo(viewer.iceServers) }),
     codec: DIRECT_CODEC,
     decoder: null,
     needKey: true,
@@ -2659,7 +2705,7 @@ async function onDirectOffer(data) {
   // a chosen buffer ("Simább" / "Stabil") is WebRTC's job; direct mode has none
   if (!d || d.udp !== data.udp || viewer.bufferMs > 0) {
     closeDirectView();
-    sendToHost({ type: 'direct-fail' });
+    sendToHost({ type: 'direct-fail', why: viewer.bufferMs > 0 ? 'buffer' : 'unavailable' });
     return;
   }
   closeViewerConnection();
@@ -2667,7 +2713,7 @@ async function onDirectOffer(data) {
   if (viewer.direct !== d) return;
   if (!res || res.error) {
     closeDirectView();
-    sendToHost({ type: 'direct-fail' });
+    sendToHost({ type: 'direct-fail', why: 'unavailable' });
     return;
   }
   if (typeof data.codec === 'string') d.codec = data.codec;
@@ -2675,6 +2721,14 @@ async function onDirectOffer(data) {
   DIRECT.connect('host', { pub: data.pub, cands: data.cands });
   sendToHost({ type: 'direct-answer', pub: res.pub, cands: res.cands });
   if (!hasPicture()) setOverlay('Közvetlen kapcsolat (alkalmazás → alkalmazás)…');
+}
+
+// An app viewer that gets WebRTC is told why, once (and in the statistics).
+function noteWhyWebrtc(why) {
+  viewer.whyWebrtc = WHY_TEXT[why] ? why : null;
+  if (!DIRECT || !viewer.whyWebrtc || viewer.whyWebrtc === 'viewer-browser' || viewer.whyToldFor === why) return;
+  viewer.whyToldFor = why;
+  toast(`Közvetlen mód helyett WebRTC: ${WHY_TEXT[why]}.`, why === 'buffer' || why === 'setting' ? 'info' : 'warn', 9000);
 }
 
 function closeDirectView() {
@@ -2697,7 +2751,7 @@ function onViewerDirectEvent(name, id, info) {
     Object.assign(d, { state: info.state, path: info.path, rtt: info.rtt ?? d.rtt });
     if (info.state === 'failed') {
       closeDirectView();
-      sendToHost({ type: 'direct-fail' });
+      sendToHost({ type: 'direct-fail', why: info.diag && !info.diag.server && !info.diag.turn ? 'udp-blocked' : 'udp' });
       setOverlay('A közvetlen kapcsolat nem jött létre – átváltás WebRTC-re…');
     } else if (info.state === 'lost' || info.state === 'closed') {
       closeDirectView();

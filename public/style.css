@@ -339,7 +339,7 @@ input[type="password"] {
 .viewer-state.ok { color: var(--ok); }
 .viewer-state.warn { color: var(--warn); }
 .viewer-stats { margin-top: 4px; color: var(--text-muted); font-family: var(--mono); font-size: 12px; line-height: 1.6; }
-.viewer-stats .warn { color: var(--warn); }
+.viewer-stats .warn, .viewer-stats.warn { color: var(--warn); }
 
 /* ---------- Viewer ---------- */
 .viewer { max-width: 100%; }

@@ -429,7 +429,7 @@ function stopDirect() {
 async function openDirect(wc, role) {
   if (direct && direct.role === role && direct.wc === wc) return direct;
   stopDirect();
-  const ep = new DirectEndpoint({ role, serverHost: new URL(serverUrl).hostname, forceRelay: process.env.SS_DIRECT_RELAY === '1' });
+  const ep = new DirectEndpoint({ role, serverHost: new URL(serverUrl).hostname, forceRelay: process.env.SS_DIRECT_RELAY === '1', forceTurn: process.env.SS_DIRECT_TURN === '1' });
   const self = { ep, role, wc };
   direct = self;
   const live = () => direct === self && !wc.isDestroyed();
@@ -463,7 +463,11 @@ function setupIpc() {
     if (e.sender !== mainWindow?.webContents || !isServerUrl(e.senderFrame?.url) || !['host', 'viewer'].includes(role) || !info) return { error: 'unavailable' };
     try {
       const d = await openDirect(e.sender, role);
-      return await d.ep.addPeer(String(id), { session: Number(info.session), secret: String(info.secret), port: Number(info.port) || 0 });
+      const t = info.turn;
+      const turn = t && typeof t === 'object' && typeof t.host === 'string' && t.username && t.credential
+        ? { host: t.host, port: Number(t.port) || 3478, username: String(t.username), credential: String(t.credential) }
+        : null;
+      return await d.ep.addPeer(String(id), { session: Number(info.session), secret: String(info.secret), port: Number(info.port) || 0, turn });
     } catch (err) {
       return { error: err.message };
     }

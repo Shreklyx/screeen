@@ -12,7 +12,8 @@
 //
 // Connection: both ends register at the server's UDP port (the answer is their public
 // address), exchange addresses over signaling and probe each other (UDP hole punching).
-// When no direct path answers, packets go through the server's UDP relay.
+// When no direct path answers, packets go through the server's UDP relay – or, when that
+// port is blocked, through the TURN server (the same one WebRTC uses, port 3478).
 
 const dgram = require('node:dgram');
 const crypto = require('node:crypto');
@@ -142,6 +143,233 @@ function validCandidate(c) {
   return Boolean(m) && m.slice(1).every((x) => Number(x) <= 255) && Number(m[1]) !== 0 && Number(m[1]) < 224 && Number.isInteger(port) && port > 0 && port < 65536;
 }
 
+/* ------------------------------------------------ TURN (RFC 8656), the fallback relay */
+
+const STUN_COOKIE = 0x2112a442;
+const ATTR = {
+  USERNAME: 0x0006, MESSAGE_INTEGRITY: 0x0008, ERROR_CODE: 0x0009, CHANNEL_NUMBER: 0x000c, LIFETIME: 0x000d,
+  XOR_PEER_ADDRESS: 0x0012, DATA: 0x0013, REALM: 0x0014, NONCE: 0x0015, XOR_RELAYED_ADDRESS: 0x0016,
+  REQUESTED_TRANSPORT: 0x0019, XOR_MAPPED_ADDRESS: 0x0020,
+};
+const METHOD = { ALLOCATE: 0x0003, REFRESH: 0x0004, CHANNEL_BIND: 0x0009 };
+const DATA_INDICATION = 0x0017;
+
+const u32 = (n) => {
+  const b = Buffer.alloc(4);
+  b.writeUInt32BE(n >>> 0);
+  return b;
+};
+
+function stunEncode(type, tid, attrs, key) {
+  let body = Buffer.concat(attrs.map(([t, v]) => {
+    const h = Buffer.alloc(4);
+    h.writeUInt16BE(t, 0);
+    h.writeUInt16BE(v.length, 2);
+    return Buffer.concat([h, v, Buffer.alloc((4 - (v.length % 4)) % 4)]);
+  }));
+  const header = Buffer.alloc(20);
+  header.writeUInt16BE(type, 0);
+  header.writeUInt32BE(STUN_COOKIE, 4);
+  tid.copy(header, 8);
+  if (key) {
+    // MESSAGE-INTEGRITY: HMAC-SHA1 over everything before it, the length already counting it
+    header.writeUInt16BE(body.length + 24, 2);
+    const mac = crypto.createHmac('sha1', key).update(Buffer.concat([header, body])).digest();
+    const h = Buffer.alloc(4);
+    h.writeUInt16BE(ATTR.MESSAGE_INTEGRITY, 0);
+    h.writeUInt16BE(20, 2);
+    body = Buffer.concat([body, h, mac]);
+  }
+  header.writeUInt16BE(body.length, 2);
+  return Buffer.concat([header, body]);
+}
+
+function stunParse(msg) {
+  if (msg.length < 20 || (msg[0] & 0xc0) !== 0 || msg.readUInt32BE(4) !== STUN_COOKIE) return null;
+  const end = 20 + msg.readUInt16BE(2);
+  if (end > msg.length) return null;
+  const attrs = new Map();
+  for (let o = 20; o + 4 <= end;) {
+    const t = msg.readUInt16BE(o);
+    const l = msg.readUInt16BE(o + 2);
+    if (o + 4 + l > end) break;
+    if (!attrs.has(t)) attrs.set(t, msg.subarray(o + 4, o + 4 + l));
+    o += 4 + l + ((4 - (l % 4)) % 4);
+  }
+  return { type: msg.readUInt16BE(0), tid: msg.subarray(8, 20).toString('hex'), attrs };
+}
+
+function xorDecode(v) {
+  if (!v || v.length < 8 || v[1] !== 1) return null; // IPv4 only
+  const ip = [0, 1, 2, 3].map((i) => v[4 + i] ^ ((STUN_COOKIE >>> (24 - i * 8)) & 0xff));
+  return { address: ip.join('.'), port: v.readUInt16BE(2) ^ (STUN_COOKIE >>> 16) };
+}
+
+function xorEncode({ address, port }) {
+  const v = Buffer.alloc(8);
+  v[1] = 1;
+  v.writeUInt16BE(port ^ (STUN_COOKIE >>> 16), 2);
+  address.split('.').forEach((x, i) => { v[4 + i] = Number(x) ^ ((STUN_COOKIE >>> (24 - i * 8)) & 0xff); });
+  return v;
+}
+
+const stunError = (m) => {
+  const v = m.attrs.get(ATTR.ERROR_CODE);
+  return v && v.length >= 4 ? (v[2] & 7) * 100 + v[3] : 0;
+};
+
+/** One allocation on the TURN server; the other app is reached through channels (4-byte header). */
+class TurnClient {
+  constructor(ep, { address, port, username, credential }) {
+    this.ep = ep;
+    this.server = { address, port };
+    this.username = String(username);
+    this.password = String(credential);
+    this.realm = null;
+    this.nonce = null;
+    this.key = null;
+    this.pending = new Map();
+    this.channels = new Map(); // 'ip:port' → { number, peer, ready }
+    this.byNumber = new Map();
+    this.nextChannel = 0x4000;
+    this.relayed = null;
+    this.mapped = null;
+    this.refreshTimer = null;
+    this.closed = false;
+  }
+
+  transaction(tid, msg) {
+    return new Promise((resolve) => {
+      const key = tid.toString('hex');
+      let tries = 0;
+      const entry = {
+        timer: null,
+        resolve: (m) => {
+          clearTimeout(entry.timer);
+          this.pending.delete(key);
+          resolve(m);
+        },
+      };
+      const send = () => {
+        if (this.closed || tries++ >= 4) {
+          entry.resolve(null);
+          return;
+        }
+        this.ep.socket?.send(msg, this.server.port, this.server.address);
+        entry.timer = setTimeout(send, 250 * tries);
+      };
+      this.pending.set(key, entry);
+      send();
+    });
+  }
+
+  async request(method, attrs) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const auth = this.realm ? [[ATTR.USERNAME, Buffer.from(this.username)], [ATTR.REALM, Buffer.from(this.realm)], [ATTR.NONCE, Buffer.from(this.nonce)]] : [];
+      const tid = crypto.randomBytes(12);
+      const answer = await this.transaction(tid, stunEncode(method, tid, [...attrs, ...auth], this.realm ? this.key : null));
+      if (!answer) throw new Error('TURN server does not answer');
+      if ((answer.type & 0x0110) === 0x0100) return answer;
+      const code = stunError(answer);
+      if (code === 401 || code === 438) {
+        // (new) realm and nonce: authenticate with the long-term credential
+        const realm = answer.attrs.get(ATTR.REALM);
+        const nonce = answer.attrs.get(ATTR.NONCE);
+        if (realm) this.realm = realm.toString();
+        if (nonce) this.nonce = nonce.toString();
+        this.key = crypto.createHash('md5').update(`${this.username}:${this.realm}:${this.password}`).digest();
+        continue;
+      }
+      throw new Error(`TURN error ${code}`);
+    }
+    throw new Error('TURN authentication failed');
+  }
+
+  async allocate() {
+    const res = await this.request(METHOD.ALLOCATE, [[ATTR.REQUESTED_TRANSPORT, Buffer.from([17, 0, 0, 0])], [ATTR.LIFETIME, u32(600)]]);
+    this.relayed = xorDecode(res.attrs.get(ATTR.XOR_RELAYED_ADDRESS));
+    this.mapped = xorDecode(res.attrs.get(ATTR.XOR_MAPPED_ADDRESS));
+    if (!this.relayed) throw new Error('TURN: no relayed address');
+    // allocations live 10 minutes, channels 10, permissions 5: refresh well before
+    this.refreshTimer = setInterval(() => {
+      this.request(METHOD.REFRESH, [[ATTR.LIFETIME, u32(600)]]).catch(() => {});
+      for (const ch of this.channels.values()) if (ch.ready) this.channelBind(ch).catch(() => {});
+    }, 120000);
+    return this;
+  }
+
+  channelBind(ch) {
+    const n = Buffer.alloc(4);
+    n.writeUInt16BE(ch.number, 0);
+    return this.request(METHOD.CHANNEL_BIND, [[ATTR.CHANNEL_NUMBER, n], [ATTR.XOR_PEER_ADDRESS, xorEncode(ch.peer)]]);
+  }
+
+  /** A channel to the other app's relayed address (also opens the permission for it). */
+  async bind(peer) {
+    const key = `${peer.address}:${peer.port}`;
+    let ch = this.channels.get(key);
+    if (!ch) {
+      if (this.nextChannel > 0x7ffe) return;
+      ch = { number: this.nextChannel++, peer: { address: peer.address, port: peer.port }, ready: false };
+      this.channels.set(key, ch);
+      this.byNumber.set(ch.number, ch);
+    }
+    if (!ch.ready) {
+      await this.channelBind(ch);
+      ch.ready = true;
+    }
+  }
+
+  bound(address, port) {
+    return Boolean(this.channels.get(`${address}:${port}`)?.ready);
+  }
+
+  wrap(address, port, packet) {
+    const ch = this.channels.get(`${address}:${port}`);
+    if (!ch?.ready) return null;
+    const out = Buffer.allocUnsafe(4 + packet.length);
+    out.writeUInt16BE(ch.number, 0);
+    out.writeUInt16BE(packet.length, 2);
+    packet.copy(out, 4);
+    return out;
+  }
+
+  /** A packet from the TURN server: { peer, data } for the other app's packets, else null. */
+  onMessage(msg) {
+    if (msg.length >= 4 && msg[0] >= 0x40 && msg[0] <= 0x7f) {
+      const ch = this.byNumber.get(msg.readUInt16BE(0));
+      const len = msg.readUInt16BE(2);
+      return ch && 4 + len <= msg.length ? { peer: ch.peer, data: msg.subarray(4, 4 + len) } : null;
+    }
+    const m = stunParse(msg);
+    if (!m) return null;
+    if (m.type === DATA_INDICATION) {
+      const peer = xorDecode(m.attrs.get(ATTR.XOR_PEER_ADDRESS));
+      const data = m.attrs.get(ATTR.DATA);
+      return peer && data ? { peer, data } : null;
+    }
+    this.pending.get(m.tid)?.resolve(m);
+    return null;
+  }
+
+  close() {
+    if (this.closed) return;
+    clearInterval(this.refreshTimer);
+    if (this.relayed && this.key) {
+      // give the allocation back (sent once, no waiting)
+      const tid = crypto.randomBytes(12);
+      const auth = [[ATTR.USERNAME, Buffer.from(this.username)], [ATTR.REALM, Buffer.from(this.realm)], [ATTR.NONCE, Buffer.from(this.nonce)]];
+      try {
+        this.ep.socket?.send(stunEncode(METHOD.REFRESH, tid, [[ATTR.LIFETIME, u32(0)], ...auth], this.key), this.server.port, this.server.address);
+      } catch {
+        // socket already gone
+      }
+    }
+    this.closed = true;
+    for (const p of [...this.pending.values()]) p.resolve(null);
+  }
+}
+
 /* ------------------------------------------------ one connection */
 
 class Peer {
@@ -196,7 +424,7 @@ class Peer {
 
   sendTo(address, port, type, payload) {
     if (!this.keys) return;
-    this.ep.socket?.send(this.packet(type, payload), port, address);
+    this.ep.transmit(this.packet(type, payload), address, port);
   }
 
   send(type, payload) {
@@ -213,11 +441,14 @@ class DirectEndpoint extends EventEmitter {
    * role: 'host' (sends the picture) or 'viewer'
    * serverHost: the signaling server's host name; its UDP port comes with each session
    */
-  constructor({ role, serverHost, forceRelay = false }) {
+  constructor({ role, serverHost, forceRelay = false, forceTurn = false }) {
     super();
     this.role = role;
     this.serverHost = serverHost;
-    this.forceRelay = forceRelay;
+    this.forceRelay = forceRelay; // tests / troubleshooting: only the server's relay …
+    this.forceTurn = forceTurn; // … or only the TURN server
+    this.turn = null;
+    this.turnPromise = null;
     this.socket = null;
     this.port = 0;
     this.server = null; // { address, port }
@@ -270,6 +501,7 @@ class DirectEndpoint extends EventEmitter {
     this.closed = true;
     for (const id of [...this.peers.keys()]) this.removePeer(id);
     clearInterval(this.tickTimer);
+    this.turn?.close();
     try {
       this.socket?.close();
     } catch {
@@ -286,24 +518,57 @@ class DirectEndpoint extends EventEmitter {
     return this.server;
   }
 
-  /** Starts a connection; resolves to what the other side needs: { pub, cands }. */
-  async addPeer(id, { session, secret, port }) {
+  /**
+   * Starts a connection; resolves to what the other side needs: { pub, cands }.
+   * port: the server's UDP port for direct mode; turn: { host, port, username, credential }.
+   */
+  async addPeer(id, { session, secret, port, turn }) {
     this.removePeer(id);
     const peer = new Peer(this, id, Number(session), Buffer.from(String(secret), 'base64'));
     this.peers.set(id, peer);
     this.bySession.set(peer.session, peer);
-    if (port) {
-      try {
-        await this.resolveServer(Number(port));
-        await this.register(peer);
-      } catch (err) {
+    await Promise.all([
+      port && !this.forceTurn ? this.resolveServer(Number(port)).then(() => this.register(peer)).catch((err) => {
         this.emit('log', `direct: server not reachable over UDP (${err.message})`);
-      }
-    }
+      }) : null,
+      turn && !this.forceRelay ? this.ensureTurn(turn) : null,
+    ]);
     if (this.peers.get(id) !== peer) throw new Error('closed');
-    const cands = this.forceRelay ? [] : localAddresses().map((address) => ({ address, port: this.port }));
-    if (peer.publicAddr && !this.forceRelay) cands.push(peer.publicAddr);
+    const forced = this.forceRelay || this.forceTurn;
+    const cands = forced ? [] : localAddresses().map((address) => ({ address, port: this.port }));
+    // the public address: from the server's UDP port, or from the TURN server
+    const pub = peer.publicAddr || this.turn?.mapped;
+    if (pub && !forced) cands.push({ address: pub.address, port: pub.port });
+    if (this.turn?.relayed) cands.push({ ...this.turn.relayed, turn: true });
     return { pub: peer.kp.pub, cands: cands.slice(0, MAX_CANDS) };
+  }
+
+  /** One TURN allocation per window, shared by all connections; null when it cannot be had. */
+  ensureTurn(info) {
+    if (!this.turnPromise) {
+      this.turnPromise = (async () => {
+        const { address } = await dns.promises.lookup(String(info.host), { family: 4 });
+        const turn = new TurnClient(this, { address, port: Number(info.port) || 3478, username: info.username, credential: info.credential });
+        this.turn = turn; // answers are routed to it from now on
+        await turn.allocate();
+        return turn;
+      })().catch((err) => {
+        this.emit('log', `direct: no TURN allocation (${err.message})`);
+        this.turn?.close();
+        this.turn = null;
+        this.turnPromise = null; // the next connection tries again
+        return null;
+      });
+    }
+    return this.turnPromise;
+  }
+
+  /** Sends to an address – through the TURN server when it is the other app's relayed address. */
+  transmit(packet, address, port) {
+    if (!this.socket) return;
+    const wrapped = this.turn?.wrap(address, port, packet);
+    if (wrapped) this.socket.send(wrapped, this.turn.server.port, this.turn.server.address);
+    else this.socket.send(packet, port, address);
   }
 
   /** Registers at the server (public address, relay); repeated so the NAT mapping stays open. */
@@ -338,11 +603,17 @@ class DirectEndpoint extends EventEmitter {
     const peer = this.peers.get(id);
     if (!peer) return;
     peer.keys = deriveKeys(peer.kp.privateKey, pub, peer.session);
-    peer.cands = (Array.isArray(cands) ? cands : []).filter(validCandidate).slice(0, MAX_CANDS).map((c) => ({ address: c.address, port: Number(c.port) }));
+    peer.cands = (Array.isArray(cands) ? cands : []).filter(validCandidate).slice(0, MAX_CANDS).map((c) => ({ address: c.address, port: Number(c.port), turn: c.turn === true }));
+    // the other app's TURN address is reached through our own allocation
+    for (const c of peer.cands) {
+      if (c.turn && this.turn) this.turn.bind(c).catch((err) => this.emit('log', `direct: TURN channel (${err.message})`));
+    }
     peer.state = 'connecting';
     this.startProbing(peer, 10000);
     peer.failTimer = setTimeout(() => {
-      if (peer.state === 'connecting' && this.peers.get(id) === peer) this.setState(peer, 'failed');
+      if (peer.state !== 'connecting' || this.peers.get(id) !== peer) return;
+      // what could be reached, for the page to explain
+      this.setState(peer, 'failed', { server: Boolean(peer.publicAddr), turn: Boolean(this.turn?.relayed), remote: peer.cands.length });
     }, 7000);
   }
 
@@ -356,9 +627,9 @@ class DirectEndpoint extends EventEmitter {
     if (this.bySession.get(peer.session) === peer) this.bySession.delete(peer.session);
   }
 
-  setState(peer, state) {
+  setState(peer, state, diag = null) {
     peer.state = state;
-    this.emit('state', peer.id, { state, path: peer.path?.kind || null, rtt: peer.path?.rtt ?? null });
+    this.emit('state', peer.id, { state, path: peer.path?.kind || null, rtt: peer.path?.rtt ?? null, ...(diag ? { diag } : {}) });
   }
 
   /* ---- finding a path */
@@ -372,9 +643,11 @@ class DirectEndpoint extends EventEmitter {
   probe(peer, t) {
     if (t < peer.nextProbe || t > peer.probeUntil || !peer.keys) return;
     peer.nextProbe = t + 100;
-    const targets = this.forceRelay ? [] : [...peer.cands];
-    // the relay only after a moment: a direct path is better
-    if (this.server && (this.forceRelay || t - peer.probeStart > 1000)) targets.push({ ...this.server, relay: true });
+    const since = t - peer.probeStart;
+    const targets = this.forceRelay || this.forceTurn ? [] : peer.cands.filter((c) => !c.turn);
+    // the relays only after a moment: a direct path is better
+    if (this.server && !this.forceTurn && (this.forceRelay || since > 1000)) targets.push({ ...this.server, relay: true });
+    if (this.turn && !this.forceRelay && (this.forceTurn || since > 1500)) targets.push(...peer.cands.filter((c) => c.turn && this.turn.bound(c.address, c.port)));
     for (const target of targets) {
       const id = crypto.randomBytes(8);
       peer.probes.set(id.toString('hex'), { sent: t, relay: Boolean(target.relay) });
@@ -388,9 +661,9 @@ class DirectEndpoint extends EventEmitter {
     if (!probe) return;
     const t = now();
     const relay = Boolean(this.server && rinfo.address === this.server.address && rinfo.port === this.server.port);
-    const kind = relay ? 'relay' : isPrivate(rinfo.address) ? 'lan' : 'internet';
+    const kind = rinfo.turn ? 'turn' : relay ? 'relay' : isPrivate(rinfo.address) ? 'lan' : 'internet';
     const candidate = { address: rinfo.address, port: rinfo.port, kind, rtt: t - probe.sent };
-    const rank = (p) => (p.kind === 'relay' ? 2 : p.kind === 'internet' ? 1 : 0);
+    const rank = (p) => ({ lan: 0, internet: 1, relay: 2, turn: 3 })[p.kind];
     const current = peer.path;
     // take it if there is none yet, or it is a better kind, or the same kind and clearly faster
     const better = !current || rank(candidate) < rank(current) || (rank(candidate) === rank(current) && candidate.rtt + 2 < current.rtt && current.address !== candidate.address);
@@ -411,6 +684,12 @@ class DirectEndpoint extends EventEmitter {
 
   onMessage(msg, rinfo) {
     if (msg.length < 1) return;
+    if (this.turn && rinfo.address === this.turn.server.address && rinfo.port === this.turn.server.port) {
+      // through the TURN server: the other app's packet, as if it came from its relayed address
+      const inner = this.turn.onMessage(msg);
+      if (inner && inner.data[0] === PEER) this.onMessage(inner.data, { address: inner.peer.address, port: inner.peer.port, turn: true });
+      return;
+    }
     if (msg[0] === REG_ACK) {
       const ack = parseRegistrationAck(msg, (s) => this.bySession.get(s)?.secret);
       const peer = ack && this.bySession.get(ack.session);
@@ -779,5 +1058,5 @@ class DirectEndpoint extends EventEmitter {
 module.exports = {
   DirectEndpoint,
   MAX_DATA,
-  _test: { keyPair, deriveKeys, seal, unseal, registration, parseRegistrationAck, isPrivate, validCandidate, T },
+  _test: { keyPair, deriveKeys, seal, unseal, registration, parseRegistrationAck, isPrivate, validCandidate, T, stunEncode, stunParse, xorEncode, xorDecode },
 };
