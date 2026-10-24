@@ -353,7 +353,9 @@ input[type="password"] {
   overflow: hidden;
   border: 1px solid var(--border);
 }
-.player video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+.player video, .player canvas { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+/* settings that only the desktop app has */
+:root:not(.in-app) .app-only { display: none; }
 .player:fullscreen { max-height: none; width: 100vw; height: 100vh; aspect-ratio: auto; border-radius: 0; border: 0; }
 .player:-webkit-full-screen { max-height: none; width: 100vw; height: 100vh; border-radius: 0; border: 0; }
 .player.idle { cursor: none; }

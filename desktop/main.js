@@ -12,13 +12,16 @@
 //  - sharing is never throttled when the window is minimised or covered, and the
 //    capture/encode processes get a higher priority while sharing (a game
 //    running next to it cannot starve them),
-//  - the computer does not go to sleep while sharing.
+//  - the computer does not go to sleep while sharing,
+//  - direct mode between two apps: the picture goes without WebRTC, over the app's own
+//    UDP transport (direct.js) – no jitter buffer, the least delay.
 
 const { app, BrowserWindow, Menu, desktopCapturer, dialog, ipcMain, powerSaveBlocker, screen, session, shell, systemPreferences } = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { DirectEndpoint } = require('./direct');
 
 const DEFAULT_URL = 'https://mozizas.hu/';
 const IS_MAC = process.platform === 'darwin';
@@ -147,13 +150,20 @@ function createMainWindow() {
   mainWindow.on('closed', () => {
     mainWindow = null;
     stopAudioHelper();
+    stopDirect();
   });
 
   const wc = mainWindow.webContents;
   wc.on('did-start-navigation', (details) => {
-    if (details.isMainFrame && !details.isSameDocument) stopAudioHelper();
+    if (details.isMainFrame && !details.isSameDocument) {
+      stopAudioHelper();
+      stopDirect();
+    }
   });
-  wc.on('render-process-gone', () => stopAudioHelper());
+  wc.on('render-process-gone', () => {
+    stopAudioHelper();
+    stopDirect();
+  });
   // Server not reachable → local page with a retry button.
   wc.on('did-fail-load', (_e, code, description, url, isMainFrame) => {
     if (!isMainFrame || code === -3 /* aborted */ || isLocalPage(url)) return;
@@ -407,6 +417,31 @@ function startAudioHelper(wc) {
   });
 }
 
+/* ------------------------------------------------ direct mode (app ↔ app, no WebRTC) */
+
+let direct = null; // { ep, role, wc }
+
+function stopDirect() {
+  direct?.ep.close();
+  direct = null;
+}
+
+async function openDirect(wc, role) {
+  if (direct && direct.role === role && direct.wc === wc) return direct;
+  stopDirect();
+  const ep = new DirectEndpoint({ role, serverHost: new URL(serverUrl).hostname, forceRelay: process.env.SS_DIRECT_RELAY === '1' });
+  const self = { ep, role, wc };
+  direct = self;
+  const live = () => direct === self && !wc.isDestroyed();
+  for (const name of ['state', 'keyframe', 'report', 'clock', 'stats']) {
+    ep.on(name, (...args) => { if (live()) wc.send('direct:event', name, ...args); });
+  }
+  ep.on('media', (meta, data) => { if (live()) wc.send('direct:media', meta, data); });
+  ep.on('log', (line) => { if (process.env.SS_DEBUG) console.log(line); });
+  await ep.open();
+  return self;
+}
+
 /* ------------------------------------------------ IPC from the pages */
 
 function setupIpc() {
@@ -424,6 +459,28 @@ function setupIpc() {
   ipcMain.on('audio:stop', (e, id) => {
     if (audioHelper?.wc === e.sender) stopAudioHelper(Number(id));
   });
+  ipcMain.handle('direct:add', async (e, role, id, info) => {
+    if (e.sender !== mainWindow?.webContents || !isServerUrl(e.senderFrame?.url) || !['host', 'viewer'].includes(role) || !info) return { error: 'unavailable' };
+    try {
+      const d = await openDirect(e.sender, role);
+      return await d.ep.addPeer(String(id), { session: Number(info.session), secret: String(info.secret), port: Number(info.port) || 0 });
+    } catch (err) {
+      return { error: err.message };
+    }
+  });
+  ipcMain.on('direct:connect', (e, id, answer) => {
+    if (direct?.wc !== e.sender) return;
+    try {
+      direct.ep.connectPeer(String(id), answer || {});
+    } catch {
+      e.sender.send('direct:event', 'state', String(id), { state: 'failed', path: null, rtt: null });
+    }
+  });
+  ipcMain.on('direct:remove', (e, id) => { if (direct?.wc === e.sender) direct.ep.removePeer(String(id)); });
+  ipcMain.on('direct:send', (e, meta, data) => { if (direct?.wc === e.sender && direct.role === 'host' && meta && data) direct.ep.sendMedia(meta, data); });
+  ipcMain.on('direct:keyframe', (e) => { if (direct?.wc === e.sender && direct.role === 'viewer') direct.ep.keyframe('host'); });
+  ipcMain.on('direct:bitrate', (e, bps) => { if (direct?.wc === e.sender && direct.role === 'host') direct.ep.setBitrate(Number(bps)); });
+  ipcMain.on('direct:stop', (e) => { if (direct?.wc === e.sender) stopDirect(); });
   ipcMain.handle('app:get-url', () => serverUrl);
   ipcMain.handle('app:set-url', (e, raw) => {
     if (!isLocalPage(e.senderFrame?.url)) return { ok: false };
@@ -553,6 +610,10 @@ async function runSmokeTest() {
       })`, true);
       log('audio helper start', JSON.stringify(started));
     }
+    // direct mode: two endpoints in this process exchange a frame (UDP, X25519, AES-GCM)
+    const loop = await directSelfTest();
+    log('direct self-test', JSON.stringify(loop));
+    if (!loop.ok) throw new Error(`direct mode transport failed: ${loop.error || ''}`);
     log('SMOKE OK');
     clearTimeout(timer);
     app.exit(0);
@@ -563,7 +624,42 @@ async function runSmokeTest() {
   }
 }
 
+async function directSelfTest() {
+  const host = new DirectEndpoint({ role: 'host', serverHost: '127.0.0.1' });
+  const viewer = new DirectEndpoint({ role: 'viewer', serverHost: '127.0.0.1' });
+  try {
+    await host.open();
+    await viewer.open();
+    const info = { session: 4242, secret: Buffer.alloc(16, 7).toString('base64'), port: 0 };
+    const offer = await host.addPeer('v', info);
+    const answer = await viewer.addPeer('host', info);
+    // a computer without a network card still has the loopback address
+    offer.cands.push({ address: '127.0.0.1', port: host.port });
+    answer.cands.push({ address: '127.0.0.1', port: viewer.port });
+    viewer.connectPeer('host', offer);
+    host.connectPeer('v', answer);
+    const frame = Buffer.alloc(50000, 3);
+    const got = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), 8000);
+      viewer.on('media', (meta, data) => {
+        clearTimeout(timer);
+        resolve(data);
+      });
+      host.on('state', (id, s) => { if (s.state === 'connected') host.sendMedia({ stream: 0, key: true, ts: 0, capture: 0 }, frame); });
+    });
+    return { ok: got.equals(frame), bytes: got.length };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  } finally {
+    host.close();
+    viewer.close();
+  }
+}
+
 /* ------------------------------------------------ start */
+
+// own profile (e.g. a second copy of the app on the same computer, for testing)
+if (arg('user-data-dir')) app.setPath('userData', path.resolve(arg('user-data-dir')));
 
 if (!SMOKE && !app.requestSingleInstanceLock()) {
   app.quit();
@@ -589,7 +685,10 @@ if (!SMOKE && !app.requestSingleInstanceLock()) {
     });
   });
 
-  app.on('will-quit', () => stopAudioHelper());
+  app.on('will-quit', () => {
+    stopAudioHelper();
+    stopDirect();
+  });
   app.on('window-all-closed', () => {
     setSharing(false);
     if (!IS_MAC) app.quit();

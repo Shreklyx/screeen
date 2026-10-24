@@ -242,3 +242,67 @@ test('password guessing is rate limited per IP', async () => {
   assert.deepEqual(await c.next(), { t: 'error', code: 'rate' });
   c.close();
 });
+
+test('direct mode: the host gets a UDP session for an app viewer; it ends when the viewer leaves', async () => {
+  // a free UDP port for the relay
+  const { default: dgram } = await import('node:dgram');
+  const probe = dgram.createSocket('udp4');
+  await new Promise((r) => probe.bind(0, '127.0.0.1', r));
+  const directPort = probe.address().port;
+  probe.close();
+  const app2 = createApp({ port: 0, host: '127.0.0.1', hostPassword: 'titok123', turnSecret: '', directPort });
+  await new Promise((r) => app2.server.listen(0, '127.0.0.1', r));
+  assert.equal(await app2.relayReady, directPort);
+  const saved = base;
+  base = `127.0.0.1:${app2.server.address().port}`;
+  try {
+    const h = await client();
+    h.send({ t: 'host', password: 'titok123' });
+    const { code } = await h.next(is('hosted'));
+    const browser = await client();
+    browser.send({ t: 'join', code, caps: { direct: 'yes' } });
+    const b = await browser.next(is('joined'));
+    assert.deepEqual((await h.next(is('viewer'))).caps, {});
+    h.send({ t: 'direct', to: b.id });
+    await browser.nothing(is('direct'));
+    await h.nothing(is('direct'));
+
+    const v = await client();
+    v.send({ t: 'join', code, caps: { direct: true } });
+    const { id } = await v.next(is('joined'));
+    assert.deepEqual((await h.next(is('viewer'))).caps, { direct: true });
+    v.send({ t: 'direct', to: id }); // only the host may ask
+    await v.nothing(is('direct'));
+    h.send({ t: 'direct', to: id });
+    const forHost = await h.next(is('direct'));
+    const forViewer = await v.next(is('direct'));
+    assert.equal(forHost.viewer, id);
+    assert.equal(forHost.session, forViewer.session);
+    assert.equal(forHost.secret, forViewer.secret);
+    assert.equal(forViewer.port, directPort);
+    assert.equal(Buffer.from(forViewer.secret, 'base64').length, 16);
+    assert.equal(app2.relay.sessions.size, 1);
+    // asking again replaces the session
+    h.send({ t: 'direct', to: id });
+    await h.next(is('direct'));
+    await v.next(is('direct'));
+    assert.equal(app2.relay.sessions.size, 1);
+    // direct signals pass between the two
+    h.send({ t: 'signal', to: id, data: { type: 'direct-offer', pub: 'x' } });
+    assert.equal((await v.next(is('signal'))).data.type, 'direct-offer');
+    v.send({ t: 'signal', to: 'host', data: { type: 'direct-answer', pub: 'y' } });
+    assert.equal((await h.next(is('signal'))).data.type, 'direct-answer');
+    v.send({ t: 'signal', to: 'host', data: { type: 'direct-fail' } });
+    assert.equal((await h.next(is('signal'))).data.type, 'direct-fail');
+
+    v.close();
+    await h.next(is('viewer-left'));
+    assert.equal(app2.relay.sessions.size, 0);
+    h.send({ t: 'close' });
+    h.close();
+    browser.close();
+  } finally {
+    base = saved;
+    await app2.close();
+  }
+});

@@ -39,6 +39,10 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   0 ms nem lehetséges: a képet rögzíteni, kódolni, átküldeni, dekódolni és a monitornak kirajzolni is idő
   (60 Hz-en egy képkocka 16,7 ms). A késést méri is: a néző statisztikájában és a megosztó
   nézőlistájában nézőnként látszik (kódolás + hálózat + fogadástól a megjelenésig).
+- **Közvetlen mód – alkalmazás → alkalmazás, WebRTC nélkül** (a legkisebb késés): ha a megosztó és a néző is az
+  asztali alkalmazást használja, a kép nem WebRTC-n megy, hanem az alkalmazás saját UDP-átvitelén (lásd lent).
+  A tesztgépen (videókártya nélkül, szoftveres kódolással) képtől képig: közvetlen mód **~21–23 ms** (p90 ~30 ms),
+  ugyanott WebRTC ~35 ms (p90 ~43 ms). A böngészős nézők közben ugyanúgy WebRTC-n néznek.
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).
 - Ha a megosztó újratölti az oldalt vagy megszakad a nete, a szoba (és a link) 2 percig megmarad, a nézők maguktól
@@ -192,7 +196,37 @@ Ugyanaz az oldal, mint a böngészőben (a szerverről töltődik, így mindig f
   hardveres kódolást, ha a túloldal is támogatja,
 - a megosztás **nem lassul le**, ha az ablak kicsinyítve vagy takarásban van, és megosztás közben a kódoló
   folyamatok **magasabb prioritást** kapnak (egy mellette futó játék nem fojtja el),
-- megosztás közben **nem alszik el** a gép.
+- megosztás közben **nem alszik el** a gép,
+- **közvetlen mód** (alapból be van kapcsolva): az alkalmazásos nézők WebRTC nélkül kapják a képet – lásd lent.
+
+### Közvetlen mód (alkalmazás → alkalmazás, WebRTC nélkül)
+
+Ha a megosztó és a néző is az asztali alkalmazást használja, a kép a lehető legrövidebb úton megy:
+
+- a megosztó gép **egyszer** kódol (H.264, a videókártyán – WebCodecs, „realtime” mód) minden alkalmazásos nézőnek,
+  és ha a kódoló épp dolgozik, a következő képkockát kihagyja ahelyett, hogy sorba állna (a sor csak késés);
+- a képkockák ~1,1 KB-os UDP-csomagokban mennek, AES-GCM titkosítással (a kulcsot a két alkalmazás X25519-cel
+  egyezteti, a szerver sem látja a képet), a küldés gyors és csak enyhén tagolt (a célbitráta 3-szorosával);
+- a néző **puffer nélkül** dolgozik: minden teljes képkockát azonnal dekódol, és egy alacsony késleltetésű
+  („desynchronized”) vásznon rajzolja ki, amely nem vár a böngésző képösszeállítására; ha a gép nem bírja a tempót,
+  mindig csak a legfrissebb kép kerül ki;
+- elveszett csomagot a néző azonnal újrakér (NACK); ha egy kép így sem lesz teljes, kihagyja, és kulcskockát kér;
+- a hang Opus, 5 ms-os csomagokban, 5.1/7.1 is (csatornapáronként); a néző csak 10–100 ms hangpuffert tart, amennyit a
+  hálózat éppen kíván;
+- kapcsolat: a két alkalmazás a szerver UDP-portján (**3479**) megtudja a saját nyilvános címét, és közvetlenül
+  egymásnak küld (helyi hálózaton a helyi címen); ha ez nem megy, a szerver továbbítja a (titkosított) csomagokat;
+  ha egyáltalán nem jön létre a kapcsolat, magától **WebRTC-re vált**;
+- a bitrátát a néző jelentései szabályozzák (csomagvesztés, kihagyott kép, növekvő RTT → kevesebb; ha minden rendben,
+  lassan több); szoftveres kódolásnál, ha a kódoló nem bírja a tempót, kisebb felbontásra vált.
+
+A néző statisztikájában (**S**) a *Mód* sorban: *Közvetlen*, a *Késés (mért)* a valódi, végponttól végpontig mért
+késés (a megosztó gépen a rögzítéstől a néző vásznára rajzolásig, a két gép órájának eltérésével korrigálva).
+A megosztó *Beállítások* → **Kapcsolat alkalmazásos nézőkkel**: *Közvetlen* (alap) vagy *WebRTC*. A néző
+„Simább” / „Stabil” pufferrel WebRTC-re vált (a közvetlen módban nincs puffer), „Minimális”-ra visszaállva vissza.
+
+Windowson az első közvetlen kapcsolatnál a Windows tűzfal rákérdezhet a Screen Share-re: engedélyezd (enélkül is
+működik, de a helyi hálózaton a közvetlen út biztosabb). A szerveren a telepítő megnyitja a **3479/udp** portot; ha a
+szolgáltatónak külön tűzfala van, ott is engedd.
 
 **Telepítés:** az alkalmazás nincs Microsofttal / Apple-lel aláírva (ahhoz fizetős fejlesztői fiók kell), ezért:
 
@@ -221,7 +255,7 @@ Visual Studio parancssorban `cl /std:c++17 /O2 /EHsc /MT /Fe:desktop\native\ss-a
 ```bash
 npm install
 HOST_PASSWORD=titok123 npm start     # http://localhost:8080
-npm test                              # szerver tesztek
+npm test                              # szerver, közvetlen mód (UDP-átvitel, relé, hang) tesztek
 ```
 
 A képernyőmegosztás csak HTTPS-en vagy `localhost`-on működik. TURN relé nélkül (üres `TURN_SECRET`) csak STUN-nal fut.
@@ -235,5 +269,9 @@ A képernyőmegosztás csak HTTPS-en vagy `localhost`-on működik. TURN relé n
   a minőséget `RTCRtpSender.setParameters()` (bitráta, FPS, felbontás-skálázás, degradáció, prioritás),
   `setCodecPreferences()` és az SDP hangolása (Opus sztereó/510k, kezdő bitráta) állítja. Forrásváltáskor
   `replaceTrack()`, kodekváltáskor újratárgyalás ugyanazon a kapcsolaton, megszakadáskor ICE restart.
+- Közvetlen mód: `desktop/direct.js` (az alkalmazás UDP-átvitele: titkosítás, darabolás, NACK, kulcskocka-kérés,
+  óra-egyeztetés, lyukasztás a NAT-on, szerveres relé), `server/direct-relay.js` (a szerver 3479/udp portja:
+  címfelderítés és relé, csak a munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része
+  (WebCodecs kódolás/dekódolás, kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet).
 - `docker-compose.yml` – `app` (Node), `caddy` (HTTPS, beállítás: `deploy/caddy/Caddyfile`), `turn` (coturn, host
   hálózaton; a belső/foglalt címek felé tiltott relézéssel).

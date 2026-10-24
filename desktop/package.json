@@ -22,6 +22,7 @@
     "copyright": "Shreklyx",
     "files": [
       "main.js",
+      "direct.js",
       "preload.js",
       "picker-preload.js",
       "pages/**"

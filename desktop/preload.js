@@ -28,4 +28,22 @@ contextBridge.exposeInMainWorld('screenshareApp', {
       },
     }
     : null,
+  // direct mode (app ↔ app without WebRTC): the app's own UDP transport, see direct.js
+  direct: {
+    add: (role, id, info) => ipcRenderer.invoke('direct:add', String(role), String(id), info),
+    connect: (id, answer) => ipcRenderer.send('direct:connect', String(id), answer),
+    remove: (id) => ipcRenderer.send('direct:remove', String(id)),
+    send: (meta, data) => ipcRenderer.send('direct:send', meta, data),
+    keyframe: () => ipcRenderer.send('direct:keyframe'),
+    bitrate: (bps) => ipcRenderer.send('direct:bitrate', Number(bps)),
+    stop: () => ipcRenderer.send('direct:stop'),
+    onEvent: (cb) => {
+      ipcRenderer.removeAllListeners('direct:event');
+      ipcRenderer.on('direct:event', (_e, name, ...args) => cb(name, ...args));
+    },
+    onMedia: (cb) => {
+      ipcRenderer.removeAllListeners('direct:media');
+      ipcRenderer.on('direct:media', (_e, meta, data) => cb(meta, data));
+    },
+  },
 });

@@ -46,6 +46,10 @@ jobs:
           npm ci
           npm ci --prefix desktop
 
+      # server + direct mode (UDP transport, relay, audio worklet) on this OS's network stack
+      - name: Tests
+        run: npm test
+
       # ss-audio.exe: Windows 5.1/7.1 system audio (desktop/native); /MT = no VC++ runtime needed
       - name: Build the audio helper
         if: runner.os == 'Windows'
@@ -99,6 +103,7 @@ jobs:
 
             - A gép teljes hangját magától megosztja – Macen is, semmit nem kell mellé telepíteni (macOS 13 vagy újabb; első megosztáskor engedélyezd a rendszerhang-felvételt).
             - Windowson 5.1 / 7.1 hangszóró (vagy 7.1-es fejhallgató) esetén minden csatornát átküld: a térhangos nézők térhangot kapnak.
+            - Közvetlen mód: ha a néző is az alkalmazással néz, a kép WebRTC nélkül, puffer nélkül megy – a legkisebb késés.
 
             Az alkalmazás nincs Microsofttal / Apple-lel aláírva:
             - Windows: „A Windows megvédte a számítógépet” ablaknál → **További információ → Futtatás mindenképp**.

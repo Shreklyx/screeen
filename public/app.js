@@ -6,7 +6,8 @@
  * Signaling: a WebSocket to this site's own server (/ws). Media: WebRTC,
  * directly between the browsers (or through the server's TURN relay when a
  * direct path is impossible). The host keeps one RTCPeerConnection per
- * viewer and always makes the offers; viewers only answer.
+ * viewer and always makes the offers; viewers only answer. Between two
+ * desktop apps the picture can go without WebRTC (see DIRECT MODE).
  * ===================================================================== */
 
 const RES_TARGETS = { native: null, 2160: [3840, 2160], 1440: [2560, 1440], 1080: [1920, 1080], 720: [1280, 720] };
@@ -29,7 +30,7 @@ const MULTIOPUS = {
 const MAX_KBPS = 300000; // SDP ceiling, above the highest selectable rate (250 Mbit/s)
 const START_KBPS_CAP = 12000;
 // "auto" = chosen per viewer from what this machine can do (see autoTarget)
-const DEFAULT_SETTINGS = { res: 'auto', fps: 'auto', kbps: 'auto', mode: 'motion', codec: 'auto', audio: true, audioSource: 'display' };
+const DEFAULT_SETTINGS = { res: 'auto', fps: 'auto', kbps: 'auto', mode: 'motion', codec: 'auto', audio: true, audioSource: 'display', link: 'direct' };
 const SETTINGS_VERSION = 2; // older saved settings are dropped so everyone starts from the best defaults
 const NUMERIC_SETTINGS = new Set(['fps', 'kbps']);
 // GPU encoding: the maximum (4K cap – a 5K/6K Retina screen at full size only adds load and delay)
@@ -704,6 +705,7 @@ function setHostAudio(track) {
     if (hadSurround && v.pc && v.caps?.surround) negotiate(v); // back to stereo Opus
   }
   if (old && old !== track) old.stop();
+  updateDirectPipelines();
   startMeter(track);
   updateCaptureInfo();
 }
@@ -774,6 +776,7 @@ function applyHosted(res) {
   host.code = res.code;
   host.token = res.token;
   host.iceServers = res.iceServers || [];
+  host.serverDirect = res.direct === true; // an older server: WebRTC only
   store.set('ss-host-room', { code: res.code, token: res.token }, 'session');
   const link = `${location.origin}${location.pathname}#${res.code}`;
   $('#roomCode').textContent = res.code;
@@ -861,6 +864,7 @@ function onHostMessage(msg) {
     case 'viewer': ensureViewer(msg.id, msg.caps); break;
     case 'viewer-left': dropViewer(msg.id); break;
     case 'signal': onViewerSignal(msg.from, msg.data); break;
+    case 'direct': onDirectSession(msg); break;
     case 'count': $('#viewerCount').textContent = String(msg.n); break;
     case 'replaced':
       host.code = null;
@@ -921,11 +925,14 @@ function videoEncoding(v) {
 function ensureViewer(id, caps) {
   let v = host.viewers.get(id);
   if (v && v.pc && !['failed', 'closed'].includes(v.pc.connectionState)) return;
+  if (v && v.direct && !['failed', 'lost', 'closed'].includes(v.direct.state)) return;
   if (!v) {
     v = { id, n: ++host.seq, caps: caps || null, pc: null, stats: null, prev: null };
     host.viewers.set(id, v);
   }
-  createViewerPc(v);
+  // both ends are the desktop app: without WebRTC (falls back to it by itself)
+  if (wantsDirect(v)) startDirectViewer(v);
+  else createViewerPc(v);
   renderViewers();
 }
 
@@ -987,6 +994,7 @@ function dropViewer(id) {
   if (!v) return;
   closeViewerPc(v);
   host.viewers.delete(id);
+  stopDirectViewer(v);
   renderViewers();
 }
 
@@ -1038,8 +1046,22 @@ async function negotiate(v, { iceRestart = false } = {}) {
 
 async function onViewerSignal(id, data) {
   const v = host.viewers.get(id);
-  if (!v || !v.pc || !data || typeof data !== 'object') return;
+  if (!v || !data || typeof data !== 'object') return;
+  if (v.direct || data.type === 'direct-answer' || data.type === 'direct-fail') {
+    onDirectViewerSignal(v, data);
+    return;
+  }
+  if (!v.pc) return;
   if (data.type === 'recall') {
+    // the viewer went back to "Minimális": direct mode again, if both are the app
+    if (data.direct === true && v.noDirect) {
+      v.noDirect = false;
+      if (wantsDirect(v)) {
+        startDirectViewer(v);
+        renderViewers();
+        return;
+      }
+    }
     if (Date.now() - (v.createdAt || 0) > 5000) createViewerPc(v);
     return;
   }
@@ -1183,6 +1205,9 @@ function setHostTracks({ video, audio, audio8 = null, stopSurround = null, surro
   for (const t of old) if (t && t !== video && t !== audio && t !== audio8) t.stop();
   if (oldStopSurround && oldStopSurround !== stopSurround) oldStopSurround();
 
+  direct.forceKey = true;
+  updateDirectPipelines();
+
   host.dims = '';
   if (host.previewOn) $('#preview').srcObject = new MediaStream([video]);
   $('#previewPaused').hidden = true;
@@ -1208,6 +1233,7 @@ function stopTracks() {
 
 function pauseSharing() {
   stopTracks();
+  updateDirectPipelines();
   for (const v of host.viewers.values()) {
     v.videoTx?.sender.replaceTrack(null).catch(() => {});
     v.audioTx?.sender.replaceTrack(null).catch(() => {});
@@ -1357,9 +1383,25 @@ function updateSetting(key, value) {
     return;
   }
   if (key === 'audio') {
+    updateDirectPipelines();
     updateCaptureInfo();
     return;
   }
+  if (key === 'link') {
+    // app viewers move to the chosen kind of connection
+    for (const v of host.viewers.values()) {
+      if (!v.caps?.direct) continue;
+      v.noDirect = false;
+      if (wantsDirect(v)) startDirectViewer(v);
+      else if (v.direct) {
+        stopDirectViewer(v);
+        createViewerPc(v);
+      }
+    }
+    renderViewers();
+    return;
+  }
+  if (key === 'kbps' && direct.kbps) direct.kbps = Math.min(direct.kbps, directTargetKbps());
   applyAllSenders();
   updateCaptureInfo();
 }
@@ -1412,6 +1454,14 @@ async function hostStatsTick() {
   }
 
   for (const v of host.viewers.values()) {
+    if (v.direct) {
+      v.stats = directStats(v);
+      if (v.stats && host.tick % 2 === 0) {
+        const { encodeMs, hw } = v.stats;
+        host.signal?.send({ t: 'signal', to: v.id, data: { type: 'stats', session: v.session, encodeMs, hw, encoder: hw ? gpu.encoderName : null, codec: 'H264' } });
+      }
+      continue;
+    }
     const pc = v.pc;
     if (!pc || pc.connectionState !== 'connected') { v.stats = null; continue; }
     let report;
@@ -1504,8 +1554,9 @@ function renderViewers() {
     const name = document.createElement('span');
     name.textContent = `Néző #${v.n}`;
     const state = document.createElement('span');
-    const cs = v.pc?.connectionState;
+    const cs = v.direct ? (v.direct.state === 'connected' ? 'direct' : 'connecting') : v.pc?.connectionState;
     if (!isLive()) { state.textContent = 'vár (szünet)'; state.className = 'viewer-state'; }
+    else if (cs === 'direct') { state.textContent = `közvetlen mód · ${PATH_LABEL[v.direct.path] || ''}`; state.className = 'viewer-state ok'; }
     else if (cs === 'connected') { state.textContent = v.stats?.relay ? 'kapcsolódva · TURN relé' : 'kapcsolódva · közvetlen'; state.className = 'viewer-state ok'; }
     else if (cs === 'failed' || cs === 'disconnected') { state.textContent = 'kapcsolat gond…'; state.className = 'viewer-state warn'; }
     else { state.textContent = 'kapcsolódik…'; state.className = 'viewer-state'; }
@@ -1525,7 +1576,8 @@ function renderViewers() {
       if (s.impl) line2.title = s.impl;
       stats.append(line1, line2);
       if (v.remote?.lat != null) {
-        const total = v.remote.lat + (s.encodeMs || 0);
+        // direct mode: measured end to end (capture → on the viewer's screen)
+        const total = v.remote.measured ? v.remote.lat : v.remote.lat + (s.encodeMs || 0);
         const line = document.createElement('div');
         line.textContent = `Késés: ~${Math.round(total)} ms`;
         if (total > 150) line.className = 'warn';
@@ -1565,7 +1617,7 @@ async function copyLink() {
 }
 
 function initHostUi() {
-  const fields = { setRes: 'res', setFps: 'fps', setKbps: 'kbps', setMode: 'mode', setCodec: 'codec' };
+  const fields = { setRes: 'res', setFps: 'fps', setKbps: 'kbps', setMode: 'mode', setCodec: 'codec', setLink: 'link' };
   for (const [id, key] of Object.entries(fields)) {
     const el = $(`#${id}`);
     el.value = String(settings[key]);
@@ -1646,6 +1698,7 @@ const viewer = {
   wakeLock: null,
   idleTimer: null,
   hostStats: null, // the sender's encoder info (codec, hardware, encode time)
+  direct: null, // direct mode (app → app without WebRTC), see DIRECT MODE
   frameDelays: [], // receive → display time of recent frames (ms)
   frameTimer: null,
   tick: 0,
@@ -1699,6 +1752,7 @@ async function startViewing(code) {
   setOverlay('Csatlakozás a szobához…');
   viewer.caps = await Promise.race([codecSupport('decode'), sleep(1500).then(() => null)]);
   if (surroundSpeakers()) viewer.caps = { ...viewer.caps, surround: true };
+  if (DIRECT) viewer.caps = { ...viewer.caps, direct: true }; // the desktop app can also receive without WebRTC
   viewer.signal = createSignal({
     onMessage: onViewerMessage,
     onOpen: joinRoom,
@@ -1746,7 +1800,10 @@ function onViewerMessage(msg) {
       break;
     case 'host-away':
       // Media may still flow peer-to-peer; only cover the picture if it stopped.
-      if (!hasPicture() || viewer.pc?.connectionState !== 'connected') setOverlay('A megosztó kapcsolata megszakadt. Várakozás…');
+      if (!hasPicture() || (viewer.direct ? viewer.direct.state !== 'connected' : viewer.pc?.connectionState !== 'connected')) setOverlay('A megosztó kapcsolata megszakadt. Várakozás…');
+      break;
+    case 'direct':
+      onViewerDirectSession(msg);
       break;
     case 'count':
       $('#viewerCountText').textContent = `${msg.n} néző`;
@@ -1755,6 +1812,7 @@ function onViewerMessage(msg) {
       viewer.closed = true;
       clearTimeout(viewer.retryTimer);
       closeViewerConnection();
+      closeDirectView();
       setLive(false);
       setOverlay(msg.reason === 'timeout' ? 'A megosztó nem tért vissza, a szoba bezárult.' : 'A megosztó befejezte a megosztást. Köszi, hogy néztél!', {
         spinner: false,
@@ -1822,7 +1880,12 @@ function closeViewerConnection() {
 }
 
 async function onHostSignal(data) {
+  if (data.type === 'direct-offer') {
+    await onDirectOffer(data);
+    return;
+  }
   if (data.type === 'offer' && typeof data.sdp === 'string') {
+    closeDirectView(); // the sharer chose WebRTC for this viewer
     if (!viewer.pc || viewer.session !== data.session || viewer.pc.signalingState === 'closed') newViewerPc(data.session);
     const pc = viewer.pc;
     const lowLatency = viewer.bufferMs === 0;
@@ -1882,7 +1945,7 @@ async function playVideo() {
   syncMuteUi();
 }
 
-const hasPicture = () => video().readyState >= 2 && video().videoWidth > 0;
+const hasPicture = () => (video().readyState >= 2 && video().videoWidth > 0) || Boolean(viewer.direct?.drawn);
 
 function onVideoPlaying() {
   if (viewer.live) { hideOverlay(); setLive(true); }
@@ -1924,6 +1987,10 @@ async function requestWakeLock() {
 }
 
 async function viewerStatsTick() {
+  if (viewer.direct) {
+    directStatsTick();
+    return;
+  }
   const pc = viewer.pc;
   if (!pc || pc.connectionState === 'closed') { $('#viewerInfo').textContent = ''; return; }
   let report;
@@ -2058,7 +2125,9 @@ function initViewerUi() {
   el.addEventListener('playing', onVideoPlaying);
   el.addEventListener('resize', () => { if (viewer.live && hasPicture()) { hideOverlay(); setLive(true); } });
   el.addEventListener('volumechange', syncMuteUi);
+  el.addEventListener('volumechange', syncDirectVolume);
   el.addEventListener('dblclick', toggleFullscreen);
+  $('#directCanvas').addEventListener('dblclick', toggleFullscreen);
   player.addEventListener('pointermove', showControls);
   player.addEventListener('pointerdown', showControls);
 
@@ -2079,8 +2148,14 @@ function initViewerUi() {
     viewer.bufferMs = Number(lat.value);
     store.set('ss-buffer', viewer.bufferMs);
     for (const r of viewer.pc?.getReceivers() || []) tuneReceiver(r);
-    // to or from "Minimális": the connection is set up differently (see ownAudioStream)
-    if (viewer.pc && viewer.lowLatency !== (viewer.bufferMs === 0)) sendToHost({ type: 'recall' });
+    if (viewer.direct && viewer.bufferMs > 0) {
+      // direct mode has no buffer: WebRTC with the chosen one
+      closeDirectView();
+      sendToHost({ type: 'direct-fail' });
+    } else if (viewer.pc && viewer.lowLatency !== (viewer.bufferMs === 0)) {
+      // to or from "Minimális": the connection is set up differently (see ownAudioStream), or direct mode
+      sendToHost({ type: 'recall', direct: viewer.bufferMs === 0 && Boolean(DIRECT) });
+    }
   });
 
   $('#btnMute').addEventListener('click', toggleMute);
@@ -2110,8 +2185,757 @@ function initViewerUi() {
 
 /* ============================== boot ============================== */
 
+/* ======================= DIRECT MODE (app → app) ======================= */
+// When both ends run the desktop app, the picture can skip WebRTC: the sharer encodes once
+// for every such viewer (WebCodecs, on the GPU), the app sends the frames over its own UDP
+// transport (desktop/direct.js), and the viewer decodes and draws every frame the moment it
+// arrives – no jitter buffer, no pacing queue, no waiting for the compositor (low-latency
+// canvas). Browsers keep using WebRTC; when the direct path cannot be set up, WebRTC takes over.
+
+const DIRECT = APP?.direct || null;
+const DIRECT_CODEC = 'avc1.640034'; // H.264 High 5.2 (up to 4K 60): every GPU decodes it
+const DIRECT_MIN_KBPS = 3000;
+const PATH_LABEL = { lan: 'helyi hálózat', internet: 'interneten át', relay: 'a szerveren át' };
+
+const direct = {
+  video: null, // the sharer's encoding pipelines
+  audio: null,
+  forceKey: false,
+  wantKey: false,
+  lastKey: 0,
+  kbps: 0,
+  lastCut: 0,
+  lastRaise: 0,
+  hw: null,
+};
+
+const directOn = () => Boolean(DIRECT) && settings.link !== 'webrtc';
+const wantsDirect = (v) => directOn() && host.serverDirect && Boolean(v.caps?.direct) && !v.noDirect;
+const clockNow = () => performance.timeOrigin + performance.now();
+const evenPx = (x) => Math.max(2, Math.round(x / 2) * 2);
+
+/* ---- sharer: one connection per app viewer ---- */
+
+function startDirectViewer(v) {
+  closeViewerPc(v);
+  stopDirectViewer(v);
+  v.session = randomId();
+  v.createdAt = Date.now();
+  v.stats = null;
+  v.prev = null;
+  v.remote = null;
+  v.direct = { state: 'starting', path: null, rtt: null, report: null, minRtt: Infinity };
+  host.signal?.send({ t: 'direct', to: v.id });
+  // no direct picture in time (e.g. UDP blocked): WebRTC
+  v.directTimer = setTimeout(() => { if (v.direct && v.direct.state !== 'connected') directFallback(v); }, 10000);
+}
+
+function stopDirectViewer(v) {
+  clearTimeout(v.directTimer);
+  if (!v.direct) return;
+  v.direct = null;
+  DIRECT?.remove(v.id);
+  updateDirectPipelines();
+}
+
+function directFallback(v) {
+  if (host.viewers.get(v.id) !== v) return;
+  stopDirectViewer(v);
+  v.noDirect = true;
+  createViewerPc(v);
+  renderViewers();
+}
+
+async function onDirectSession(msg) {
+  const v = host.viewers.get(msg.viewer);
+  const d = v?.direct;
+  if (!d || d.state !== 'starting') return;
+  const res = await DIRECT.add('host', v.id, { session: msg.session, secret: msg.secret, port: msg.port });
+  if (v.direct !== d) return;
+  if (!res || res.error) {
+    directFallback(v);
+    return;
+  }
+  d.state = 'connecting';
+  host.signal.send({ t: 'signal', to: v.id, data: { type: 'direct-offer', session: v.session, udp: msg.session, pub: res.pub, cands: res.cands, codec: DIRECT_CODEC } });
+}
+
+function onDirectViewerSignal(v, data) {
+  if (data.type === 'recall') {
+    if (Date.now() - (v.createdAt || 0) > 3000) startDirectViewer(v);
+    return;
+  }
+  if (data.session !== v.session) return;
+  if (data.type === 'direct-answer' && v.direct?.state === 'connecting') {
+    DIRECT.connect(v.id, { pub: data.pub, cands: data.cands });
+  } else if (data.type === 'direct-fail') {
+    directFallback(v);
+  } else if (data.type === 'stats') {
+    const num = (x) => (Number.isFinite(x) && x >= 0 && x < 1e6 ? x : null);
+    v.remote = { lat: num(data.lat), fps: num(data.fps), loss: num(data.loss), measured: data.measured === true };
+  }
+}
+
+function onHostDirectEvent(name, id, info) {
+  if (name === 'keyframe') {
+    direct.wantKey = true;
+    return;
+  }
+  const v = host.viewers.get(id);
+  if (!v?.direct || !info) return;
+  if (name === 'state') {
+    Object.assign(v.direct, { state: info.state, path: info.path, rtt: info.rtt });
+    if (info.state === 'connected') {
+      clearTimeout(v.directTimer);
+      if (!direct.kbps) direct.kbps = info.path === 'lan' ? directTargetKbps() : Math.min(directTargetKbps(), 25000);
+      DIRECT.bitrate(direct.kbps * 1000);
+      updateDirectPipelines();
+      direct.forceKey = true;
+    } else if (info.state === 'failed') {
+      directFallback(v);
+    } else if (info.state === 'lost' || info.state === 'closed') {
+      // the viewer's network changed or the app reloaded: try again, then WebRTC
+      v.directRetries = (v.directRetries || 0) + 1;
+      if (v.directRetries > 2) directFallback(v);
+      else startDirectViewer(v);
+    }
+    renderViewers();
+  } else if (name === 'report') {
+    v.direct.report = info;
+    if (Number.isFinite(info.rtt)) v.direct.minRtt = Math.min(v.direct.minRtt, info.rtt);
+    if (info.fps > 0) v.directRetries = 0;
+    adaptDirectBitrate();
+  }
+}
+
+const directViewers = () => [...host.viewers.values()].filter((v) => v.direct?.state === 'connected');
+const directTargetKbps = () => (settings.kbps === 'auto' ? (direct.hw === false ? 20000 : 80000) : settings.kbps);
+
+// No bandwidth estimate as in WebRTC: lower the bitrate when a viewer loses packets, has to
+// skip frames or its round trip grows (queues filling up), raise it slowly while all is well.
+function adaptDirectBitrate() {
+  const viewers = directViewers();
+  const reports = viewers.map((v) => v.direct.report).filter(Boolean);
+  if (!reports.length) return;
+  const target = directTargetKbps();
+  const now = Date.now();
+  const congested = reports.some((r) => r.loss > 2 || r.skips > 0)
+    || viewers.some((v) => v.direct.report?.rtt != null && v.direct.report.rtt > v.direct.minRtt + 40);
+  if (congested && now - direct.lastCut > 2000) {
+    direct.kbps = Math.max(DIRECT_MIN_KBPS, direct.kbps * 0.7);
+    direct.lastCut = now;
+  } else if (!congested && now - direct.lastCut > 3000 && now - direct.lastRaise > 1000 && reports.every((r) => r.loss < 0.5)) {
+    direct.kbps = Math.min(target, direct.kbps * 1.12 + 500);
+    direct.lastRaise = now;
+  }
+  direct.kbps = Math.min(direct.kbps, target);
+  DIRECT.bitrate(direct.kbps * 1000);
+}
+
+/** Starts/stops the encoders to match the tracks and whether any app viewer is connected. */
+function updateDirectPipelines() {
+  if (!DIRECT) return;
+  if (!isLive() || !directViewers().length) {
+    stopDirectVideo();
+    stopDirectAudio();
+    return;
+  }
+  if (direct.video?.track !== host.video) startDirectVideo(host.video);
+  const audio = settings.audio ? host.audio8 || host.audio : null;
+  if ((direct.audio?.track || null) !== (audio || null)) startDirectAudio(audio);
+}
+
+/* ---- sharer: video ---- */
+
+function startDirectVideo(track) {
+  stopDirectVideo();
+  if (!track || track.readyState !== 'live') return;
+  let reader;
+  try {
+    reader = new MediaStreamTrackProcessor({ track, maxBufferSize: 1 }).readable.getReader();
+  } catch (err) {
+    console.warn('direct video', err);
+    return;
+  }
+  const pipe = { track, reader, encoder: null, config: null, sizeKey: '', captured: new Map(), encodeMs: null, inFlight: 0, limit: 1, lastOutput: performance.now(), scale: 1, slowSince: 0, fastSince: 0, stopped: false };
+  direct.video = pipe;
+  direct.forceKey = true;
+  (async () => {
+    try {
+      for (;;) {
+        const { value: frame, done } = await reader.read();
+        if (done) break;
+        if (pipe.stopped) {
+          frame.close();
+          break;
+        }
+        await encodeDirectFrame(pipe, frame);
+      }
+    } catch (err) {
+      if (pipe.stopped) return;
+      console.warn('direct video', err);
+      // no encoder at all: these viewers get WebRTC
+      for (const v of [...host.viewers.values()]) if (v.direct) directFallback(v);
+    }
+  })();
+}
+
+function stopDirectVideo() {
+  const pipe = direct.video;
+  if (!pipe) return;
+  direct.video = null;
+  pipe.stopped = true;
+  pipe.reader.cancel().catch(() => {});
+  try { pipe.encoder?.close(); } catch { /* already closed */ }
+}
+
+function directVideoConfig(pipe, frame) {
+  const w = frame.displayWidth;
+  const h = frame.displayHeight;
+  const hwOk = direct.hw !== false;
+  const target = RES_TARGETS[settings.res === 'auto' ? (hwOk ? HW_TARGET.res : '1080') : settings.res];
+  let scale = 1;
+  if (target) {
+    const [tw, th] = w >= h ? target : [target[1], target[0]];
+    scale = Math.max(1, w / tw, h / th);
+  }
+  scale *= pipe.scale; // the encoder could not keep up at the full size
+  return {
+    codec: DIRECT_CODEC,
+    width: evenPx(w / scale),
+    height: evenPx(h / scale),
+    bitrate: Math.round((direct.kbps || directTargetKbps()) * 1000),
+    framerate: settings.fps === 'auto' ? (hwOk ? HW_TARGET.fps : 30) : settings.fps,
+    latencyMode: 'realtime',
+    bitrateMode: 'variable',
+    avc: { format: 'annexb' },
+    ...(CONTENT_HINT[settings.mode] ? { contentHint: CONTENT_HINT[settings.mode] } : {}),
+  };
+}
+
+async function configureDirectEncoder(pipe, want) {
+  const supported = async (c) => {
+    try {
+      return (await VideoEncoder.isConfigSupported(c)).supported === true;
+    } catch {
+      return false;
+    }
+  };
+  let config = { ...want, hardwareAcceleration: 'prefer-hardware' };
+  const hw = direct.hw !== false && (await supported(config));
+  if (!hw) {
+    // no GPU encoder: the processor manages at most 1080p 30 without falling behind
+    const scale = Math.sqrt(Math.max(1, (want.width * want.height) / (1920 * 1080)));
+    config = { ...want, width: evenPx(want.width / scale), height: evenPx(want.height / scale), framerate: Math.min(want.framerate, 30), hardwareAcceleration: 'no-preference' };
+    if (!(await supported(config))) throw new Error('no H.264 encoder');
+  }
+  if (pipe.stopped) return;
+  if (!pipe.encoder || pipe.encoder.state === 'closed') {
+    pipe.encoder = new VideoEncoder({
+      output: (chunk) => onDirectChunk(pipe, chunk),
+      error: (err) => {
+        console.warn('direct encoder', err);
+        if (direct.hw) direct.hw = false; // a GPU encoder that fails while running: the processor from now on
+        pipe.encoder = null;
+        pipe.sizeKey = '';
+      },
+    });
+  }
+  pipe.encoder.configure(config);
+  pipe.config = config;
+  pipe.inFlight = 0;
+  pipe.lastOutput = performance.now();
+  direct.hw = hw;
+}
+
+async function encodeDirectFrame(pipe, frame) {
+  try {
+    const want = directVideoConfig(pipe, frame);
+    const sizeKey = `${want.width}x${want.height}@${want.framerate}`;
+    if (!pipe.encoder || pipe.encoder.state !== 'configured' || sizeKey !== pipe.sizeKey) {
+      await configureDirectEncoder(pipe, want);
+      pipe.sizeKey = sizeKey;
+      direct.forceKey = true;
+    } else if (Math.abs(want.bitrate - pipe.config.bitrate) > pipe.config.bitrate * 0.1) {
+      pipe.config = { ...pipe.config, bitrate: want.bitrate };
+      pipe.encoder.configure(pipe.config);
+    }
+    if (pipe.stopped || !pipe.encoder) return;
+    // The encoder is still busy: a frame that waits is only delay – skip it. (An encoder
+    // that holds a frame or two back before its first output gets that much room.)
+    if (pipe.inFlight >= pipe.limit || pipe.encoder.encodeQueueSize > 0) {
+      if (performance.now() - pipe.lastOutput > 250 && pipe.limit < 4) pipe.limit++;
+      return;
+    }
+    const now = Date.now();
+    const keyFrame = direct.forceKey || (direct.wantKey && now - direct.lastKey >= 250);
+    if (keyFrame) {
+      direct.forceKey = false;
+      direct.wantKey = false;
+      direct.lastKey = now;
+    }
+    pipe.captured.set(frame.timestamp, { at: clockNow(), start: performance.now() });
+    if (pipe.captured.size > 30) pipe.captured.delete(pipe.captured.keys().next().value);
+    pipe.inFlight++;
+    pipe.encoder.encode(frame, { keyFrame });
+  } finally {
+    frame.close();
+  }
+}
+
+function onDirectChunk(pipe, chunk) {
+  if (pipe.stopped) return;
+  const data = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(data);
+  const c = pipe.captured.get(chunk.timestamp);
+  pipe.captured.delete(chunk.timestamp);
+  pipe.inFlight = Math.max(0, pipe.inFlight - 1);
+  pipe.lastOutput = performance.now();
+  if (c) {
+    const ms = performance.now() - c.start;
+    pipe.encodeMs = pipe.encodeMs == null ? ms : pipe.encodeMs * 0.9 + ms * 0.1;
+    adaptDirectSize(pipe);
+  }
+  DIRECT.send({ stream: 0, key: chunk.type === 'key', ts: chunk.timestamp, capture: c?.at ?? clockNow() }, data);
+}
+
+// Encoding slower than the frame interval adds delay: a smaller picture until it keeps up again.
+function adaptDirectSize(pipe) {
+  const now = performance.now();
+  const interval = 1000 / (pipe.config?.framerate || 60);
+  if (pipe.encodeMs > interval * 0.9) {
+    pipe.fastSince = 0;
+    pipe.slowSince ||= now;
+    if (now - pipe.slowSince > 2000 && pipe.scale < 3) {
+      pipe.scale *= 1.5;
+      pipe.slowSince = 0;
+    }
+  } else if (pipe.encodeMs < interval * 0.35 && pipe.scale > 1) {
+    pipe.slowSince = 0;
+    pipe.fastSince ||= now;
+    if (now - pipe.fastSince > 10000) {
+      pipe.scale = Math.max(1, pipe.scale / 1.5);
+      pipe.fastSince = 0;
+    }
+  } else {
+    pipe.slowSince = 0;
+    pipe.fastSince = 0;
+  }
+}
+
+/* ---- sharer: audio (Opus, 5 ms packets; 5.1/7.1 as channel pairs) ---- */
+
+function startDirectAudio(track) {
+  stopDirectAudio();
+  if (!track || track.readyState !== 'live') return;
+  let reader;
+  try {
+    reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+  } catch (err) {
+    console.warn('direct audio', err);
+    return;
+  }
+  const pipe = { track, reader, encoders: [], channels: 0, rate: 0, stopped: false };
+  direct.audio = pipe;
+  (async () => {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        try {
+          if (!pipe.stopped) encodeDirectAudio(pipe, value);
+        } finally {
+          value.close();
+        }
+        if (pipe.stopped) break;
+      }
+    } catch (err) {
+      if (!pipe.stopped) console.warn('direct audio', err);
+    }
+  })();
+}
+
+function stopDirectAudio() {
+  const pipe = direct.audio;
+  if (!pipe) return;
+  direct.audio = null;
+  pipe.stopped = true;
+  pipe.reader.cancel().catch(() => {});
+  for (const e of pipe.encoders) {
+    try { e.close(); } catch { /* already closed */ }
+  }
+}
+
+function encodeDirectAudio(pipe, data) {
+  const channels = Math.min(8, data.numberOfChannels);
+  const pairs = Math.ceil(channels / 2);
+  if (channels !== pipe.channels || data.sampleRate !== pipe.rate) {
+    for (const e of pipe.encoders) {
+      try { e.close(); } catch { /* already closed */ }
+    }
+    pipe.encoders = Array.from({ length: pairs }, (_, pair) => {
+      const ch = Math.min(2, channels - pair * 2);
+      const enc = new AudioEncoder({
+        output: (chunk) => sendDirectAudio(pipe, pair, channels, chunk),
+        error: (err) => console.warn('direct audio encoder', err),
+      });
+      enc.configure({ codec: 'opus', sampleRate: data.sampleRate, numberOfChannels: ch, bitrate: ch * 128000, opus: { frameDuration: 5000, application: 'lowdelay' } });
+      return enc;
+    });
+    pipe.channels = channels;
+    pipe.rate = data.sampleRate;
+  }
+  const frames = data.numberOfFrames;
+  for (let pair = 0; pair < pairs; pair++) {
+    const ch = Math.min(2, channels - pair * 2);
+    const buf = new Float32Array(frames * ch);
+    for (let c = 0; c < ch; c++) data.copyTo(buf.subarray(c * frames, (c + 1) * frames), { planeIndex: pair * 2 + c, format: 'f32-planar' });
+    const part = new AudioData({ format: 'f32-planar', sampleRate: data.sampleRate, numberOfFrames: frames, numberOfChannels: ch, timestamp: data.timestamp, data: buf });
+    if (pipe.encoders[pair].state === 'configured') pipe.encoders[pair].encode(part);
+    part.close();
+  }
+}
+
+function sendDirectAudio(pipe, pair, channels, chunk) {
+  if (pipe.stopped) return;
+  const data = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(data);
+  DIRECT.send({ stream: 1, sub: pair | (channels << 4), ts: chunk.timestamp, capture: clockNow() }, data);
+}
+
+function directStats(v) {
+  const d = v.direct;
+  if (d.state !== 'connected') return null;
+  const r = d.report;
+  const cfg = direct.video?.config;
+  return {
+    w: cfg?.width,
+    h: cfg?.height,
+    fps: r?.fps ?? null,
+    kbps: r?.kbps ?? null,
+    codec: 'H264',
+    hw: direct.hw,
+    impl: 'WebCodecs',
+    encodeMs: direct.video?.encodeMs ?? null,
+    limit: null,
+    rtt: r?.rtt ?? d.rtt,
+    relay: d.path === 'relay',
+    path: d.path,
+  };
+}
+
+/* ---- viewer ---- */
+
+function onViewerDirectSession(msg) {
+  if (!DIRECT) return;
+  closeDirectView();
+  viewer.direct = {
+    udp: msg.session,
+    state: 'starting',
+    ready: DIRECT.add('viewer', 'host', { session: msg.session, secret: msg.secret, port: msg.port }),
+    codec: DIRECT_CODEC,
+    decoder: null,
+    needKey: true,
+    ctx: null,
+    pending: new Map(),
+    lat: [],
+    frames: 0,
+    fpsAt: performance.now(),
+    drawn: false,
+    offset: null,
+    rtt: null,
+    path: null,
+    report: null,
+    audio: null,
+    audioOpening: false,
+  };
+}
+
+async function onDirectOffer(data) {
+  // the server's session message normally comes first; wait a moment if not
+  for (let i = 0; i < 40 && viewer.direct?.udp !== data.udp; i++) await sleep(50);
+  viewer.session = data.session;
+  const d = viewer.direct;
+  // a chosen buffer ("Simább" / "Stabil") is WebRTC's job; direct mode has none
+  if (!d || d.udp !== data.udp || viewer.bufferMs > 0) {
+    closeDirectView();
+    sendToHost({ type: 'direct-fail' });
+    return;
+  }
+  closeViewerConnection();
+  const res = await d.ready;
+  if (viewer.direct !== d) return;
+  if (!res || res.error) {
+    closeDirectView();
+    sendToHost({ type: 'direct-fail' });
+    return;
+  }
+  if (typeof data.codec === 'string') d.codec = data.codec;
+  d.state = 'connecting';
+  DIRECT.connect('host', { pub: data.pub, cands: data.cands });
+  sendToHost({ type: 'direct-answer', pub: res.pub, cands: res.cands });
+  if (!hasPicture()) setOverlay('Közvetlen kapcsolat (alkalmazás → alkalmazás)…');
+}
+
+function closeDirectView() {
+  const d = viewer.direct;
+  if (!d) return;
+  viewer.direct = null;
+  try { d.decoder?.close(); } catch { /* already closed */ }
+  d.latest?.close();
+  d.latest = null;
+  closeDirectAudio(d);
+  DIRECT?.remove('host');
+  $('#directCanvas').hidden = true;
+  video().hidden = false;
+}
+
+function onViewerDirectEvent(name, id, info) {
+  const d = viewer.direct;
+  if (!d || id !== 'host' || !info) return;
+  if (name === 'state') {
+    Object.assign(d, { state: info.state, path: info.path, rtt: info.rtt ?? d.rtt });
+    if (info.state === 'failed') {
+      closeDirectView();
+      sendToHost({ type: 'direct-fail' });
+      setOverlay('A közvetlen kapcsolat nem jött létre – átváltás WebRTC-re…');
+    } else if (info.state === 'lost' || info.state === 'closed') {
+      closeDirectView();
+      if (!viewer.closed) {
+        setOverlay('A közvetlen kapcsolat megszakadt. Újracsatlakozás…');
+        sendToHost({ type: 'recall' });
+      }
+    }
+  } else if (name === 'clock') {
+    d.offset = info.offset;
+    d.rtt = info.rtt;
+  } else if (name === 'stats') {
+    d.report = info;
+  }
+}
+
+function decodeDirectVideo(d, meta, data) {
+  if (!d.decoder || d.decoder.state === 'closed') {
+    d.decoder = new VideoDecoder({
+      output: (frame) => queueDirectFrame(d, frame),
+      error: (err) => {
+        console.warn('direct decoder', err);
+        d.decoder = null;
+        DIRECT.keyframe();
+      },
+    });
+    d.decoder.configure({ codec: d.codec, optimizeForLatency: true, hardwareAcceleration: 'no-preference' });
+    d.needKey = true;
+  }
+  if (d.needKey && !meta.key) {
+    DIRECT.keyframe();
+    return;
+  }
+  d.needKey = false;
+  d.pending.set(meta.ts, meta.capture);
+  if (d.pending.size > 60) d.pending.delete(d.pending.keys().next().value);
+  d.decoder.decode(new EncodedVideoChunk({ type: meta.key ? 'key' : 'delta', timestamp: meta.ts, data }));
+}
+
+// Only the newest decoded frame is drawn: when drawing falls behind (a busy computer), older
+// frames are dropped instead of waiting in line.
+function queueDirectFrame(d, frame) {
+  if (d.latest) {
+    d.pending.delete(d.latest.timestamp);
+    d.latest.close();
+  }
+  d.latest = frame;
+  if (d.drawQueued) return;
+  d.drawQueued = true;
+  if (!d.drawPort) {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      d.drawQueued = false;
+      const next = d.latest;
+      d.latest = null;
+      if (next) drawDirectFrame(d, next);
+    };
+    d.drawPort = channel.port2;
+  }
+  d.drawPort.postMessage(0);
+}
+
+// Drawn at once, outside the page's frame cycle: a low-latency ("desynchronized") canvas
+// goes to the screen without waiting for the browser's compositor.
+function drawDirectFrame(d, frame) {
+  if (viewer.direct !== d) {
+    frame.close();
+    return;
+  }
+  const canvas = $('#directCanvas');
+  const w = frame.displayWidth;
+  const h = frame.displayHeight;
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  d.ctx ||= canvas.getContext('2d', { desynchronized: true, alpha: false });
+  d.ctx.drawImage(frame, 0, 0, w, h);
+  const capture = d.pending.get(frame.timestamp);
+  d.pending.delete(frame.timestamp);
+  frame.close();
+  d.frames++;
+  if (capture && d.offset != null) {
+    d.lat.push(clockNow() + d.offset - capture);
+    if (d.lat.length > 60) d.lat.shift();
+  }
+  if (!d.drawn) {
+    d.drawn = true;
+    canvas.hidden = false;
+    video().hidden = true;
+    if (viewer.live) {
+      hideOverlay();
+      setLive(true);
+    }
+    requestWakeLock();
+  }
+}
+
+async function openDirectAudio(d, channels) {
+  closeDirectAudio(d);
+  const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+  try {
+    await ctx.audioWorklet.addModule('/direct-audio.js');
+  } catch (err) {
+    console.warn('direct audio', err);
+    ctx.close().catch(() => {});
+    return null;
+  }
+  if (viewer.direct !== d) {
+    ctx.close().catch(() => {});
+    return null;
+  }
+  const max = ctx.destination.maxChannelCount;
+  const out = channels >= 8 && max >= 8 ? 8 : channels >= 6 && max >= 6 ? 6 : 2;
+  ctx.destination.channelCount = out;
+  ctx.destination.channelInterpretation = 'discrete';
+  const node = new AudioWorkletNode(ctx, 'direct-audio', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [out], processorOptions: { channels } });
+  const gain = ctx.createGain();
+  node.connect(gain).connect(ctx.destination);
+  d.audio = { ctx, node, gain, channels, out, decoders: [] };
+  syncDirectVolume();
+  ctx.resume().catch(() => {});
+  return d.audio;
+}
+
+function closeDirectAudio(d) {
+  const a = d.audio;
+  if (!a) return;
+  d.audio = null;
+  for (const dec of a.decoders) {
+    try { dec?.close(); } catch { /* already closed */ }
+  }
+  a.ctx.close().catch(() => {});
+}
+
+function syncDirectVolume() {
+  const a = viewer.direct?.audio;
+  if (!a) return;
+  const el = video();
+  a.gain.gain.value = el.muted ? 0 : el.volume;
+}
+
+async function playDirectAudio(d, meta, data) {
+  const channels = Math.max(1, Math.min(8, meta.sub >> 4));
+  const pair = meta.sub & 15;
+  if (pair * 2 >= channels) return;
+  let a = d.audio;
+  if (!a || a.channels !== channels) {
+    if (d.audioOpening) return; // the first packets while the player starts
+    d.audioOpening = true;
+    try {
+      a = await openDirectAudio(d, channels);
+    } finally {
+      d.audioOpening = false;
+    }
+    if (!a) return;
+  }
+  let dec = a.decoders[pair];
+  if (!dec || dec.state === 'closed') {
+    dec = new AudioDecoder({
+      output: (ad) => {
+        const frames = ad.numberOfFrames;
+        const planes = [];
+        for (let c = 0; c < ad.numberOfChannels; c++) {
+          const plane = new Float32Array(frames);
+          ad.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+          planes.push(plane);
+        }
+        a.node.port.postMessage({ pair, ts: ad.timestamp, frames, planes }, planes.map((p) => p.buffer));
+        ad.close();
+      },
+      error: (err) => console.warn('direct audio decoder', err),
+    });
+    dec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: Math.min(2, channels - pair * 2) });
+    a.decoders[pair] = dec;
+  }
+  if (dec.state === 'configured') dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: meta.ts, data }));
+}
+
+function onDirectMedia(meta, data) {
+  const d = viewer.direct;
+  if (!d || host.code || !meta) return;
+  if (meta.stream === 0) decodeDirectVideo(d, meta, data);
+  else playDirectAudio(d, meta, data);
+}
+
+function onDirectEvent(name, id, info) {
+  if (host.code) onHostDirectEvent(name, id, info);
+  else onViewerDirectEvent(name, id, info);
+}
+
+function renderStatsRows(rows) {
+  const dl = document.createElement('dl');
+  for (const [k, val, warn] of rows) {
+    const dt = document.createElement('dt');
+    dt.textContent = k;
+    const dd = document.createElement('dd');
+    dd.textContent = val;
+    if (warn) dd.className = 'warn';
+    dl.append(dt, dd);
+  }
+  $('#stats').replaceChildren(dl);
+}
+
+function directStatsTick() {
+  const d = viewer.direct;
+  const now = performance.now();
+  const fps = (d.frames * 1000) / Math.max(1, now - d.fpsAt);
+  d.frames = 0;
+  d.fpsAt = now;
+  const lat = median(d.lat);
+  const r = d.report;
+  const canvas = $('#directCanvas');
+  const res = d.drawn ? `${canvas.width}×${canvas.height}` : '–';
+  if (viewer.tick++ % 2 === 0 && lat != null) sendToHost({ type: 'stats', lat: Math.round(lat), fps: Math.round(fps), loss: r?.loss ?? 0, measured: true });
+  $('#viewerInfo').textContent = d.drawn ? `${res} · ${Math.round(fps)} FPS${lat != null ? ` · ${Math.round(lat)} ms` : ''} · közvetlen` : '';
+  if ($('#stats').hidden) return;
+  const a = d.audio;
+  renderStatsRows([
+    ['Mód', 'Közvetlen (alkalmazás → alkalmazás, WebRTC nélkül)'],
+    ['Felbontás', res],
+    ['FPS', d.drawn ? String(Math.round(fps)) : '–'],
+    ['Bitráta', fmtKbps(r?.kbps ?? null)],
+    ['Kodek', 'H.264'],
+    ['Küldő kódolója', senderEncoderText(viewer.hostStats), viewer.hostStats?.hw === false],
+    ['Késés (mért)', lat != null ? `${Math.round(lat)} ms` : '–', lat > 100],
+    ['RTT', fmtMs(d.rtt)],
+    ['Csomagvesztés', `${nf1.format(r?.loss ?? 0)} %`, (r?.loss ?? 0) > 2],
+    ['Kihagyott képek', String(r?.skips ?? 0), (r?.skips ?? 0) > 0],
+    ['Kapcsolat', PATH_LABEL[d.path] || '–'],
+    ['Hang', a ? `Opus · ${a.channels > 2 ? `${surroundName(a.channels)} → ${a.out} hangszóró` : 'sztereó'}` : 'nincs'],
+  ]);
+}
+
 function init() {
   if (IS_IOS) document.documentElement.classList.add('is-ios'); // no volume control: iOS keeps media at full volume
+  DIRECT?.onEvent(onDirectEvent);
+  DIRECT?.onMedia(onDirectMedia);
   initHostUi();
   initViewerUi();
 

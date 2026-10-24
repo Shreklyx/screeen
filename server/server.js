@@ -2,7 +2,9 @@
 //
 // The browser pages talk to this server only to set up connections; the
 // screen video and audio go directly between the browsers (WebRTC), or via
-// the TURN relay when a direct path is not possible.
+// the TURN relay when a direct path is not possible. Between two desktop apps
+// the picture can go without WebRTC ("direct mode", see direct-relay.js): the
+// server's UDP port tells the apps their public address and relays if needed.
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -10,6 +12,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { createRelay } from './direct-relay.js';
 
 const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 const STATIC_FILES = {
@@ -17,6 +20,7 @@ const STATIC_FILES = {
   '/index.html': ['index.html', 'text/html; charset=utf-8'],
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
+  '/direct-audio.js': ['direct-audio.js', 'text/javascript; charset=utf-8'], // direct mode: audio playback worklet
   // home-screen app (iPhone / iPad / Android)
   '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json; charset=utf-8'],
   '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'],
@@ -29,8 +33,8 @@ const STATIC_FILES = {
 const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 const CODE_RE = /^[a-z0-9]{4,12}$/;
 const CODECS = ['AV1', 'VP9', 'H264', 'VP8'];
-const HOST_SIGNALS = new Set(['offer', 'candidate', 'stats']);
-const VIEWER_SIGNALS = new Set(['answer', 'candidate', 'recall', 'stats']);
+const HOST_SIGNALS = new Set(['offer', 'candidate', 'stats', 'direct-offer']);
+const VIEWER_SIGNALS = new Set(['answer', 'candidate', 'recall', 'stats', 'direct-answer', 'direct-fail']);
 
 const LIMITS = {
   rooms: 100,
@@ -59,6 +63,8 @@ export function loadConfig(env = process.env) {
     turnHost: env.TURN_HOST || env.DOMAIN || '',
     turnPort: Number(env.TURN_PORT) || 3478,
     trustProxy: /^(1|true|yes)$/i.test(env.TRUST_PROXY || ''),
+    // direct mode (app ↔ app): UDP port for address discovery and relaying; 0 = off
+    directPort: Number(env.DIRECT_PORT) || 0,
   };
 }
 
@@ -140,6 +146,7 @@ function sanitizeCaps(caps) {
     if (v && typeof v === 'object') out[c] = { supported: v.supported !== false, hw: v.hw === true };
   }
   if (caps.surround === true) out.surround = true; // 5.1/7.1 speakers that can play multi-channel Opus
+  if (caps.direct === true) out.direct = true; // the desktop app: can receive without WebRTC
   return out;
 }
 
@@ -230,6 +237,12 @@ function handleStatic(req, res) {
 
 export function createApp(config = loadConfig()) {
   const rooms = new Map();
+  let closing = false;
+  const relay = config.directPort ? createRelay({ port: config.directPort, host: config.host }) : null;
+  const relayReady = relay ? relay.listen().catch((err) => {
+    console.error(`[screenshare] direct mode UDP port ${config.directPort} unavailable: ${err.message}`);
+    return null;
+  }) : Promise.resolve(null);
   const authLimiter = new RateLimiter(LIMITS.authFailures, LIMITS.authWindowMs);
   const joinLimiter = new RateLimiter(LIMITS.joins, LIMITS.joinWindowMs);
   let nextId = 1;
@@ -266,6 +279,7 @@ export function createApp(config = loadConfig()) {
   function closeRoom(room, reason = 'closed') {
     clearTimeout(room.awayTimer);
     rooms.delete(room.code);
+    relay?.removeWhere((s) => s.room === room.code);
     for (const v of room.viewers.values()) {
       v.room = null;
       v.role = null;
@@ -283,12 +297,13 @@ export function createApp(config = loadConfig()) {
     if (!room) return;
     if (conn.role === 'viewer') {
       room.viewers.delete(conn.id);
+      relay?.removeWhere((s) => s.room === room.code && s.viewer === conn.id);
       if (room.host) send(room.host, { t: 'viewer-left', id: conn.id });
       broadcastCount(room);
     } else if (conn.role === 'host' && room.host === conn) {
       room.host = null;
       for (const v of room.viewers.values()) send(v, { t: 'host-away' });
-      room.awayTimer = setTimeout(() => closeRoom(room, 'timeout'), LIMITS.hostGraceMs);
+      if (!closing) room.awayTimer = setTimeout(() => closeRoom(room, 'timeout'), LIMITS.hostGraceMs);
     }
     conn.room = null;
     conn.role = null;
@@ -312,6 +327,7 @@ export function createApp(config = loadConfig()) {
       iceServers: iceServers(config),
       live: room.live,
       viewers: [...room.viewers.values()].map((v) => ({ id: v.id, caps: v.caps })),
+      direct: true, // this server sets up direct mode (app ↔ app)
     });
     for (const v of room.viewers.values()) send(v, { t: 'host-back', live: room.live });
     broadcastCount(room);
@@ -396,6 +412,26 @@ export function createApp(config = loadConfig()) {
     leave(conn) {
       if (conn.role === 'viewer') leave(conn);
     },
+
+    // direct mode for one viewer: a session (id + secret) for the UDP registration / relay
+    direct(conn, msg) {
+      const room = conn.room;
+      if (!room || conn.role !== 'host' || room.host !== conn) return;
+      const target = room.viewers.get(msg.to);
+      if (!target || !target.caps?.direct) return;
+      let session;
+      let secret;
+      if (relay) {
+        relay.removeWhere((s) => s.room === room.code && s.viewer === target.id);
+        ({ session, secret } = relay.create({ room: room.code, viewer: target.id }));
+      } else {
+        session = crypto.randomBytes(4).readUInt32BE(0) || 1;
+        secret = crypto.randomBytes(16).toString('base64');
+      }
+      const info = { t: 'direct', session, secret, port: relay ? config.directPort : 0 };
+      send(conn, { ...info, viewer: target.id });
+      send(target, info);
+    },
   };
 
   wss.on('connection', (ws, req) => {
@@ -460,8 +496,12 @@ export function createApp(config = loadConfig()) {
     server,
     wss,
     rooms,
+    relay,
+    relayReady,
     close() {
+      closing = true; // connections closing now must not start a room's grace timer
       clearInterval(heartbeat);
+      relay?.close();
       for (const room of rooms.values()) clearTimeout(room.awayTimer);
       for (const ws of wss.clients) ws.terminate();
       wss.close();

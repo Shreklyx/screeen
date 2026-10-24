@@ -11,7 +11,8 @@
 #   3. ha egy másik Docker alkalmazás (pl. a Sori) foglalja a 80/443-as portot, leállítja –
 #      az adatai és fájljai megmaradnak, semmit nem töröl,
 #   4. megnyitja a szükséges portokat a tűzfalon (ha ufw fut),
-#   5. elindítja az oldalt, a Caddy-t (automatikus HTTPS) és a TURN relét.
+#   5. elindítja az oldalt, a Caddy-t (automatikus HTTPS) és a TURN relét
+#      (+ a 3479-es UDP port: az alkalmazások közvetlen, WebRTC nélküli módja).
 # Újrafuttatva frissít: letölti az új kódot és újraindít.
 #
 # Kérdések nélkül (a jelszót ilyenkor generálja, és a végén kiírja):
@@ -297,6 +298,9 @@ fi
 if ss -Hlun "( sport = :3478 )" 2>/dev/null | grep -q . && [ -z "$(docker compose ps -q turn 2>/dev/null)" ]; then
   warn "A 3478-as UDP portot már használja egy másik program – a TURN relé nem fog elindulni."
 fi
+if ss -Hlun "( sport = :3479 )" 2>/dev/null | grep -q . && [ -z "$(docker compose ps -q app 2>/dev/null)" ]; then
+  warn "A 3479-es UDP portot már használja egy másik program – az alkalmazások közvetlen módja csak relé nélkül megy."
+fi
 ok "A portok szabadok"
 
 # ---------------------------------------------------------------- tűzfal
@@ -307,10 +311,11 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active
   ufw allow 443/udp >/dev/null
   ufw allow 3478/tcp >/dev/null
   ufw allow 3478/udp >/dev/null
+  ufw allow 3479/udp >/dev/null
   ufw allow "$TURN_MIN_PORT:$TURN_MAX_PORT/udp" >/dev/null
-  ok "ufw: 80, 443, 3478 és $TURN_MIN_PORT-$TURN_MAX_PORT/udp megnyitva"
+  ok "ufw: 80, 443, 3478, 3479/udp és $TURN_MIN_PORT-$TURN_MAX_PORT/udp megnyitva"
 fi
-warn "Ha a szolgáltatód webes felületén is van tűzfal, ott is engedd: 80 és 443 TCP, 443 UDP, 3478 TCP+UDP, $TURN_MIN_PORT-$TURN_MAX_PORT UDP."
+warn "Ha a szolgáltatód webes felületén is van tűzfal, ott is engedd: 80 és 443 TCP, 443 UDP, 3478 TCP+UDP, 3479 UDP, $TURN_MIN_PORT-$TURN_MAX_PORT UDP."
 
 # ---------------------------------------------------------------- indítás
 
