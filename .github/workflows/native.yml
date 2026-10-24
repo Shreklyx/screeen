@@ -1,6 +1,6 @@
 # The native apps (no Electron): the shared core (native/core) – built, tested, and a native sharer
 # and a native viewer exchange a recorded stream through the real server (direct mode over UDP and
-# over the server's WebSocket) – and the Windows app (native/windows).
+# over the server's WebSocket) – the Windows app (native/windows) and the Mac app (native/mac).
 name: Native apps
 
 on:
@@ -113,18 +113,104 @@ jobs:
           "$makensis" -V2 -DVERSION=2.0.${{ github.run_number }} -DEXE=../../build/windows/ScreenShare.exe -DOUT=../../ScreenShare-Native-Setup.exe installer.nsi
           cd ../..
           ls -la ScreenShare-Native-Setup.exe
-          printf '{"version":"2.0.%s","windows":"ScreenShare-Native-Setup.exe"}\n' "${{ github.run_number }}" > native-latest.json
       - uses: actions/upload-artifact@v4
         with:
           name: screenshare-native-windows
           path: |
             ScreenShare-Native-Setup.exe
-            native-latest.json
             from-app.h264
           if-no-files-found: error
 
-  publish-windows:
-    needs: [core, windows]
+  # The native Mac app: built for Apple silicon and Intel (joined with lipo, signed ad hoc), then on
+  # this machine it watches (decodes with VideoToolbox) a native sharer, and shares its screen to a
+  # native viewer when the runner lets it record the screen. Published as ScreenShare-Native-Mac.zip.
+  mac:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Icon
+        run: |
+          mkdir -p icon.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s desktop/build/icon.png --out icon.iconset/icon_${s}x${s}.png >/dev/null
+            sips -z $((s * 2)) $((s * 2)) desktop/build/icon.png --out icon.iconset/icon_${s}x${s}@2x.png >/dev/null
+          done
+          iconutil -c icns icon.iconset -o native/mac/app.icns
+      - name: Build (arm64 and x86_64, one app)
+        run: |
+          set -e
+          for arch in arm64 x86_64; do
+            cmake -S native -B build-$arch -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=$arch \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 -DSS_VERSION=2.0.${{ github.run_number }}
+            cmake --build build-$arch -j4
+          done
+          mkdir -p dist
+          cp -R "build-arm64/mac/Screen Share.app" dist/
+          exe="Contents/MacOS/Screen Share"
+          lipo -create "build-arm64/mac/Screen Share.app/$exe" "build-x86_64/mac/Screen Share.app/$exe" -output "dist/Screen Share.app/$exe"
+          lipo -info "dist/Screen Share.app/$exe"
+          codesign --force --deep --sign - "dist/Screen Share.app"
+          codesign --verify --verbose "dist/Screen Share.app"
+      - name: Core tests
+        run: build-arm64/sscore_test
+      - name: "Smoke: the app watches a native sharer; shares the screen to a native viewer"
+        run: |
+          PORT=8090 HOST_PASSWORD=ci DIRECT_PORT=3479 node server/server.js &
+          sleep 3
+          app="dist/Screen Share.app/Contents/MacOS/Screen Share"
+          cli=build-arm64/ss-cli
+          "$cli" host --server http://127.0.0.1:8090 --password ci --h264 native/tests/data/test.h264 --seconds 25 > cli-host.log &
+          cliPid=$!
+          for i in $(seq 1 80); do grep -q '^CODE' cli-host.log 2>/dev/null && break; sleep 0.25; done
+          code=$(grep '^CODE' cli-host.log | awk '{print $2}')
+          "$app" --smoke-view http://127.0.0.1:8090 "$code" 12 view-app.log
+          grep -E 'RESULT|EVENT' view-app.log | tail -5
+          wait $cliPid || true
+          "$app" --smoke-host http://127.0.0.1:8090 ci 20 host.log &
+          appPid=$!
+          for i in $(seq 1 80); do grep -q '^CODE' host.log 2>/dev/null && break; sleep 0.25; done
+          code=$(grep '^CODE' host.log | awk '{print $2}')
+          echo "room $code"
+          "$cli" view --server http://127.0.0.1:8090 --code "$code" --seconds 8 --out from-app.h264 | tee view.log | grep -E 'RESULT' || true
+          wait $appPid || true
+          grep -E 'RESULT|error' host.log || true
+          node -e "
+            const fs = require('fs');
+            const res = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8').split(/\r?\n/).find((l) => l.startsWith('RESULT ')).slice(7)); } catch { return {}; } };
+            const view = res('view-app.log'), host = res('host.log'), got = res('view.log');
+            console.log('app as viewer:', JSON.stringify(view));
+            console.log('app as sharer:', JSON.stringify(host));
+            console.log('native viewer got:', JSON.stringify(got));
+            const problems = [];
+            if (!(view.received > 100)) problems.push('the app received too few frames');
+            if (!(view.shownFps > 10)) problems.push('the app did not decode / show the picture');
+            if (host.error === 'permission' || host.error === 'no-screen-access') console.log('::warning::this runner may not record the screen (' + host.error + ') – sharing not checked');
+            else {
+              if (!host.width) problems.push('the app captured nothing: ' + host.error);
+              if (!(got.frames > 10 && got.firstKey)) problems.push('the native viewer got too few frames from the app');
+            }
+            if (problems.length) { console.error(problems.join('\n')); process.exit(1); }
+          "
+      - name: Package
+        run: |
+          cd dist
+          ditto -c -k --keepParent "Screen Share.app" ../ScreenShare-Native-Mac.zip
+          cd ..
+          ls -la ScreenShare-Native-Mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshare-native-mac
+          path: ScreenShare-Native-Mac.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [core, windows, mac]
     if: github.ref == 'refs/heads/claude/elegant-gauss-mi4rl5' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -134,7 +220,13 @@ jobs:
         with:
           name: screenshare-native-windows
           path: out
+      - uses: actions/download-artifact@v4
+        with:
+          name: screenshare-native-mac
+          path: out
       - name: Upload to the "desktop-latest" release (next to the Electron app)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload desktop-latest out/ScreenShare-Native-Setup.exe out/native-latest.json --clobber --repo ${{ github.repository }}
+        run: |
+          printf '{"version":"2.0.%s","windows":"ScreenShare-Native-Setup.exe","mac":"ScreenShare-Native-Mac.zip"}\n' "${{ github.run_number }}" > out/native-latest.json
+          gh release upload desktop-latest out/ScreenShare-Native-Setup.exe out/ScreenShare-Native-Mac.zip out/native-latest.json --clobber --repo ${{ github.repository }}

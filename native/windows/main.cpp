@@ -79,7 +79,7 @@ struct App {
   HINSTANCE inst = nullptr;
   HWND wnd = nullptr;
   UINT dpi = 96;
-  HFONT font = nullptr, bold = nullptr, big = nullptr, title = nullptr, small = nullptr;
+  HFONT font = nullptr, bold = nullptr, big = nullptr, title = nullptr, smallFont = nullptr;
   HBRUSH bgBrush = nullptr, cardBrush = nullptr, editBrush = nullptr;
   Screen screen = Screen::Home;
 
@@ -206,7 +206,7 @@ HWND combo(int id, std::vector<HWND>& group) {
 }
 
 void makeFonts() {
-  for (HFONT* f : {&g.font, &g.bold, &g.big, &g.title, &g.small}) if (*f) DeleteObject(*f);
+  for (HFONT* f : {&g.font, &g.bold, &g.big, &g.title, &g.smallFont}) if (*f) DeleteObject(*f);
   auto mk = [](int pt, int weight) {
     return CreateFontW(-MulDiv(pt, int(g.dpi), 72), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                        DEFAULT_PITCH, L"Segoe UI");
@@ -215,7 +215,7 @@ void makeFonts() {
   g.bold = mk(11, FW_SEMIBOLD);
   g.big = mk(30, FW_BOLD);
   g.title = mk(20, FW_BOLD);
-  g.small = mk(9, FW_NORMAL);
+  g.smallFont = mk(9, FW_NORMAL);
 }
 
 void applyFonts() {
@@ -224,7 +224,7 @@ void applyFonts() {
   for (HWND h : {g.shareHead, g.joinHead, g.viewersHead}) SendMessageW(h, WM_SETFONT, WPARAM(g.bold), TRUE);
   SendMessageW(g.title1, WM_SETFONT, WPARAM(g.title), TRUE);
   SendMessageW(g.roomCode, WM_SETFONT, WPARAM(g.big), TRUE);
-  for (HWND h : {g.sub1, g.footer, g.info, g.serverLabel, g.viewInfo}) SendMessageW(h, WM_SETFONT, WPARAM(g.small), TRUE);
+  for (HWND h : {g.sub1, g.footer, g.info, g.serverLabel, g.viewInfo}) SendMessageW(h, WM_SETFONT, WPARAM(g.smallFont), TRUE);
 }
 
 void createControls() {

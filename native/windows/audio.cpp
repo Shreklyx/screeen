@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "audio_ring.h"
 #include "clock.h"
 
 namespace ss {
@@ -182,112 +183,14 @@ void AudioCapture::stop() {
 
 std::string AudioCapture::layout() const { return impl_->layoutName; }
 
-/* ------------------------------------------------ the viewer: Opus → ring → speakers */
-
-namespace {
-const int kRing = kRate; // one second
-const int kMinTarget = 240, kMaxTarget = 4800; // 5 … 100 ms
-const float K = 0.70710678f;
-float soft(float x) { return x > 0.9f ? 0.9f + 0.1f * std::tanh((x - 0.9f) / 0.1f) : x < -0.9f ? -0.9f + 0.1f * std::tanh((x + 0.9f) / 0.1f) : x; }
-}  // namespace
+/* ------------------------------------------------ the viewer: Opus → ring (audio_ring.cpp) → speakers */
 
 struct AudioPlayer::Impl {
-  std::mutex mu;
-  int channels = 0;             // of the stream
-  std::vector<std::vector<float>> ring;
-  std::vector<OpusDecoder*> decoders;
-  long long read = LLONG_MIN;   // absolute sample index of the next output sample
-  long long end = LLONG_MIN;    // one past the newest written sample
-  int target = 480;             // 10 ms to start with
-  long long calm = 0;
-  std::atomic<float> volume{1.0f};
+  AudioRing ring;
   std::thread thread;
   std::atomic<bool> quit{false};
 
-  ~Impl() { for (OpusDecoder* d : decoders) if (d) opus_decoder_destroy(d); }
-
-  void configure(int ch) {
-    for (OpusDecoder* d : decoders) if (d) opus_decoder_destroy(d);
-    decoders.assign(size_t((ch + 1) / 2), nullptr);
-    channels = ch;
-    ring.assign(size_t(ch), std::vector<float>(kRing, 0.0f));
-    read = end = LLONG_MIN;
-    target = 480;
-  }
-
-  void push(int sub, const uint8_t* data, size_t n, double tsUs) {
-    int ch = std::max(1, std::min(8, sub >> 4));
-    int pair = sub & 15;
-    if (pair * 2 >= ch) return;
-    std::lock_guard<std::mutex> l(mu);
-    if (ch != channels) configure(ch);
-    int pc = std::min(2, ch - pair * 2);
-    OpusDecoder*& dec = decoders[size_t(pair)];
-    if (!dec) {
-      int err = 0;
-      dec = opus_decoder_create(kRate, pc, &err);
-      if (!dec) return;
-    }
-    float pcm[5760 * 2];
-    int frames = opus_decode_float(dec, data, opus_int32(n), pcm, 5760, 0);
-    if (frames <= 0) return;
-    long long at = llround(tsUs * kRate / 1e6);
-    if (read == LLONG_MIN) read = at - target;
-    if (at + frames <= read) return; // too late, already played
-    if (at - read > kRing - 2048) read = at - target; // far ahead (clock jump): start over
-    for (int c = 0; c < pc; c++) {
-      std::vector<float>& r = ring[size_t(pair * 2 + c)];
-      for (int i = 0; i < frames; i++) {
-        long long a = at + i;
-        if (a >= read) r[size_t(((a % kRing) + kRing) % kRing)] = pcm[i * pc + c];
-      }
-    }
-    if (at + frames > end) end = at + frames;
-  }
-
-  /** Fills `out` (outs channels, n frames, interleaved float) – the device thread. */
-  void pull(float* out, int outs, int n) {
-    std::fill(out, out + size_t(n) * outs, 0.0f);
-    std::lock_guard<std::mutex> l(mu);
-    if (read == LLONG_MIN || !channels) return;
-    long long buffered = end - read;
-    if (buffered < n) {
-      // ran dry: wait a little longer next time
-      target = std::min(kMaxTarget, target + 240);
-      calm = 0;
-      if (buffered <= 0) read = end - target;
-      return;
-    }
-    if (buffered > target + 2400) read = end - target; // the buffer grew (clock drift): catch up
-    calm += n;
-    if (calm > kRate * 5 && target > kMinTarget) {
-      target -= 48;
-      calm = 0;
-    }
-    float v = volume;
-    int ch = channels;
-    for (int i = 0; i < n; i++) {
-      size_t idx = size_t((((read + i) % kRing) + kRing) % kRing);
-      auto s = [&](int c) { return c < ch ? ring[size_t(c)][idx] : 0.0f; };
-      float* o = out + size_t(i) * outs;
-      if (ch == 1) {
-        for (int k = 0; k < std::min(outs, 2); k++) o[k] = s(0);
-      } else if (ch <= 2 || outs >= ch) {
-        for (int k = 0; k < std::min(outs, ch); k++) o[k] = s(k);
-      } else if (outs >= 6) {
-        // 7.1 → 5.1: sides folded into the surrounds
-        o[0] = s(0); o[1] = s(1); o[2] = s(2); o[3] = s(3);
-        o[4] = soft(K * (s(4) + s(6)));
-        o[5] = soft(K * (s(5) + s(7)));
-      } else {
-        o[0] = soft(s(0) + K * s(2) + K * s(4) + K * s(6));
-        if (outs > 1) o[1] = soft(s(1) + K * s(2) + K * s(5) + K * s(7));
-      }
-      for (int k = 0; k < outs; k++) o[k] *= v;
-      for (int c = 0; c < ch; c++) ring[size_t(c)][idx] = 0; // never play a sample twice
-    }
-    read += n;
-  }
+  void pull(float* out, int outs, int n) { ring.pull(out, outs, n); }
 
   void run() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -364,13 +267,10 @@ AudioPlayer::~AudioPlayer() {
   if (impl_->thread.joinable()) impl_->thread.join();
 }
 
-void AudioPlayer::push(int sub, const uint8_t* data, size_t n, double tsUs) { impl_->push(sub, data, n, tsUs); }
+void AudioPlayer::push(int sub, const uint8_t* data, size_t n, double tsUs) { impl_->ring.push(sub, data, n, tsUs); }
 
-void AudioPlayer::setVolume(float volume) { impl_->volume = std::max(0.0f, std::min(1.0f, volume)); }
+void AudioPlayer::setVolume(float volume) { impl_->ring.setVolume(volume); }
 
-void AudioPlayer::reset() {
-  std::lock_guard<std::mutex> l(impl_->mu);
-  impl_->configure(std::max(1, impl_->channels));
-}
+void AudioPlayer::reset() { impl_->ring.reset(); }
 
 }  // namespace ss

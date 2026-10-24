@@ -8,6 +8,7 @@
 #include <mferror.h>
 #include <mfidl.h>
 #include <mftransform.h>
+#include <strmif.h> // ICodecAPI
 #include <wrl/client.h>
 
 #include <algorithm>

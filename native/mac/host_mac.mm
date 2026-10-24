@@ -111,7 +111,6 @@ struct MacHostImplBase {
 };
 }  // namespace ss
 
-API_AVAILABLE(macos(12.3))
 @interface SSStreamOutput : NSObject <SCStreamOutput, SCStreamDelegate>
 @property(nonatomic) std::weak_ptr<ss::MacHostImplBase> owner;
 @end
@@ -136,8 +135,8 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
   Options opts;
   dispatch_queue_t videoQueue = dispatch_queue_create("ss.video", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
   dispatch_queue_t audioQueue = dispatch_queue_create("ss.audio", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
-  SCStream* stream API_AVAILABLE(macos(12.3)) = nil;
-  SSStreamOutput* output API_AVAILABLE(macos(12.3)) = nil;
+  SCStream* stream = nil;
+  SSStreamOutput* output = nil;
   VTCompressionSessionRef encoder = nullptr;
   dispatch_source_t timer = nil;
   std::atomic<bool> streaming{false}, wantKey{true}, running{false};
@@ -198,7 +197,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     return true;
   }
 
-  void start(const Options& o) API_AVAILABLE(macos(12.3)) {
+  void start(const Options& o) {
     opts = o;
     interval = 1000.0 / o.fps;
     running = true;
@@ -208,7 +207,10 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
                                                  completionHandler:^(SCShareableContent* content, NSError* error) {
                                                    if (!self->running) return;
                                                    if (!content) return self->fail(error.code == -3801 ? "permission" : "no-screen-access");
-                                                   self->open(content);
+                                                   // on the video queue, as stop() is
+                                                   dispatch_async(self->videoQueue, ^{
+                                                     if (self->running) self->open(content);
+                                                   });
                                                  }];
   }
 
@@ -216,7 +218,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     setInfo([&](Info& i) { i.error = why; });
   }
 
-  void open(SCShareableContent* content) API_AVAILABLE(macos(12.3)) {
+  void open(SCShareableContent* content) {
     CGDirectDisplayID wanted = opts.display ? opts.display : CGMainDisplayID();
     SCDisplay* display = nil;
     for (SCDisplay* d in content.displays)
@@ -283,7 +285,8 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     dispatch_resume(timer);
   }
 
-  void onVideo(CMSampleBufferRef sample) override API_AVAILABLE(macos(12.3)) {
+  void onVideo(CMSampleBufferRef sample) override {
+    if (!running) return;
     CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sample, false);
     if (!atts || CFArrayGetCount(atts) == 0) return;
     NSDictionary* info = (__bridge NSDictionary*)CFArrayGetValueAtIndex(atts, 0);
@@ -320,7 +323,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     VTCompressionSessionEncodeFrameWithOutputHandler(encoder, image, CMTimeMake(pts, 1000000), kCMTimeInvalid, (__bridge CFDictionaryRef)props, nullptr,
                                                     ^(OSStatus status, VTEncodeInfoFlags, CMSampleBufferRef out) {
                                                       auto s = weak.lock();
-                                                      if (!s || status != noErr || !out) return;
+                                                      if (!s || !s->running || status != noErr || !out) return;
                                                       std::vector<uint8_t> data;
                                                       bool isKey = false;
                                                       if (!annexB(out, data, isKey)) return;
@@ -345,10 +348,14 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
   }
 
   void onAudio(CMSampleBufferRef sample) override {
-    if (!opus) return;
-    AudioBufferList list;
+    if (!opus || !running) return;
+    struct {
+      AudioBufferList list;
+      AudioBuffer more[7]; // non-interleaved: one buffer per channel
+    } buffers;
+    AudioBufferList& list = buffers.list;
     CMBlockBufferRef block = nullptr;
-    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, nullptr, &list, sizeof list, nullptr, nullptr, 0, &block) != noErr) return;
+    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, nullptr, &list, sizeof buffers, nullptr, nullptr, 0, &block) != noErr) return;
     CMItemCount frames = CMSampleBufferGetNumSamples(sample);
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
     double ageMs = (CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())) - CMTimeGetSeconds(pts)) * 1000;
@@ -374,13 +381,16 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
 
   void onStopped(NSError* error) override { fail(error.code == -3801 ? "permission" : "capture-stopped"); }
 
-  void stop() API_AVAILABLE(macos(12.3)) {
+  void stop() {
     running = false;
-    if (timer) dispatch_source_cancel(timer);
-    timer = nil;
-    if (stream) [stream stopCaptureWithCompletionHandler:nil];
-    stream = nil;
-    dispatch_sync(videoQueue, ^{});
+    streaming = false;
+    // on the video queue: whatever runs there finishes first, nothing reaches the engine after
+    dispatch_sync(videoQueue, ^{
+      if (timer) dispatch_source_cancel(timer);
+      timer = nil;
+      if (stream) [stream stopCaptureWithCompletionHandler:nil];
+      stream = nil;
+    });
     dispatch_sync(audioQueue, ^{});
     if (encoder) VTCompressionSessionCompleteFrames(encoder, kCMTimeInvalid);
   }
@@ -389,14 +399,9 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
 MacHost::MacHost(Engine& engine) : impl_(std::make_shared<Impl>(engine)) {}
 MacHost::~MacHost() { stop(); }
 
-void MacHost::start(const Options& options) {
-  if (@available(macOS 12.3, *)) impl_->start(options);
-  else impl_->fail("macos-too-old");
-}
+void MacHost::start(const Options& options) { impl_->start(options); }  // (macOS 12.3+: the app's minimum)
 
-void MacHost::stop() {
-  if (@available(macOS 12.3, *)) impl_->stop();
-}
+void MacHost::stop() { impl_->stop(); }
 
 void MacHost::setStreaming(bool on) {
   impl_->streaming = on;
