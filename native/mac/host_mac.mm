@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <vector>
 
@@ -149,7 +150,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
   int encoded = 0;
   double encSum = 0, statsAt = 0;
   // sound
-  std::vector<float> pending;
+  std::vector<float> pending, raw;
   double pendingTs = -1;
   OpusEncoder* opus = nullptr;
   mutable std::mutex mu;
@@ -350,26 +351,34 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
   void onAudio(CMSampleBufferRef sample) override {
     if (!opus || !running) return;
     setInfo([](Info& i) { i.audioBuffers++; });
-    struct {
-      AudioBufferList list;
-      AudioBuffer more[7]; // non-interleaved: one buffer per channel
-    } buffers;
-    AudioBufferList& list = buffers.list;
-    CMBlockBufferRef block = nullptr;
-    if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample, nullptr, &list, sizeof buffers, nullptr, nullptr, 0, &block) != noErr) return;
-    CMItemCount frames = CMSampleBufferGetNumSamples(sample);
+    // float PCM straight from the block: one channel after the other (non-interleaved, as
+    // ScreenCaptureKit gives it) or interleaved – the format description says which
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sample);
+    const AudioStreamBasicDescription* asbd = fmt ? CMAudioFormatDescriptionGetStreamBasicDescription(fmt) : nullptr;
+    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
+    if (!asbd || !block || asbd->mFormatID != kAudioFormatLinearPCM || !(asbd->mFormatFlags & kAudioFormatFlagIsFloat) || asbd->mBitsPerChannel != 32 ||
+        std::lround(asbd->mSampleRate) != 48000) {
+      if (asbd) {
+        char note[96];
+        snprintf(note, sizeof note, "format %u/%x/%u bit/%.0f Hz", unsigned(asbd->mFormatID), unsigned(asbd->mFormatFlags), unsigned(asbd->mBitsPerChannel), asbd->mSampleRate);
+        setInfo([&](Info& i) { i.audioNote = note; });
+      }
+      return;
+    }
+    int channels = std::max<int>(1, int(asbd->mChannelsPerFrame));
+    bool planar = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    raw.resize(CMBlockBufferGetDataLength(block) / sizeof(float));
+    if (raw.empty() || CMBlockBufferCopyDataBytes(block, 0, raw.size() * sizeof(float), raw.data()) != noErr) return;
+    size_t frames = raw.size() / size_t(channels);
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
     double ageMs = (CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())) - CMTimeGetSeconds(pts)) * 1000;
     if (pendingTs < 0 || pending.empty()) pendingTs = (nowMs() - ageMs) * 1000;
-    // ScreenCaptureKit gives float, one buffer per channel (or interleaved in one)
-    bool planar = list.mNumberBuffers >= 2;
-    for (CMItemCount i = 0; i < frames; i++) {
+    for (size_t i = 0; i < frames; i++) {
       for (int c = 0; c < 2; c++) {
-        const float* src = static_cast<const float*>(list.mBuffers[planar ? std::min<UInt32>(UInt32(c), list.mNumberBuffers - 1) : 0].mData);
-        pending.push_back(planar ? src[i] : src[i * list.mBuffers[0].mNumberChannels + std::min<UInt32>(UInt32(c), list.mBuffers[0].mNumberChannels - 1)]);
+        size_t ch = size_t(std::min(c, channels - 1));
+        pending.push_back(planar ? raw[ch * frames + i] : raw[i * size_t(channels) + ch]);
       }
     }
-    CFRelease(block);
     uint8_t out[1500];
     while (pending.size() >= 240) {
       // 2.5 ms packets: the least delay Opus has
@@ -377,6 +386,8 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
       if (n > 0) {
         engine.sendAudio(0, 2, out, size_t(n), pendingTs);
         setInfo([](Info& i) { i.audioPackets++; });
+      } else {
+        setInfo([&](Info& i) { i.audioNote = std::string("opus: ") + opus_strerror(n); });
       }
       pending.erase(pending.begin(), pending.begin() + 240);
       pendingTs += 2500;

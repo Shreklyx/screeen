@@ -35,6 +35,7 @@ class MacHost {
     std::string error;
     std::string audioLayout;
     int audioBuffers = 0, audioPackets = 0; // what ScreenCaptureKit gave / what went out
+    std::string audioNote;                  // why sound did not go (diagnostics)
   };
 
   explicit MacHost(Engine& engine);

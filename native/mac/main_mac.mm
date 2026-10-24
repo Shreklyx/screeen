@@ -723,7 +723,7 @@ static int smoke(NSArray<NSString*>* args) {
     runFor(seconds);
     MacHost::Info i = host.info();
     result.set("encoder", i.encoder).set("width", i.width).set("height", i.height).set("fps", i.fps).set("error", i.error).set("audio", i.audioLayout);
-    result.set("audioBuffers", i.audioBuffers).set("audioPackets", i.audioPackets);
+    result.set("audioBuffers", i.audioBuffers).set("audioPackets", i.audioPackets).set("audioNote", i.audioNote);
     host.stop();
     hostPtr = nullptr;
   } else {

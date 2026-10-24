@@ -741,8 +741,8 @@ void DirectEndpoint::openTcp(Peer& p) {
   };
   WebSocketEvents ev;
   int role = role_ == Role::Host ? 1 : 2;
-  ev.open = [this, onLoop, role] {
-    onLoop([this, role](Peer& q) {
+  ev.open = [onLoop, role] {
+    onLoop([role](Peer& q) {
       uint8_t n[8];
       randomBytes(n, 8);
       std::string nonce = toHex(n, 8);
