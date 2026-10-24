@@ -168,7 +168,10 @@ void HostPipeline::start(const Options& options) {
     impl_->audio.reset(new AudioCapture([engine](int pair, int channels, const uint8_t* d, size_t n, double ts) { engine->sendAudio(pair, channels, d, n, ts); }));
     std::string why = impl_->audio->start();
     std::string layout = why.empty() ? impl_->audio->layout() : "";
-    impl_->setInfo([&](Info& i) { i.audioLayout = layout; });
+    impl_->setInfo([&](Info& i) {
+      i.audioLayout = layout;
+      i.audioError = why;
+    });
     if (!why.empty()) impl_->audio.reset();
   }
 }

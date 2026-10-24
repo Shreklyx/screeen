@@ -27,6 +27,7 @@ class HostPipeline {
     double fps = 0, encodeMs = 0;
     std::string error;       // why the picture cannot go (empty: all right)
     std::string audioLayout; // "7.1", "5.1", "sztereó"; empty without sound
+    std::string audioError;  // why there is no sound (no output device, …)
   };
 
   explicit HostPipeline(Engine& engine);

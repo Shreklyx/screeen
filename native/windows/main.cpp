@@ -937,7 +937,7 @@ int smoke(int argc, wchar_t** argv) {
     Sleep(DWORD(seconds) * 1000);
     HostPipeline::Info i = host.info();
     result.set("encoder", i.encoder).set("hardware", i.hardware).set("width", i.width).set("height", i.height).set("fps", i.fps).set("encodeMs", i.encodeMs);
-    result.set("error", i.error).set("audio", i.audioLayout).set("monitors", int(mons.size()));
+    result.set("error", i.error).set("audio", i.audioLayout).set("audioError", i.audioError).set("monitors", int(mons.size()));
     host.stop();
     hostPtr = nullptr;
   } else {

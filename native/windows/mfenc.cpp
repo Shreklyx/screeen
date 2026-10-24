@@ -66,7 +66,13 @@ class MfEncoder : public VideoEncoder {
     fps_ = fps;
     std::string why = createTransform();
     if (!why.empty()) return why;
-    if (!createConverter(input)) return "video-processor";
+    if (!createConverter(input)) {
+      // no video processor on this GPU (a basic display driver, a virtual machine): the software
+      // encoder gets its NV12 made on the CPU instead
+      if (hardware_) return "video-processor";
+      cpuConvert_ = true;
+      input_ = input;
+    }
     ComPtr<ICodecAPI> codec;
     if (SUCCEEDED(mft_->QueryInterface(kCodecApi, reinterpret_cast<void**>(codec.GetAddressOf())))) {
       codec_ = codec;
@@ -110,25 +116,30 @@ class MfEncoder : public VideoEncoder {
   }
 
   bool encode(bool key, double captureMs, const EncodedFrame& out) override {
-    // BGRA → NV12 on the GPU
-    ComPtr<ID3D11Texture2D>& nv12 = pool_[next_++ % pool_.size()];
-    ComPtr<ID3D11VideoProcessorOutputView>& view = poolViews_[(next_ - 1) % pool_.size()];
-    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
-    stream.Enable = TRUE;
-    stream.pInputSurface = inView_.Get();
-    if (FAILED(videoCtx_->VideoProcessorBlt(processor_.Get(), view.Get(), 0, 1, &stream))) return false;
+    ComPtr<IMFMediaBuffer> buffer;
+    if (cpuConvert_) {
+      if (!convertOnCpu(buffer)) return false;
+    } else {
+      // BGRA → NV12 on the GPU
+      ComPtr<ID3D11Texture2D>& nv12 = pool_[next_ % pool_.size()];
+      ComPtr<ID3D11VideoProcessorOutputView>& view = poolViews_[next_ % pool_.size()];
+      next_++;
+      D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+      stream.Enable = TRUE;
+      stream.pInputSurface = inView_.Get();
+      if (FAILED(videoCtx_->VideoProcessorBlt(processor_.Get(), view.Get(), 0, 1, &stream))) return false;
+      if (hardware_) {
+        if (FAILED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12.Get(), 0, FALSE, &buffer))) return false;
+        DWORD len = 0;
+        ComPtr<IMF2DBuffer> b2;
+        if (SUCCEEDED(buffer.As(&b2))) b2->GetContiguousLength(&len);
+        buffer->SetCurrentLength(len);
+      } else if (!readBack(nv12.Get(), buffer)) {
+        return false;
+      }
+    }
     ComPtr<IMFSample> sample;
     MFCreateSample(&sample);
-    ComPtr<IMFMediaBuffer> buffer;
-    if (hardware_) {
-      if (FAILED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12.Get(), 0, FALSE, &buffer))) return false;
-      DWORD len = 0;
-      ComPtr<IMF2DBuffer> b2;
-      if (SUCCEEDED(buffer.As(&b2))) b2->GetContiguousLength(&len);
-      buffer->SetCurrentLength(len);
-    } else if (!readBack(nv12.Get(), buffer)) {
-      return false;
-    }
     sample->AddBuffer(buffer.Get());
     LONGLONG time = LONGLONG(frame_++) * 10000000 / fps_;
     sample->SetSampleTime(time);
@@ -274,6 +285,53 @@ class MfEncoder : public VideoEncoder {
     return true;
   }
 
+  /** No video processor: the BGRA frame comes back from the GPU and becomes NV12 here (BT.709, video range). */
+  bool convertOnCpu(ComPtr<IMFMediaBuffer>& buffer) {
+    if (!stagingBgra_) {
+      D3D11_TEXTURE2D_DESC td;
+      input_->GetDesc(&td);
+      if (int(td.Width) < width_ || int(td.Height) < height_) return false;
+      td.Usage = D3D11_USAGE_STAGING;
+      td.BindFlags = 0;
+      td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      td.MiscFlags = 0;
+      if (FAILED(dev_->CreateTexture2D(&td, nullptr, &stagingBgra_))) return false;
+    }
+    ctx_->CopyResource(stagingBgra_.Get(), input_);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ctx_->Map(stagingBgra_.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+    DWORD size = DWORD(width_ * height_ * 3 / 2);
+    MFCreateMemoryBuffer(size, &buffer);
+    BYTE* dst = nullptr;
+    buffer->Lock(&dst, nullptr, nullptr);
+    BYTE* chroma = dst + size_t(width_) * height_;
+    for (int y = 0; y + 1 < height_; y += 2) {
+      const BYTE* rows[2] = {static_cast<const BYTE*>(m.pData) + size_t(y) * m.RowPitch, static_cast<const BYTE*>(m.pData) + size_t(y + 1) * m.RowPitch};
+      BYTE* luma[2] = {dst + size_t(y) * width_, dst + size_t(y + 1) * width_};
+      BYTE* c = chroma + size_t(y / 2) * width_;
+      for (int x = 0; x + 1 < width_; x += 2) {
+        int sr = 0, sg = 0, sb = 0;
+        for (int k = 0; k < 4; k++) {
+          const BYTE* p = rows[k >> 1] + size_t(x + (k & 1)) * 4; // B, G, R, A
+          int b = p[0], g = p[1], r = p[2];
+          luma[k >> 1][x + (k & 1)] = BYTE(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16);
+          sr += r;
+          sg += g;
+          sb += b;
+        }
+        sr = (sr + 2) >> 2;
+        sg = (sg + 2) >> 2;
+        sb = (sb + 2) >> 2;
+        c[x] = BYTE(((-26 * sr - 86 * sg + 112 * sb + 128) >> 8) + 128);
+        c[x + 1] = BYTE(((112 * sr - 102 * sg - 10 * sb + 128) >> 8) + 128);
+      }
+    }
+    buffer->Unlock();
+    buffer->SetCurrentLength(size);
+    ctx_->Unmap(stagingBgra_.Get(), 0);
+    return true;
+  }
+
   void pump(bool block) {
     for (;;) {
       ComPtr<IMFMediaEvent> ev;
@@ -355,6 +413,9 @@ class MfEncoder : public VideoEncoder {
   std::array<ComPtr<ID3D11Texture2D>, 4> pool_;
   std::array<ComPtr<ID3D11VideoProcessorOutputView>, 4> poolViews_;
   ComPtr<ID3D11Texture2D> staging_;
+  bool cpuConvert_ = false;
+  ID3D11Texture2D* input_ = nullptr; // the capture's BGRA frame (it outlives the encoder)
+  ComPtr<ID3D11Texture2D> stagingBgra_;
   size_t next_ = 0;
   uint64_t frame_ = 0;
   std::map<LONGLONG, double> times_;
