@@ -34,6 +34,7 @@ class MacHost {
     double fps = 0, encodeMs = 0;
     std::string error;
     std::string audioLayout;
+    int audioBuffers = 0, audioPackets = 0; // what ScreenCaptureKit gave / what went out
   };
 
   explicit MacHost(Engine& engine);

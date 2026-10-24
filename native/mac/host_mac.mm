@@ -349,6 +349,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
 
   void onAudio(CMSampleBufferRef sample) override {
     if (!opus || !running) return;
+    setInfo([](Info& i) { i.audioBuffers++; });
     struct {
       AudioBufferList list;
       AudioBuffer more[7]; // non-interleaved: one buffer per channel
@@ -373,7 +374,10 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     while (pending.size() >= 240) {
       // 2.5 ms packets: the least delay Opus has
       int n = opus_encode_float(opus, pending.data(), 120, out, sizeof out);
-      if (n > 0) engine.sendAudio(0, 2, out, size_t(n), pendingTs);
+      if (n > 0) {
+        engine.sendAudio(0, 2, out, size_t(n), pendingTs);
+        setInfo([](Info& i) { i.audioPackets++; });
+      }
       pending.erase(pending.begin(), pending.begin() + 240);
       pendingTs += 2500;
     }

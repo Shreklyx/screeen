@@ -95,15 +95,17 @@ class WinHttpSocket : public std::enable_shared_from_this<WinHttpSocket> {
   void readLoop() {
     URL_COMPONENTS u{};
     u.dwStructSize = sizeof u;
-    wchar_t host[256] = L"", path[1024] = L"";
+    wchar_t host[256] = L"", path[1024] = L"", extra[1024] = L"";
     u.lpszHostName = host;
     u.dwHostNameLength = 255;
     u.lpszUrlPath = path;
     u.dwUrlPathLength = 1023;
+    u.lpszExtraInfo = extra; // ?query
+    u.dwExtraInfoLength = 1023;
     std::wstring wurl = widen(url_);
     // WinHTTP knows http(s): the same URL with ws → http
-    if (wurl.compare(0, 5, L"wss://") == 0) wurl = L"https://" + wurl.substr(6);
-    else if (wurl.compare(0, 4, L"ws://") == 0) wurl = L"http://" + wurl.substr(5);
+    if (wurl.rfind(L"wss://", 0) == 0) wurl = L"https://" + wurl.substr(6);
+    else if (wurl.rfind(L"ws://", 0) == 0) wurl = L"http://" + wurl.substr(5);
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &u)) return finish();
     bool secure = u.nScheme == INTERNET_SCHEME_HTTPS;
     session_ = WinHttpOpen(L"ScreenShare", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -112,7 +114,8 @@ class WinHttpSocket : public std::enable_shared_from_this<WinHttpSocket> {
     WinHttpSetTimeouts(session_, 10000, 10000, 10000, 0); // no receive timeout: a quiet socket is fine
     connect_ = WinHttpConnect(session_, host, u.nPort, 0);
     if (!connect_) return finish();
-    request_ = WinHttpOpenRequest(connect_, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0);
+    std::wstring target = std::wstring(path) + extra;
+    request_ = WinHttpOpenRequest(connect_, L"GET", target.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0);
     if (!request_) return finish();
     if (!WinHttpSetOption(request_, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0)) return finish();
     if (!WinHttpSendRequest(request_, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) || !WinHttpReceiveResponse(request_, nullptr)) return finish();

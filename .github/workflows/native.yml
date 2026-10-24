@@ -78,21 +78,21 @@ jobs:
           "$app" --smoke-host http://127.0.0.1:8090 ci 20 host.log &
           appPid=$!
           for i in $(seq 1 80); do grep -q '^CODE' host.log 2>/dev/null && break; sleep 0.25; done
-          code=$(grep '^CODE' host.log | awk '{print $2}' | tr -d '\r')
+          code=$(grep '^CODE' host.log 2>/dev/null | awk '{print $2}' | tr -d '\r' || true)
           echo "room $code"
           "$cli" view --server http://127.0.0.1:8090 --code "$code" --seconds 8 --out from-app.h264 | tee view.log | grep -E 'RESULT' || true
           wait $appPid || true
-          cat host.log | grep -E 'RESULT|error' || true
+          tail -8 host.log || true
           "$cli" host --server http://127.0.0.1:8090 --password ci --h264 native/tests/data/test.h264 --seconds 25 > cli-host.log &
           cliPid=$!
           for i in $(seq 1 80); do grep -q '^CODE' cli-host.log 2>/dev/null && break; sleep 0.25; done
-          code=$(grep '^CODE' cli-host.log | awk '{print $2}' | tr -d '\r')
+          code=$(grep '^CODE' cli-host.log 2>/dev/null | awk '{print $2}' | tr -d '\r' || true)
           "$app" --smoke-view http://127.0.0.1:8090 "$code" 12 view-app.log
-          cat view-app.log | grep -E 'RESULT|EVENT' | tail -5
+          tail -5 view-app.log || true
           wait $cliPid || true
           node -e "
             const fs = require('fs');
-            const res = (f) => JSON.parse(fs.readFileSync(f, 'utf8').split(/\r?\n/).find((l) => l.startsWith('RESULT ')).slice(7));
+            const res = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8').split(/\r?\n/).find((l) => l.startsWith('RESULT ')).slice(7)); } catch { return {}; } };
             const host = res('host.log'), got = res('view.log'), view = res('view-app.log');
             console.log('app as sharer:', JSON.stringify(host));
             console.log('native viewer got:', JSON.stringify(got));
