@@ -2,9 +2,10 @@
 //
 // The browser pages talk to this server only to set up connections; the
 // screen video and audio go directly between the browsers (WebRTC), or via
-// the TURN relay when a direct path is not possible. Between two desktop apps
-// the picture can go without WebRTC ("direct mode", see direct-relay.js): the
-// server's UDP port tells the apps their public address and relays if needed.
+// the TURN relay when a direct path is not possible. The desktop apps – and
+// browsers with WebCodecs – send the picture without WebRTC ("direct mode", see
+// direct-relay.js): the server's UDP port tells the apps their public address and
+// relays if needed; browsers send through the /direct WebSocket.
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -21,6 +22,7 @@ const STATIC_FILES = {
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
   '/direct-audio.js': ['direct-audio.js', 'text/javascript; charset=utf-8'], // direct mode: audio playback worklet
+  '/direct-web.js': ['direct-web.js', 'text/javascript; charset=utf-8'], // direct mode in the browser (WebSocket)
   // home-screen app (iPhone / iPad / Android)
   '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json; charset=utf-8'],
   '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'],
@@ -147,7 +149,7 @@ function sanitizeCaps(caps) {
     if (v && typeof v === 'object') out[c] = { supported: v.supported !== false, hw: v.hw === true };
   }
   if (caps.surround === true) out.surround = true; // 5.1/7.1 speakers that can play multi-channel Opus
-  if (caps.direct === true) out.direct = true; // the desktop app: can receive without WebRTC
+  if (caps.direct === true) out.direct = true; // the app, or a browser with WebCodecs: can receive without WebRTC
   return out;
 }
 
@@ -268,8 +270,9 @@ export function createApp(config = loadConfig()) {
     },
   });
 
-  // direct mode's TCP fallback: encrypted packets between two apps (see direct-relay.js)
-  const directWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
+  // direct mode over the HTTPS port: browsers, and apps without UDP (see direct-relay.js);
+  // a frame goes as one message there (a 4K keyframe can be a few MB)
+  const directWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
   server.on('upgrade', (req, socket, head) => {
     let pathname = '';
     try {

@@ -4,9 +4,10 @@ Saját szerveren futó képernyőmegosztó oldal: **4K / 60 FPS**, **rendszerhan
 **5.1 / 7.1 térhang** is), minimális késleltetés.
 Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel bárki tud – regisztráció és telepítés nélkül, telefonon is.
 
-- **WebRTC, közvetlen kapcsolat** – a kép és a hang közvetlenül a gépek között megy, titkosítva (DTLS-SRTP).
-  A szerver csak a kapcsolat felépítését intézi, illetve **TURN relével** segít, ha a két gép nem éri el egymást
-  közvetlenül (pl. mobilnet, szigorú NAT).
+- **Saját átvitel, WebRTC nélkül** (*közvetlen mód*, lásd lent) – puffer nélkül, végponttól végpontig titkosítva
+  (X25519 + AES-GCM): két asztali alkalmazás között közvetlenül, UDP-n; böngészőben a szerver WebSocketjén át.
+  Ahol a böngésző ezt nem tudja (régebbi böngésző, iPhone), **WebRTC** megy (DTLS-SRTP, közvetlenül vagy **TURN
+  relével**, ha a két gép nem éri el egymást).
 - **Alapból a legjobb beállítás, a gép alapján (Automatikus):** ha a videókártya kódol, **4K · 60 FPS · max. 150 Mbit/s**
   (4K-ra korlátozva, így egy 5K-s Retina kijelző sem terheli feleslegesen a gépet). Ha a processzor kódol, a szálak
   száma szerint annyit, amennyit késés nélkül bír (pl. 12+ szál: 1440p60, 8 szál: 1080p60, kevesebb: 1080p30), és
@@ -209,9 +210,10 @@ Ami a böngészőhöz képest még több:
 - megosztás közben **nem alszik el** a gép,
 - **közvetlen mód** (alapból be van kapcsolva): az alkalmazásos nézők WebRTC nélkül kapják a képet – lásd lent.
 
-### Közvetlen mód (alkalmazás → alkalmazás, WebRTC nélkül)
+### Közvetlen mód (WebRTC nélkül – alkalmazásban és böngészőben)
 
-Ha a megosztó és a néző is az asztali alkalmazást használja, a kép a lehető legrövidebb úton megy:
+A kép a saját átvitelünkkel megy, nem WebRTC-vel. Ha a megosztó és a néző is az asztali alkalmazást használja, a
+lehető legrövidebb úton:
 
 - a megosztó gép **egyszer** kódol (H.264, a videókártyán – WebCodecs, „realtime” mód) minden alkalmazásos nézőnek,
   és ha a kódoló épp dolgozik, a következő képkockát kihagyja ahelyett, hogy sorba állna (a sor csak késés);
@@ -240,8 +242,15 @@ Ha a megosztó és a néző is az asztali alkalmazást használja, a kép a lehe
 
 A néző statisztikájában (**S**) a *Mód* sorban: *Közvetlen*, a *Késés (mért)* a valódi, végponttól végpontig mért
 késés (a megosztó gépen a rögzítéstől a néző vásznára rajzolásig, a két gép órájának eltérésével korrigálva).
-Böngészős és telefonos nézők WebRTC-t kapnak (a böngésző mást nem tud); a megosztó nézőlistájában látszik, ki
-melyiket kapja és miért.
+**Böngészőben is** (Chrome, Edge, friss Firefox / Safari – ahol van WebCodecs H.264 és WebCrypto X25519;
+`public/direct-web.js`): ugyanez a protokoll és ugyanaz a végponttól végpontig titkosítás, de mivel böngészőből nem
+lehet UDP-t küldeni, a csomagok WebSocketben, a szerver HTTPS-portján (`wss://…/direct`) mennek, és a szerver adja
+tovább őket (a képet nem látja). Ezen az úton egy képkocka egy csomag (a TCP nem veszít el semmit, nincs újrakérés);
+ha a néző vonala nem bírja, a megosztó eldobja a képkockákat a következő kulcskockáig ahelyett, hogy sorba állítaná
+őket (a sor csak késés), és a bitráta lejjebb megy. A néző itt is puffer nélkül, minden képet azonnal kirajzol. Így
+mehet alkalmazás → böngésző, böngésző → böngésző és böngésző → alkalmazás (böngészőből megosztani Chrome / Edge
+kell). Ahol a böngésző ezt nem tudja (régebbi böngésző, iPhone), WebRTC megy; a megosztó nézőlistájában látszik,
+ki melyiket kapja és miért. A böngészős nézők képe a szerver sávszélességét használja.
 
 Windowson az első közvetlen kapcsolatnál a Windows tűzfal rákérdezhet a Screen Share-re: engedélyezd (enélkül is
 működik, de a helyi hálózaton a közvetlen út biztosabb). A szerveren a telepítő megnyitja a **3479/udp** portot; ha a
@@ -296,6 +305,7 @@ A képernyőmegosztás csak HTTPS-en vagy `localhost`-on működik. TURN relé n
   óra-egyeztetés, lyukasztás a NAT-on, szerveres relé), `server/direct-relay.js` (a szerver 3479/udp portja:
   címfelderítés és relé, csak a munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része
   (WebCodecs kódolás/dekódolás, kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet),
+  `public/direct-web.js` (ugyanez a böngészőben: WebCrypto + WebSocket a szerveren át),
   `desktop/native/ss-capture.cpp` (Windows: DXGI képrögzítés + NVENC; az NVIDIA Video Codec SDK 11.1 API-fejléce a
   `third_party/` mappában, MIT licenc – a futáshoz csak az NVIDIA illesztőprogram kell).
 - `docker-compose.yml` – `app` (Node), `caddy` (HTTPS, beállítás: `deploy/caddy/Caddyfile`), `turn` (coturn, host

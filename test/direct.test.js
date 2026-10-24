@@ -311,3 +311,112 @@ test('TCP fallback: through the server\'s WebSocket when no UDP gets through', a
     await app.close();
   }
 });
+
+/* ---- the browser's transport (public/direct-web.js) against the app's ---- */
+
+async function loadWebDirect() {
+  const fs = await import('node:fs');
+  const vm = await import('node:vm');
+  globalThis.window ||= globalThis; // what the script hangs its API on
+  vm.runInThisContext(fs.readFileSync(new URL('../public/direct-web.js', import.meta.url), 'utf8'));
+  return globalThis.ScreenShareWebDirect;
+}
+
+async function webPair(webRole) {
+  const { createApp } = await import('../server/server.js');
+  const app = createApp({ port: 0, host: '127.0.0.1', hostPassword: 'x', turnSecret: '', directPort: 0 });
+  await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
+  const tcpUrl = `ws://127.0.0.1:${app.server.address().port}/direct`;
+  const { session, secret } = app.relay.create({ room: 'r', viewer: 'v1' });
+  const web = (await loadWebDirect()).create({ tcpUrl });
+  const events = [];
+  const media = [];
+  web.onEvent((name, ...args) => events.push([name, ...args]));
+  web.onMedia((meta, data) => media.push({ meta, data: Buffer.from(data) }));
+  // the app on the other side, with its UDP socket (no path there: the browser has none)
+  const native = new DirectEndpoint({ role: webRole === 'viewer' ? 'host' : 'viewer', serverHost: '127.0.0.1', tcpUrl });
+  await native.open();
+  const nativeStates = [];
+  native.on('state', (id, s) => nativeStates.push(s));
+  const info = { session, secret, port: 0 };
+  if (webRole === 'viewer') {
+    const offer = await native.addPeer('v1', info);
+    const answer = await web.add('viewer', 'host', info);
+    assert.equal(answer.tcp, true);
+    web.connect('host', offer);
+    native.connectPeer('v1', answer);
+  } else {
+    const offer = await web.add('host', 'v1', info);
+    const answer = await native.addPeer('host', info);
+    native.connectPeer('host', offer);
+    web.connect('v1', answer);
+  }
+  await until(() => nativeStates.some((s) => s.state === 'connected') && events.some(([n, , s]) => n === 'state' && s.state === 'connected'), 8000);
+  return {
+    web, native, events, media, nativeStates,
+    async close() {
+      web.stop();
+      native.close();
+      await app.close();
+    },
+  };
+}
+
+test('browser transport: an app shares to a browser over the server WebSocket (whole frames, keyframes, clock)', async () => {
+  const p = await webPair('viewer');
+  try {
+    assert.equal(p.nativeStates.at(-1).path, 'tcp'); // at once: the browser said it has only that
+    for (let n = 0; n < 15; n++) {
+      p.native.sendMedia({ stream: 0, key: n === 0, ts: n, capture: n }, frame(n, 6 * MAX_DATA + n));
+      await sleep(5);
+    }
+    p.native.sendMedia({ stream: 1, sub: 0x21, ts: 1, capture: 1 }, Buffer.from('opus'));
+    await until(() => p.media.filter((m) => m.meta.stream === 0).length === 15 && p.media.some((m) => m.meta.stream === 1));
+    const video = p.media.filter((m) => m.meta.stream === 0);
+    assert.deepEqual(video.map((m) => m.data.readUInt32BE(0)), [...Array(15).keys()]);
+    assert.ok(video.every((m) => m.data.equals(frame(m.data.readUInt32BE(0), m.data.length))));
+    assert.equal(p.media.find((m) => m.meta.stream === 1).meta.sub, 0x21);
+    // the browser asks for a keyframe; it measures the round trip; its reports reach the app
+    const keys = [];
+    p.native.on('keyframe', (id) => keys.push(id));
+    const reports = [];
+    p.native.on('report', (id, r) => reports.push(r));
+    p.web.keyframe();
+    await until(() => keys.length === 1 && reports.length > 0 && p.events.some(([n]) => n === 'clock'), 3000);
+    assert.equal(reports.at(-1).path, 'tcp');
+    // a socket that cannot keep up: frames are dropped (not queued) until the next keyframe
+    const ws = p.native.peers.get('v1').tcp;
+    Object.defineProperty(ws, 'bufferedAmount', { value: 10 << 20, configurable: true });
+    const before = p.media.length;
+    p.native.sendMedia({ stream: 0, key: false, ts: 20, capture: 20 }, frame(20, 1000));
+    assert.equal(keys.length, 2, 'the sharer is told to send a keyframe');
+    delete ws.bufferedAmount;
+    p.native.sendMedia({ stream: 0, key: false, ts: 21, capture: 21 }, frame(21, 1000));
+    p.native.sendMedia({ stream: 0, key: true, ts: 22, capture: 22 }, frame(22, 1000));
+    await until(() => p.media.length > before);
+    await sleep(100);
+    assert.deepEqual(p.media.slice(before).map((m) => m.data.readUInt32BE(0)), [22]);
+  } finally {
+    await p.close();
+  }
+});
+
+test('browser transport: a browser shares to an app', async () => {
+  const p = await webPair('host');
+  const got = [];
+  p.native.on('media', (meta, data) => { if (meta.stream === 0) got.push(data); });
+  try {
+    for (let n = 0; n < 10; n++) {
+      p.web.send({ stream: 0, key: n === 0, ts: n, capture: n }, new Uint8Array(frame(n, 50000)));
+      await sleep(5);
+    }
+    await until(() => got.length === 10);
+    assert.deepEqual(got.map((d) => d.readUInt32BE(0)), [...Array(10).keys()]);
+    assert.ok(got.every((d) => d.equals(frame(d.readUInt32BE(0), d.length))));
+    // the app's keyframe request reaches the browser sharer
+    p.native.keyframe('host');
+    await until(() => p.events.some(([n]) => n === 'keyframe'), 3000);
+  } finally {
+    await p.close();
+  }
+});

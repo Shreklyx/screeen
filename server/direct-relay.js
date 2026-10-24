@@ -6,8 +6,9 @@
 //  - Relay: when the two apps cannot reach each other directly, their (end-to-end
 //    encrypted) packets come here and are forwarded between the two registered addresses.
 //    Nothing is ever sent to an address that has not registered with the session secret.
-//  - TCP fallback (acceptTcp): when no UDP gets through at all (strict firewalls), the two apps
-//    send the same encrypted packets in a WebSocket (wss://…/direct) and this passes them on.
+//  - WebSocket path (acceptTcp): browsers (which cannot send UDP), and apps when no UDP gets
+//    through at all (strict firewalls), send the same encrypted packets in a WebSocket
+//    (wss://…/direct) and this passes them on.
 
 import dgram from 'node:dgram';
 import crypto from 'node:crypto';
@@ -70,8 +71,8 @@ export function createRelay({ port = 0, host } = {}) {
       s.tcp[role] = ws;
       ws.on('message', (packet, binary) => {
         const other = s.tcp?.[role === 1 ? 2 : 1];
-        // late packets are worth nothing: a peer that does not keep up loses them (NACK / keyframe)
-        if (!binary || !other || other.readyState !== other.OPEN || other.bufferedAmount > 8 << 20) return;
+        // late frames are worth nothing: a peer that does not keep up loses them (it asks for a keyframe)
+        if (!binary || !other || other.readyState !== other.OPEN || other.bufferedAmount > 2 << 20) return;
         s.relayed += packet.length;
         other.send(packet, { binary: true });
       });

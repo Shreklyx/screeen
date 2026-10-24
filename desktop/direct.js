@@ -14,7 +14,8 @@
 // address), exchange addresses over signaling and probe each other (UDP hole punching).
 // When no direct path answers, packets go through the server's UDP relay – or, when that
 // port is blocked, through the TURN server (the same one WebRTC uses, port 3478) – or, when no
-// UDP gets through at all, in a WebSocket to the server (HTTPS port, wss://…/direct).
+// UDP gets through at all, in a WebSocket to the server (HTTPS port, wss://…/direct). Browsers
+// (public/direct-web.js) have only that path; over it a frame goes as one packet.
 
 const dgram = require('node:dgram');
 const crypto = require('node:crypto');
@@ -37,6 +38,7 @@ const MTU = 1200; // UDP payload: fits every path, VPNs and PPPoE included
 const MAX_DATA = MTU - HEADER - TAG - MEDIA_HEADER;
 const RING = 1 << 14; // video packets kept for retransmission
 const MAX_CANDS = 8;
+const WHOLE = 4; // media flag: the whole frame in this one packet (the WebSocket path: TCP loses nothing)
 const INFO = Buffer.from('screenshare-direct-v1');
 const X25519_SPKI = Buffer.from('302a300506032b656e032100', 'hex');
 
@@ -607,10 +609,11 @@ class DirectEndpoint extends EventEmitter {
   }
 
   /** The other side's answer arrived: derive the keys and find a path. */
-  connectPeer(id, { pub, cands }) {
+  connectPeer(id, { pub, cands, tcp }) {
     const peer = this.peers.get(id);
     if (!peer) return;
     peer.keys = deriveKeys(peer.kp.privateKey, pub, peer.session);
+    peer.tcpOnly = tcp === true; // a browser: only the WebSocket reaches it
     peer.cands = (Array.isArray(cands) ? cands : []).filter(validCandidate).slice(0, MAX_CANDS).map((c) => ({ address: c.address, port: Number(c.port), turn: c.turn === true }));
     // the other app's TURN address is reached through our own allocation
     for (const c of peer.cands) {
@@ -687,14 +690,15 @@ class DirectEndpoint extends EventEmitter {
     if (t < peer.nextProbe || t > peer.probeUntil || !peer.keys) return;
     peer.nextProbe = t + 100;
     const since = t - peer.probeStart;
-    const forced = this.forceRelay || this.forceTurn || this.forceTcp;
+    const tcpNow = this.forceTcp || peer.tcpOnly;
+    const forced = this.forceRelay || this.forceTurn || tcpNow;
     const targets = forced ? [] : peer.cands.filter((c) => !c.turn);
     // the relays only after a moment: a direct path is better
     if (this.server && (!forced || this.forceRelay) && (this.forceRelay || since > 1000)) targets.push({ ...this.server, relay: true });
     if (this.turn && (!forced || this.forceTurn) && (this.forceTurn || since > 1500)) targets.push(...peer.cands.filter((c) => c.turn && this.turn.bound(c.address, c.port)));
     // no UDP path yet after 2 s: the WebSocket too (opened once, probed like the others)
-    if (this.tcpUrl && (!forced || this.forceTcp) && (this.forceTcp || (since > 2000 && peer.state !== 'connected'))) this.openTcp(peer);
-    if (peer.tcp?.ready && (!forced || this.forceTcp) && (this.forceTcp || since > 2000)) targets.push({ address: `tcp:${peer.session}`, port: 0 });
+    if (this.tcpUrl && (!forced || tcpNow) && (tcpNow || (since > 2000 && peer.state !== 'connected'))) this.openTcp(peer);
+    if (peer.tcp?.ready && (!forced || tcpNow) && (tcpNow || since > 2000)) targets.push({ address: `tcp:${peer.session}`, port: 0 });
     for (const target of targets) {
       const id = crypto.randomBytes(8);
       peer.probes.set(id.toString('hex'), { sent: t, relay: Boolean(target.relay) });
@@ -825,7 +829,7 @@ class DirectEndpoint extends EventEmitter {
       if (count === 1) this.emit('media', { stream: 1, sub: body[2], ts, capture, key: true }, data);
       return;
     }
-    this.trackSequence(peer, seq, t);
+    if (!(flags & WHOLE)) this.trackSequence(peer, seq, t); // a whole frame is never asked for again
     if (peer.next != null && ((frameId - peer.next) | 0) < 0) return; // already delivered or skipped
     let f = peer.frames.get(frameId);
     if (!f) {
@@ -899,7 +903,8 @@ class DirectEndpoint extends EventEmitter {
       const later = [...peer.frames.keys()].some((id) => ((id - peer.next) | 0) > 0);
       if (!later) return;
       if (!peer.waitSince) peer.waitSince = t;
-      if (t - peer.waitSince < this.giveUpMs(peer)) return;
+      // over the WebSocket nothing comes late: a missing frame was dropped on purpose
+      if (peer.path?.kind !== 'tcp' && t - peer.waitSince < this.giveUpMs(peer)) return;
       peer.stats.skips++;
       peer.minNext = (peer.next + 1) >>> 0;
       peer.next = null;
@@ -958,6 +963,7 @@ class DirectEndpoint extends EventEmitter {
     // a frame leaves at 3× the video bitrate: fast, but not one big burst into the network
     const pace = Math.max(3 * Number(bps || 0), 40e6);
     this.paceRate = pace / 8 / 1000;
+    this.bitrate = Number(bps || 0);
   }
 
   /** One encoded frame (video) or Opus packet (audio) to every connected viewer. */
@@ -969,7 +975,13 @@ class DirectEndpoint extends EventEmitter {
     if (count > 65535) return;
     const frameId = video ? this.videoFrame : this.audioSeq;
     if (video) this.videoFrame = (this.videoFrame + 1) >>> 0;
-    const ready = [...this.peers.values()].filter((p) => p.state === 'connected' && p.path);
+    const connected = [...this.peers.values()].filter((p) => p.state === 'connected' && p.path);
+    for (const peer of connected) if (peer.path.kind === 'tcp') this.sendWhole(peer, meta, frameId, buf);
+    const ready = connected.filter((p) => p.path.kind !== 'tcp');
+    if (!ready.length && video) {
+      this.videoSeq = (this.videoSeq + count) >>> 0; // the numbering stays the same for UDP viewers
+      return;
+    }
     for (let i = 0; i < count; i++) {
       const part = buf.subarray(i * MAX_DATA, Math.min(buf.length, (i + 1) * MAX_DATA));
       const p = Buffer.allocUnsafe(MEDIA_HEADER + part.length);
@@ -994,6 +1006,39 @@ class DirectEndpoint extends EventEmitter {
       for (const peer of ready) this.enqueue(peer, p, !video);
     }
     this.drain();
+  }
+
+  /** The WebSocket path: the frame as one packet, at once – or dropped when the socket is full. */
+  sendWhole(peer, meta, frameId, buf) {
+    const video = meta.stream === 0;
+    const ws = peer.tcp;
+    if (!ws?.ready) return;
+    // what may wait in the socket: ~150 ms of video; more is only delay
+    const limit = Math.max(256 * 1024, ((this.bitrate || 0) / 8) * 0.15);
+    if (video) {
+      if (ws.bufferedAmount > limit || (peer.dropping && !meta.key)) {
+        if (!peer.dropping) this.emit('keyframe', peer.id); // the next one goes when there is room
+        peer.dropping = true;
+        return;
+      }
+      peer.dropping = false;
+    } else if (ws.bufferedAmount > limit * 4) {
+      return;
+    }
+    const p = Buffer.allocUnsafe(MEDIA_HEADER + buf.length);
+    p[0] = video ? 0 : 1;
+    p[1] = (meta.key ? 1 : 0) | WHOLE;
+    p[2] = Number(meta.sub) & 0xff;
+    p[3] = 0;
+    p.writeUInt32BE(peer.wholeSeq = ((peer.wholeSeq || 0) + 1) >>> 0, 4);
+    p.writeUInt32BE(frameId, 8);
+    p.writeUInt16BE(0, 12);
+    p.writeUInt16BE(1, 14);
+    p.writeDoubleBE(Number(meta.capture) || 0, 16);
+    p.writeDoubleBE(Number(meta.ts) || 0, 24);
+    buf.copy(p, MEDIA_HEADER);
+    peer.lastSent = now();
+    ws.send(peer.packet(T.MEDIA, p));
   }
 
   enqueue(peer, payload, urgent = false) {

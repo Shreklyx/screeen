@@ -1758,9 +1758,9 @@ async function startViewing(code) {
   }
   viewer.code = code;
   setOverlay('Csatlakozás a szobához…');
-  viewer.caps = await Promise.race([codecSupport('decode'), sleep(1500).then(() => null)]);
+  [viewer.caps] = await Promise.all([Promise.race([codecSupport('decode'), sleep(1500).then(() => null)]), directReady]);
   if (surroundSpeakers()) viewer.caps = { ...viewer.caps, surround: true };
-  if (DIRECT) viewer.caps = { ...viewer.caps, direct: true }; // the desktop app can also receive without WebRTC
+  if (DIRECT) viewer.caps = { ...viewer.caps, direct: true }; // can receive without WebRTC
   viewer.signal = createSignal({
     onMessage: onViewerMessage,
     onOpen: joinRoom,
@@ -2173,6 +2173,8 @@ function initViewerUi() {
     if (el.volume === 0) el.volume = 1;
     $('#btnUnmute').hidden = true;
     el.play().catch(() => {});
+    viewer.direct?.audio?.ctx.resume().catch(() => {});
+    syncDirectVolume();
     syncMuteUi();
   });
 
@@ -2191,21 +2193,24 @@ function initViewerUi() {
 
 /* ============================== boot ============================== */
 
-/* ======================= DIRECT MODE (app → app) ======================= */
-// When both ends run the desktop app, the picture can skip WebRTC: the sharer encodes once
-// for every such viewer (WebCodecs, on the GPU), the app sends the frames over its own UDP
-// transport (desktop/direct.js), and the viewer decodes and draws every frame the moment it
-// arrives – no jitter buffer, no pacing queue, no waiting for the compositor (low-latency
-// canvas). Browsers keep using WebRTC; when the direct path cannot be set up, WebRTC takes over.
+/* ======================= DIRECT MODE (no WebRTC) ======================= */
+// The picture skips WebRTC: the sharer encodes once for every such viewer (WebCodecs, on the
+// GPU – or the app's native NVENC), the frames go over our own encrypted transport, and the
+// viewer decodes and draws every frame the moment it arrives – no jitter buffer, no pacing
+// queue, no waiting for the compositor (low-latency canvas). The app sends over UDP
+// (desktop/direct.js); a browser over a WebSocket through the server (public/direct-web.js),
+// as it cannot send UDP. WebRTC is left for browsers without WebCodecs / X25519 (and iPhones).
 
-const DIRECT = APP?.direct || null;
+let DIRECT = APP?.direct || null;
+// a browser: the WebSocket transport, once it is known to work here
+let directReady = Promise.resolve();
 const DIRECT_CODEC = 'avc1.640034'; // H.264 High 5.2 (up to 4K 60): every GPU decodes it
 const DIRECT_MIN_KBPS = 3000;
 const PATH_LABEL = { lan: 'helyi hálózat', internet: 'interneten át', relay: 'a szerveren át', turn: 'TURN relén át', tcp: 'a szerveren át (HTTPS)' };
 // why an app viewer gets WebRTC (or why a direct attempt is repeated) – shown to both sides
 const WHY_TEXT = {
-  'host-browser': 'a megosztó böngészőből oszt meg (közvetlen mód csak az alkalmazásból megy)',
-  'viewer-browser': 'a néző böngészőben néz (közvetlen mód csak az alkalmazásban van)',
+  'host-browser': 'a megosztó böngészője nem tud közvetlen módban küldeni (Chrome / Edge, vagy az alkalmazás kell)',
+  'viewer-browser': 'a néző böngészője nem tud közvetlen módban fogadni (régebbi böngésző vagy iPhone)',
   server: 'a szerver még nem ismeri – futtasd rajta újra: sudo bash deploy/install.sh',
   encoder: 'nincs használható H.264 kódoló',
   udp: 'a két gép nem érte el egymást',
@@ -2229,7 +2234,7 @@ function turnInfo(iceServers) {
 
 /** Why this viewer gets WebRTC (null: it gets direct mode). */
 function directWhy(v) {
-  if (!DIRECT) return 'host-browser';
+  if (!directOn()) return 'host-browser';
   if (!v.caps?.direct) return 'viewer-browser';
   if (!host.serverDirect) return 'server';
   if (v.noDirect) return v.noDirectWhy || 'encoder';
@@ -2250,7 +2255,8 @@ const direct = {
   nativeOff: null, // why it is not used for this share
 };
 
-const directOn = () => Boolean(DIRECT);
+// a browser sends only with a track reader and an encoder (Chrome, Edge)
+const directOn = () => Boolean(DIRECT) && (!DIRECT.web || (typeof MediaStreamTrackProcessor === 'function' && typeof VideoEncoder === 'function'));
 const wantsDirect = (v) => directOn() && host.serverDirect && Boolean(v.caps?.direct) && !v.noDirect;
 const clockNow = () => performance.timeOrigin + performance.now();
 const evenPx = (x) => Math.max(2, Math.round(x / 2) * 2);
@@ -2314,7 +2320,7 @@ async function onDirectSession(msg) {
     return;
   }
   d.state = 'connecting';
-  host.signal.send({ t: 'signal', to: v.id, data: { type: 'direct-offer', session: v.session, udp: msg.session, pub: res.pub, cands: res.cands, codec: DIRECT_CODEC } });
+  host.signal.send({ t: 'signal', to: v.id, data: { type: 'direct-offer', session: v.session, udp: msg.session, pub: res.pub, cands: res.cands, tcp: res.tcp === true, codec: DIRECT_CODEC } });
 }
 
 function onDirectViewerSignal(v, data) {
@@ -2324,7 +2330,7 @@ function onDirectViewerSignal(v, data) {
   }
   if (data.session !== v.session) return;
   if (data.type === 'direct-answer' && v.direct?.state === 'connecting') {
-    DIRECT.connect(v.id, { pub: data.pub, cands: data.cands });
+    DIRECT.connect(v.id, { pub: data.pub, cands: data.cands, tcp: data.tcp === true });
   } else if (data.type === 'direct-fail') {
     directFailed(v, typeof data.why === 'string' && WHY_TEXT[data.why] ? data.why : 'failed');
   } else if (data.type === 'stats') {
@@ -2807,9 +2813,10 @@ async function onDirectOffer(data) {
   }
   if (typeof data.codec === 'string') d.codec = data.codec;
   d.state = 'connecting';
-  DIRECT.connect('host', { pub: data.pub, cands: data.cands });
-  sendToHost({ type: 'direct-answer', pub: res.pub, cands: res.cands });
-  if (!hasPicture()) setOverlay('Közvetlen kapcsolat (alkalmazás → alkalmazás)…');
+  DIRECT.connect('host', { pub: data.pub, cands: data.cands, tcp: data.tcp === true });
+  sendToHost({ type: 'direct-answer', pub: res.pub, cands: res.cands, tcp: res.tcp === true });
+  $('#latency').hidden = true; // no buffer to choose: every frame is shown at once
+  if (!hasPicture()) setOverlay('Közvetlen kapcsolat…');
 }
 
 // An app viewer that gets WebRTC is told why, once (and in the statistics).
@@ -2830,6 +2837,7 @@ function closeDirectView() {
   closeDirectAudio(d);
   DIRECT?.remove('host');
   $('#directCanvas').hidden = true;
+  $('#latency').hidden = false;
   video().hidden = false;
 }
 
@@ -2964,6 +2972,8 @@ async function openDirectAudio(d, channels) {
   d.audio = { ctx, node, gain, channels, out, decoders: [] };
   syncDirectVolume();
   ctx.resume().catch(() => {});
+  // a browser opened from a link (no click yet) keeps the sound off: one click turns it on
+  setTimeout(() => { if (ctx.state === 'suspended' && d.audio?.ctx === ctx && !viewer.muted) $('#btnUnmute').hidden = false; }, 400);
   return d.audio;
 }
 
@@ -3061,7 +3071,7 @@ function directStatsTick() {
   if ($('#stats').hidden) return;
   const a = d.audio;
   renderStatsRows([
-    ['Mód', 'Közvetlen (alkalmazás → alkalmazás, WebRTC nélkül)'],
+    ['Mód', `Közvetlen (WebRTC nélkül${DIRECT?.web ? ', böngészőben' : ''})`],
     ['Felbontás', res],
     ['FPS', d.drawn ? String(Math.round(fps)) : '–'],
     ['Bitráta', fmtKbps(r?.kbps ?? null)],
@@ -3122,6 +3132,15 @@ function init() {
   DIRECT?.onEvent(onDirectEvent);
   DIRECT?.onMedia(onDirectMedia);
   NATIVE?.onEvent(onNativeEvent);
+  if (!DIRECT && window.ScreenShareWebDirect && !IS_IOS) {
+    // a browser: the same direct mode, through the server's WebSocket
+    directReady = window.ScreenShareWebDirect.supported().then((ok) => {
+      if (!ok) return;
+      DIRECT = window.ScreenShareWebDirect.create({ tcpUrl: `${SERVER_ORIGIN.replace(/^http/, 'ws')}/direct` });
+      DIRECT.onEvent(onDirectEvent);
+      DIRECT.onMedia(onDirectMedia);
+    }).catch(() => {});
+  }
   initHostUi();
   initViewerUi();
 
