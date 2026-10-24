@@ -1,0 +1,41 @@
+# The native apps' shared core (native/core): builds it, runs its tests, and a native sharer and a
+# native viewer exchange a recorded stream through the real server (direct mode over UDP and over
+# the server's WebSocket).
+name: Native core
+
+on:
+  push:
+    branches: [claude/elegant-gauss-mi4rl5, main]
+    paths: ['native/**', 'server/**', '.github/workflows/native.yml']
+  workflow_dispatch:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build
+        run: |
+          cmake -S native -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j4
+      - name: Core tests
+        run: build/sscore_test
+      - name: Native sharer → native viewer through the server
+        run: |
+          PORT=8090 HOST_PASSWORD=ci DIRECT_PORT=3479 node server/server.js &
+          sleep 2
+          for path in udp tcp; do
+            flag=""; [ "$path" = tcp ] && flag="--tcp"
+            build/ss-cli host --server http://127.0.0.1:8090 --password ci --h264 native/tests/data/test.h264 --seconds 15 $flag > host.log &
+            for i in $(seq 1 50); do grep -q '^CODE' host.log && break; sleep 0.2; done
+            code=$(grep '^CODE' host.log | awk '{print $2}')
+            build/ss-cli view --server http://127.0.0.1:8090 --code "$code" --seconds 5 $flag | tee view.log | grep RESULT
+            node -e "const r=JSON.parse(require('fs').readFileSync('view.log','utf8').split('\n').find(l=>l.startsWith('RESULT ')).slice(7)); if(!(r.frames>100&&r.firstKey)) {console.error('too few frames', r); process.exit(1)}"
+            wait
+          done

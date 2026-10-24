@@ -1,0 +1,55 @@
+# Screen Share – the native apps (no Electron, no Chromium).
+#   core/       C++17, every platform: direct mode's transport, crypto, signaling, the session engine
+#   windows/    the Windows app (Win32, Direct3D 11, Media Foundation, NVENC, WASAPI)
+#   mac/        the macOS app (AppKit, ScreenCaptureKit, VideoToolbox, Core Audio)
+#   tests/      core tests and a command-line host/viewer (Linux, CI)
+cmake_minimum_required(VERSION 3.20)
+project(ScreenShareNative LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>") # no VC++ runtime to install
+endif()
+
+# BearSSL (MIT): X25519, AES-GCM, SHA / HMAC / HKDF
+file(GLOB_RECURSE BEARSSL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/bearssl/src/*.c)
+add_library(bearssl STATIC ${BEARSSL_SOURCES})
+target_include_directories(bearssl PUBLIC third_party/bearssl/inc PRIVATE third_party/bearssl/src)
+if(MSVC)
+  target_compile_options(bearssl PRIVATE /W0)
+else()
+  target_compile_options(bearssl PRIVATE -w)
+endif()
+
+add_library(sscore STATIC
+  core/clock.cpp core/crypto.cpp core/json.cpp core/net.cpp core/ws_plain.cpp core/direct.cpp core/engine.cpp)
+target_include_directories(sscore PUBLIC core)
+target_link_libraries(sscore PUBLIC bearssl)
+if(WIN32)
+  target_link_libraries(sscore PUBLIC ws2_32 iphlpapi bcrypt)
+  target_compile_definitions(sscore PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+elseif(APPLE)
+  target_link_libraries(sscore PUBLIC "-framework Security")
+else()
+  find_package(Threads REQUIRED)
+  target_link_libraries(sscore PUBLIC Threads::Threads)
+endif()
+if(NOT MSVC)
+  target_compile_options(sscore PRIVATE -Wall -Wextra)
+endif()
+
+option(SS_TESTS "core tests and the command-line host/viewer" ON)
+if(SS_TESTS)
+  add_executable(sscore_test tests/core_test.cpp)
+  target_link_libraries(sscore_test PRIVATE sscore)
+  add_executable(ss-cli tests/ss_cli.cpp)
+  target_link_libraries(ss-cli PRIVATE sscore)
+endif()
+
+if(WIN32 AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/windows/CMakeLists.txt)
+  add_subdirectory(windows)
+endif()
+if(APPLE AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/mac/CMakeLists.txt)
+  add_subdirectory(mac)
+endif()
