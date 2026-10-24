@@ -2,8 +2,9 @@
 
 // Screen Share desktop app (Windows / macOS).
 //
-// The UI and the WebRTC code are the website itself (loaded from the server),
-// so the app always matches the server. What the app adds on top of a browser:
+// The pages are built into the app (public/ of this repository, served as app://screenshare);
+// the server (default https://mozizas.hu) is only used for signaling, the relays, and the room
+// links viewers get. The app updates itself (updates.js). What it adds on top of a browser:
 //  - its own screen/window picker, and the system audio comes along
 //    automatically (Windows, and macOS 13+ – no extra audio driver needed),
 //  - 5.1 / 7.1 surround system audio on Windows (native/ss-audio.cpp),
@@ -16,12 +17,13 @@
 //  - direct mode between two apps: the picture goes without WebRTC, over the app's own
 //    UDP transport (direct.js) – no jitter buffer, the least delay.
 
-const { app, BrowserWindow, Menu, desktopCapturer, dialog, ipcMain, powerSaveBlocker, screen, session, shell, systemPreferences } = require('electron');
+const { app, BrowserWindow, Menu, desktopCapturer, dialog, ipcMain, powerSaveBlocker, protocol, screen, session, shell, systemPreferences } = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { DirectEndpoint } = require('./direct');
+const { createUpdater } = require('./updates');
 
 const DEFAULT_URL = 'https://mozizas.hu/';
 const IS_MAC = process.platform === 'darwin';
@@ -32,6 +34,74 @@ const SYSTEM_AUDIO = IS_WIN || (IS_MAC && Number(os.release().split('.')[0]) >= 
 const AUDIO_HELPER = process.env.SS_AUDIO_HELPER
   || (IS_WIN ? path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, 'native'), 'ss-audio.exe') : '');
 const HAS_AUDIO_HELPER = Boolean(AUDIO_HELPER) && fs.existsSync(AUDIO_HELPER);
+
+/* ------------------------------------------------ the built-in pages */
+
+const APP_HOST = 'screenshare';
+const APP_ORIGIN = `app://${APP_HOST}`;
+const APP_PAGE = `${APP_ORIGIN}/index.html`;
+const isAppPage = (url) => {
+  const s = String(url || '');
+  return s === APP_ORIGIN || s.startsWith(`${APP_ORIGIN}/`);
+};
+// packaged: web/ inside the app; during development: the repository's public/
+const WEB_DIR = [path.join(__dirname, 'web'), path.join(__dirname, '..', 'public')].find((d) => fs.existsSync(path.join(d, 'index.html')));
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.webmanifest': 'application/manifest+json',
+};
+
+// a secure origin of its own: screen capture, WebCodecs, worklets work as on https
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, codeCache: true } },
+]);
+
+function appCsp() {
+  const s = new URL(serverUrl);
+  const ws = `${s.protocol === 'https:' ? 'wss' : 'ws'}://${s.host}`;
+  return [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data: blob:",
+    `connect-src 'self' ${ws} ${s.origin}`,
+    "media-src 'self' blob:",
+    "base-uri 'none'",
+    "form-action 'self'",
+  ].join('; ');
+}
+
+function serveAppFile(request) {
+  const notFound = () => new Response('Nincs ilyen oldal', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch {
+    return notFound();
+  }
+  if (url.host !== APP_HOST || !WEB_DIR) return notFound();
+  const rel = url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname);
+  const file = path.normalize(path.join(WEB_DIR, rel));
+  if (!file.startsWith(WEB_DIR + path.sep)) return notFound();
+  try {
+    const body = fs.readFileSync(file);
+    return new Response(body, {
+      headers: {
+        'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
+        'Content-Security-Policy': appCsp(),
+        'Cache-Control': 'no-cache',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    });
+  } catch {
+    return notFound();
+  }
+}
 
 /* ------------------------------------------------ Chromium switches (before 'ready') */
 
@@ -92,22 +162,16 @@ const SMOKE = process.argv.includes('--smoke-test');
 const SMOKE_CAPTURE = process.argv.includes('--smoke-capture');
 
 let serverUrl = DEFAULT_URL;
-const serverOrigin = () => new URL(serverUrl).origin;
-const isServerUrl = (url) => {
-  try {
-    return new URL(url).origin === serverOrigin();
-  } catch {
-    return false;
-  }
-};
+// in-app updates: the installed app (not development runs, not the CI self-test)
+const updatesSupported = () => app.isPackaged && (IS_WIN || IS_MAC) && !SMOKE;
 const isLocalPage = (url) => String(url).startsWith('file:');
 
 /* ------------------------------------------------ main window */
 
 let mainWindow = null;
 
-function loadServer() {
-  mainWindow.loadURL(serverUrl);
+function loadApp() {
+  mainWindow.loadURL(APP_PAGE);
 }
 
 // Last window position, unless that monitor is gone.
@@ -139,7 +203,7 @@ function createMainWindow() {
       nodeIntegration: false,
       backgroundThrottling: false,
       spellcheck: false,
-      additionalArguments: [`--ss-version=${app.getVersion()}`, ...(HAS_AUDIO_HELPER ? ['--ss-surround'] : [])],
+      additionalArguments: [`--ss-version=${app.getVersion()}`, ...(HAS_AUDIO_HELPER ? ['--ss-surround'] : []), ...(updatesSupported() ? ['--ss-updates'] : [])],
     },
   });
 
@@ -147,6 +211,22 @@ function createMainWindow() {
     if (!SMOKE) mainWindow.show();
   });
   mainWindow.on('close', () => saveConfig({ bounds: mainWindow.getNormalBounds() }));
+  // The page asks before leaving while viewers watch; a window gets no dialog by itself.
+  mainWindow.webContents.on('will-prevent-unload', (e) => {
+    if (installingUpdate) {
+      e.preventDefault();
+      return;
+    }
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'question',
+      buttons: ['Kilépés', 'Mégse'],
+      defaultId: 1,
+      cancelId: 1,
+      message: 'Biztosan kilépsz?',
+      detail: 'Megosztás közben a nézőknél leáll a kép.',
+    });
+    if (choice === 0) e.preventDefault();
+  });
   mainWindow.on('closed', () => {
     mainWindow = null;
     stopAudioHelper();
@@ -164,23 +244,23 @@ function createMainWindow() {
     stopAudioHelper();
     stopDirect();
   });
-  // Server not reachable → local page with a retry button.
+  // The built-in page could not load (should not happen) → local page with a retry button.
   wc.on('did-fail-load', (_e, code, description, url, isMainFrame) => {
     if (!isMainFrame || code === -3 /* aborted */ || isLocalPage(url)) return;
     mainWindow.loadFile(path.join(__dirname, 'pages', 'offline.html'), { query: { url: serverUrl, error: description } });
   });
-  // Only the server and our own pages open inside the app; everything else in the browser.
+  // Only our own pages open inside the app; everything else (the website too) in the browser.
   wc.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
   wc.on('will-navigate', (e, url) => {
-    if (isServerUrl(url) || isLocalPage(url)) return;
+    if (isAppPage(url) || isLocalPage(url)) return;
     e.preventDefault();
     if (/^https?:/i.test(url)) shell.openExternal(url);
   });
 
-  loadServer();
+  loadApp();
 }
 
 /* ------------------------------------------------ permissions */
@@ -190,12 +270,12 @@ const ALLOWED_PERMISSIONS = new Set(['media', 'display-capture', 'fullscreen', '
 function setupPermissions(ses) {
   ses.setPermissionRequestHandler((wc, permission, callback, details) => {
     const url = details?.requestingUrl || wc.getURL();
-    let ok = isServerUrl(url) && ALLOWED_PERMISSIONS.has(permission);
+    let ok = isAppPage(url) && ALLOWED_PERMISSIONS.has(permission);
     // audio inputs (the Hangforrás list) yes, camera no
     if (permission === 'media' && (details?.mediaTypes || []).includes('video')) ok = false;
     callback(ok);
   });
-  ses.setPermissionCheckHandler((_wc, permission, origin) => origin === serverOrigin() && ALLOWED_PERMISSIONS.has(permission));
+  ses.setPermissionCheckHandler((_wc, permission, origin) => isAppPage(origin) && ALLOWED_PERMISSIONS.has(permission));
 }
 
 /* ------------------------------------------------ screen picker */
@@ -293,7 +373,7 @@ function pickSource(audioRequested) {
 function setupDisplayMedia(ses) {
   ses.setDisplayMediaRequestHandler(async (request, callback) => {
     try {
-      if (!isServerUrl(request.securityOrigin) || !screenPermissionOk()) return callback(null);
+      if (!isAppPage(request.securityOrigin) || !screenPermissionOk()) return callback(null);
       const choice = await pickSource(request.audioRequested);
       if (!choice) return callback(null);
       let source = listedSources.get(choice.id);
@@ -442,25 +522,54 @@ async function openDirect(wc, role) {
   return self;
 }
 
+/* ------------------------------------------------ updates (updates.js) */
+
+let updater = null;
+let manualCheck = false;
+let installingUpdate = false;
+
+function setupUpdates() {
+  if (!updatesSupported()) return;
+  updater = createUpdater({
+    onState: (s) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('update:state', s);
+      if (!manualCheck || s.status === 'checking') return;
+      manualCheck = false;
+      if (s.status === 'latest') {
+        dialog.showMessageBox(mainWindow, { type: 'info', message: 'A legfrissebb verzió fut.', detail: `Screen Share ${app.getVersion()}` });
+      } else if (s.status === 'error') {
+        dialog.showMessageBox(mainWindow, { type: 'warning', message: 'Nem sikerült frissítést keresni.', detail: s.error || '' });
+      }
+    },
+  });
+  updater.start();
+}
+
+function checkForUpdates() {
+  if (!updater) return;
+  manualCheck = true;
+  updater.check();
+}
+
 /* ------------------------------------------------ IPC from the pages */
 
 function setupIpc() {
   ipcMain.on('app:sharing', (e, on) => {
-    if (isServerUrl(e.senderFrame?.url)) setSharing(Boolean(on));
+    if (isAppPage(e.senderFrame?.url)) setSharing(Boolean(on));
   });
   ipcMain.on('app:retry', (e) => {
-    if (isLocalPage(e.senderFrame?.url) && mainWindow) loadServer();
+    if (isLocalPage(e.senderFrame?.url) && mainWindow) loadApp();
   });
   ipcMain.on('app:settings', () => openSettings());
   ipcMain.handle('audio:start', (e) => {
-    if (!HAS_AUDIO_HELPER || e.sender !== mainWindow?.webContents || !isServerUrl(e.senderFrame?.url)) return { error: 'unavailable' };
+    if (!HAS_AUDIO_HELPER || e.sender !== mainWindow?.webContents || !isAppPage(e.senderFrame?.url)) return { error: 'unavailable' };
     return startAudioHelper(e.sender);
   });
   ipcMain.on('audio:stop', (e, id) => {
     if (audioHelper?.wc === e.sender) stopAudioHelper(Number(id));
   });
   ipcMain.handle('direct:add', async (e, role, id, info) => {
-    if (e.sender !== mainWindow?.webContents || !isServerUrl(e.senderFrame?.url) || !['host', 'viewer'].includes(role) || !info) return { error: 'unavailable' };
+    if (e.sender !== mainWindow?.webContents || !isAppPage(e.senderFrame?.url) || !['host', 'viewer'].includes(role) || !info) return { error: 'unavailable' };
     try {
       const d = await openDirect(e.sender, role);
       const t = info.turn;
@@ -485,14 +594,24 @@ function setupIpc() {
   ipcMain.on('direct:keyframe', (e) => { if (direct?.wc === e.sender && direct.role === 'viewer') direct.ep.keyframe('host'); });
   ipcMain.on('direct:bitrate', (e, bps) => { if (direct?.wc === e.sender && direct.role === 'host') direct.ep.setBitrate(Number(bps)); });
   ipcMain.on('direct:stop', (e) => { if (direct?.wc === e.sender) stopDirect(); });
+  ipcMain.handle('update:state', (e) => (isAppPage(e.senderFrame?.url) && updater ? { ...updater.state } : null));
+  ipcMain.on('update:check', (e) => { if (isAppPage(e.senderFrame?.url)) checkForUpdates(); });
+  ipcMain.on('update:install', (e) => {
+    if (!isAppPage(e.senderFrame?.url) || !updater) return;
+    installingUpdate = IS_WIN; // Windows: the app closes and the installer starts it again
+    setSharing(false);
+    updater.install();
+  });
   ipcMain.handle('app:get-url', () => serverUrl);
+  // the built-in page needs the server before anything else (synchronous, from the preload)
+  ipcMain.on('app:server-url', (e) => { e.returnValue = isAppPage(e.senderFrame?.url) ? serverUrl : ''; });
   ipcMain.handle('app:set-url', (e, raw) => {
     if (!isLocalPage(e.senderFrame?.url)) return { ok: false };
     const url = normalizeUrl(raw);
     if (!url) return { ok: false, error: 'Érvénytelen cím.' };
     serverUrl = url;
     saveConfig({ serverUrl: url });
-    if (mainWindow) loadServer();
+    if (mainWindow) loadApp();
     return { ok: true };
   });
 }
@@ -529,6 +648,7 @@ function buildMenu() {
       label: 'Fájl',
       submenu: [
         { label: 'Szerver címe…', click: openSettings },
+        ...(updatesSupported() ? [{ label: 'Frissítések keresése…', click: checkForUpdates }] : []),
         { type: 'separator' },
         IS_MAC ? { role: 'close', label: 'Ablak bezárása' } : { role: 'quit', label: 'Kilépés' },
       ],
@@ -574,8 +694,18 @@ async function runSmokeTest() {
       shareButton: Boolean(document.querySelector('#btnShare')),
     })`);
     log('page', JSON.stringify(page));
-    if (!page.app || !page.shareButton || !isServerUrl(page.url)) throw new Error('page or app bridge missing');
+    if (!page.app || !page.shareButton || !isAppPage(page.url)) throw new Error('page or app bridge missing');
+    // the built-in page reaches the server (signaling)
+    const signal = await wc.executeJavaScript(`hostSignal().whenOpen(15000).then(() => 'open', (e) => 'failed: ' + e.message)`, true);
+    log('signaling', signal);
+    if (signal !== 'open') throw new Error(`cannot reach the server: ${signal}`);
     log(`gpu: ${JSON.stringify(app.getGPUFeatureStatus()).slice(0, 400)}`);
+    if (app.isPackaged) {
+      // in-app updates (Windows: electron-updater reads where to look from app-update.yml)
+      const updateConfig = path.join(process.resourcesPath, 'app-update.yml');
+      log('update config', fs.existsSync(updateConfig) ? fs.readFileSync(updateConfig, 'utf8').replace(/\s+/g, ' ').trim() : 'missing');
+      if (IS_WIN && !fs.existsSync(updateConfig)) throw new Error('app-update.yml missing');
+    }
     if (SMOKE_CAPTURE) {
       const cap = await wc.executeJavaScript(`(async () => {
         let stream, audioError = null;
@@ -677,11 +807,13 @@ if (!SMOKE && !app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     serverUrl = normalizeUrl(arg('url') || process.env.SCREENSHARE_URL || loadConfig().serverUrl || DEFAULT_URL) || DEFAULT_URL;
     const ses = session.defaultSession;
+    ses.protocol.handle('app', serveAppFile);
     setupPermissions(ses);
     setupDisplayMedia(ses);
     setupIpc();
     buildMenu();
     createMainWindow();
+    setupUpdates();
     if (SMOKE) runSmokeTest();
 
     app.on('activate', () => {

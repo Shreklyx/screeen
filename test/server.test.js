@@ -127,8 +127,11 @@ test('relay only forwards the expected message types', async () => {
   v.close();
 });
 
-test('rejects WebSocket connections from other sites', async () => {
+test('rejects WebSocket connections from other sites, accepts the desktop app', async () => {
   await assert.rejects(client({ Origin: 'https://evil.example' }));
+  await assert.rejects(client({ Origin: 'app://screenshare.evil' }));
+  const app = await client({ Origin: 'app://screenshare' });
+  app.close();
 });
 
 test('hosting needs the password', async () => {

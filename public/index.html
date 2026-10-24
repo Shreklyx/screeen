@@ -23,7 +23,14 @@
       <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M8 10.5h16v10H8zM13 24h6" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span>Screen Share</span>
     </a>
-    <span class="topbar-note"><span class="dot" aria-hidden="true"></span>Közvetlen P2P · titkosított kapcsolat</span>
+    <span class="topbar-note web-only"><span class="dot" aria-hidden="true"></span>Közvetlen P2P · titkosított kapcsolat</span>
+    <div class="topbar-app app-only">
+      <div id="updateBar" class="update-bar" role="status" hidden>
+        <span id="updateText"></span>
+        <button id="btnUpdate" class="btn btn-primary btn-sm" type="button" hidden>Frissítés</button>
+      </div>
+      <span id="appInfo" class="topbar-note"></span>
+    </div>
   </header>
 
   <main>
@@ -32,6 +39,11 @@
       <div class="hero">
         <h1>Képernyőmegosztás <em>4K&#8209;ban</em>, hanggal, késés nélkül.</h1>
         <p class="lead">Nincs regisztráció, nincs telepítés. A kép és a hang közvetlenül a gépek között megy, titkosítva. Nézni bárki tud a linkkel, megosztani a jelszóval lehet.</p>
+      </div>
+
+      <div class="app-hero app-only">
+        <h1>Mit szeretnél?</h1>
+        <p>Ha a túloldalon is ez az alkalmazás fut, a kép közvetlenül, puffer nélkül megy – a legkisebb késéssel.</p>
       </div>
 
       <div class="cards">

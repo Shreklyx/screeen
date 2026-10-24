@@ -8,6 +8,20 @@ const version = (process.argv.find((a) => a.startsWith('--ss-version=')) || '').
 contextBridge.exposeInMainWorld('screenshareApp', {
   platform: process.platform,
   version,
+  // the server for signaling (the pages are built into the app)
+  serverUrl: ipcRenderer.sendSync('app:server-url') || '',
+  // in-app updates (installed app on Windows / macOS)
+  updates: process.argv.includes('--ss-updates')
+    ? {
+      getState: () => ipcRenderer.invoke('update:state'),
+      check: () => ipcRenderer.send('update:check'),
+      install: () => ipcRenderer.send('update:install'),
+      onState: (cb) => {
+        ipcRenderer.removeAllListeners('update:state');
+        ipcRenderer.on('update:state', (_e, s) => cb(s));
+      },
+    }
+    : null,
   setSharing: (on) => ipcRenderer.send('app:sharing', Boolean(on)),
   retry: () => ipcRenderer.send('app:retry'),
   openSettings: () => ipcRenderer.send('app:settings'),

@@ -354,8 +354,25 @@ input[type="password"] {
   border: 1px solid var(--border);
 }
 .player video, .player canvas { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
-/* settings that only the desktop app has */
+/* ---------- the desktop app: an app, not a website ---------- */
 :root:not(.in-app) .app-only { display: none; }
+.in-app .web-only, .in-app .hero, .in-app .features, .in-app .howto, .in-app #downloads, .in-app #iosInstall { display: none !important; }
+.app-hero { max-width: 920px; margin: 24px auto 28px; }
+.app-hero h1 { font-size: 28px; letter-spacing: -0.025em; margin: 0 0 6px; }
+.app-hero p { color: var(--text-muted); margin: 0; }
+.topbar-app { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.update-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  padding: 4px 4px 4px 12px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  border: 1px solid rgba(255, 77, 94, 0.35);
+}
+.update-bar.ready { background: rgba(61, 220, 132, 0.12); border-color: rgba(61, 220, 132, 0.4); }
+.btn-sm { padding: 5px 12px; font-size: 13px; border-radius: 999px; }
 .player:fullscreen { max-height: none; width: 100vw; height: 100vh; aspect-ratio: auto; border-radius: 0; border: 0; }
 .player:-webkit-full-screen { max-height: none; width: 100vw; height: 100vh; border-radius: 0; border: 0; }
 .player.idle { cursor: none; }

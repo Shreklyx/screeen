@@ -50,6 +50,18 @@ const STANDALONE = Boolean(window.matchMedia?.('(display-mode: standalone)').mat
 // The Windows/Mac desktop app (desktop/preload.js) exposes a small API; null in a plain browser.
 const APP = window.screenshareApp || null;
 const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
+// The server this page talks to: the site itself in a browser; in the desktop app, whose pages
+// are built in, the server chosen there (default https://mozizas.hu).
+const SERVER_ORIGIN = (() => {
+  try {
+    return new URL(APP?.serverUrl || location.href).origin;
+  } catch {
+    return location.origin;
+  }
+})();
+// what viewers open: the website (also from the app)
+const SITE_URL = APP?.serverUrl ? `${SERVER_ORIGIN}/` : `${location.origin}${location.pathname}`;
+if (APP) document.documentElement.classList.add('in-app'); // an app, not a website: before the first paint
 // the website inside the iOS app (ios/App/WatchView.swift); sharing is its own tab there
 const IN_IOS_APP = /ScreenShareApp\//.test(navigator.userAgent);
 const IOS_APP_URL = 'https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-iOS.ipa';
@@ -143,7 +155,7 @@ function createSignal({ onMessage, onOpen, onClose }) {
   const openWaiters = new Set();
 
   function connect() {
-    const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+    const socket = new WebSocket(`${SERVER_ORIGIN.replace(/^http/, 'ws')}/ws`);
     ws = socket;
     socket.onopen = () => {
       attempt = 0;
@@ -778,7 +790,7 @@ function applyHosted(res) {
   host.iceServers = res.iceServers || [];
   host.serverDirect = res.direct === true; // an older server: WebRTC only
   store.set('ss-host-room', { code: res.code, token: res.token }, 'session');
-  const link = `${location.origin}${location.pathname}#${res.code}`;
+  const link = `${SITE_URL}#${res.code}`;
   $('#roomCode').textContent = res.code;
   $('#roomLink').value = link;
   $('#btnCopy').disabled = false;
@@ -2355,7 +2367,8 @@ function onHostDirectEvent(name, id, info) {
 }
 
 const directViewers = () => [...host.viewers.values()].filter((v) => v.direct?.state === 'connected');
-const directTargetKbps = () => (settings.kbps === 'auto' ? (direct.hw === false ? 20000 : 80000) : settings.kbps);
+// the most beautiful picture the network allows: high (GPU) / what a processor manages
+const directTargetKbps = () => (settings.kbps === 'auto' ? (direct.hw === false ? 20000 : 120000) : settings.kbps);
 
 // No bandwidth estimate as in WebRTC: lower the bitrate when a viewer loses packets, has to
 // skip frames or its round trip grows (queues filling up), raise it slowly while all is well.
@@ -2986,8 +2999,49 @@ function directStatsTick() {
   ]);
 }
 
+/* ---- the desktop app: version, server, updates ---- */
+
+let lastUpdate = null;
+
+function initAppChrome() {
+  if (!APP) return;
+  let serverHost = '';
+  try { serverHost = new URL(SERVER_ORIGIN).host; } catch { /* keep empty */ }
+  $('#appInfo').textContent = `v${APP.version || '?'}${serverHost ? ` · ${serverHost}` : ''}`;
+  if (!APP.updates) return;
+  APP.updates.onState(renderUpdate);
+  APP.updates.getState().then((s) => { if (s) renderUpdate(s); }).catch(() => {});
+  $('#btnUpdate').addEventListener('click', () => {
+    if (lastUpdate?.status === 'ready' && isLive() && host.viewers.size
+      && !confirm('A frissítéshez az alkalmazás újraindul, a megosztás leáll. Folytatod?')) return;
+    if (lastUpdate?.status === 'ready') window.removeEventListener('beforeunload', confirmLeave);
+    APP.updates.install();
+  });
+}
+
+function renderUpdate(s) {
+  lastUpdate = s;
+  const bar = $('#updateBar');
+  const btn = $('#btnUpdate');
+  bar.hidden = !['downloading', 'ready', 'available'].includes(s.status);
+  bar.classList.toggle('ready', s.status !== 'downloading');
+  if (s.status === 'downloading') {
+    $('#updateText').textContent = `Új verzió (${s.version}) letöltése… ${s.progress ?? 0}%`;
+    btn.hidden = true;
+  } else if (s.status === 'ready') {
+    $('#updateText').textContent = `Új verzió kész: ${s.version}`;
+    btn.textContent = 'Újraindítás és frissítés';
+    btn.hidden = false;
+  } else if (s.status === 'available') {
+    $('#updateText').textContent = `Új verzió: ${s.version}`;
+    btn.textContent = 'Letöltés';
+    btn.hidden = false;
+  }
+}
+
 function init() {
   if (IS_IOS) document.documentElement.classList.add('is-ios'); // no volume control: iOS keeps media at full volume
+  initAppChrome();
   DIRECT?.onEvent(onDirectEvent);
   DIRECT?.onMedia(onDirectMedia);
   initHostUi();

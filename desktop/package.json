@@ -23,20 +23,44 @@
     "files": [
       "main.js",
       "direct.js",
+      "updates.js",
       "preload.js",
       "picker-preload.js",
-      "pages/**"
+      "pages/**",
+      {
+        "from": "../public",
+        "to": "web",
+        "filter": [
+          "**/*"
+        ]
+      }
     ],
     "directories": {
       "buildResources": "build",
       "output": "dist"
     },
-    "electronLanguages": ["hu", "en-US", "en"],
+    "electronLanguages": [
+      "hu",
+      "en-US",
+      "en"
+    ],
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "icon": "build/icon.png",
       "artifactName": "ScreenShare-Setup.${ext}",
-      "extraResources": [{ "from": "native/ss-audio.exe", "to": "ss-audio.exe" }]
+      "extraResources": [
+        {
+          "from": "native/ss-audio.exe",
+          "to": "ss-audio.exe"
+        }
+      ]
     },
     "nsis": {
       "oneClick": true,
@@ -47,8 +71,18 @@
     },
     "mac": {
       "target": [
-        { "target": "dmg", "arch": ["universal"] },
-        { "target": "zip", "arch": ["universal"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "universal"
+          ]
+        }
       ],
       "icon": "build/icon.png",
       "category": "public.app-category.video",
@@ -62,6 +96,15 @@
     },
     "dmg": {
       "title": "Screen Share"
-    }
+    },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://github.com/Shreklyx/screeen/releases/download/desktop-latest"
+      }
+    ]
+  },
+  "dependencies": {
+    "electron-updater": "6.8.10"
   }
 }

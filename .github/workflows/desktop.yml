@@ -59,9 +59,17 @@ jobs:
           call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /W3 /MT /Fo:desktop\native\ /Fe:desktop\native\ss-audio.exe desktop\native\ss-audio.cpp ole32.lib avrt.lib winmm.lib || exit /b 1
 
+      # every build gets a higher version: the installed apps update themselves to it (updates.js)
       - name: Build
         working-directory: desktop
-        run: npx electron-builder ${{ matrix.builder }} --publish never
+        run: npx electron-builder ${{ matrix.builder }} --publish never -c.extraMetadata.version=1.1.${{ github.run_number }}
+
+      - name: Update files
+        shell: bash
+        run: |
+          ls -la desktop/dist
+          if [ "$RUNNER_OS" = Windows ]; then test -f desktop/dist/latest.yml && cat desktop/dist/latest.yml; fi
+          if [ "$RUNNER_OS" = macOS ]; then test -f desktop/dist/latest-mac.yml && cat desktop/dist/latest-mac.yml; fi
 
       - name: "Smoke test (app starts, loads the site; on Windows also screen capture and the audio helper)"
         shell: bash
@@ -79,6 +87,8 @@ jobs:
             desktop/dist/ScreenShare-Setup.exe
             desktop/dist/ScreenShare-mac.dmg
             desktop/dist/ScreenShare-mac.zip
+            desktop/dist/latest.yml
+            desktop/dist/latest-mac.yml
           if-no-files-found: error
 
   publish:
@@ -104,11 +114,12 @@ jobs:
             - A gép teljes hangját magától megosztja – Macen is, semmit nem kell mellé telepíteni (macOS 13 vagy újabb; első megosztáskor engedélyezd a rendszerhang-felvételt).
             - Windowson 5.1 / 7.1 hangszóró (vagy 7.1-es fejhallgató) esetén minden csatornát átküld: a térhangos nézők térhangot kapnak.
             - Közvetlen mód: ha a néző is az alkalmazással néz, a kép WebRTC nélkül, puffer nélkül megy – a legkisebb késés.
+            - Saját alkalmazás: a felülete be van építve (a szervert csak a kapcsolódáshoz használja), és magát frissíti: Windowson letölti az új verziót („Újraindítás és frissítés”), Macen felajánlja a letöltését.
 
             Az alkalmazás nincs Microsofttal / Apple-lel aláírva:
             - Windows: „A Windows megvédte a számítógépet” ablaknál → **További információ → Futtatás mindenképp**.
             - Mac: az első indításnál jobb klikk az alkalmazáson → **Megnyitás**, vagy Rendszerbeállítások → Adatvédelem és biztonság → **Megnyitás mindenképp**.
 
-            Készült: ${{ github.sha }}
+            Verzió: 1.1.${{ github.run_number }} · készült: ${{ github.sha }}
           files: out/*
           make_latest: true

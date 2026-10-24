@@ -185,7 +185,17 @@ Fordítás: a GitHub Actions (`.github/workflows/ios.yml`) macOS gépen építi 
 Letöltés: a weboldal főoldalán, vagy <https://github.com/Shreklyx/screeen/releases/tag/desktop-latest>
 (**ScreenShare-Setup.exe** Windowsra, **ScreenShare-mac.dmg** Macre – Intel és Apple Silicon is).
 
-Ugyanaz az oldal, mint a böngészőben (a szerverről töltődik, így mindig friss), plusz:
+**Saját alkalmazás:** a felülete be van építve (nem a weboldalt nyitja meg), a szervert (alap: `https://mozizas.hu`)
+csak a kapcsolódáshoz, a relékhez és a nézőknek küldött linkhez használja. A böngészős oldalhoz képest nincs benne
+bemutató, letöltés, böngészős tipp – rögtön a **Megosztok** / **Nézek** választás jön.
+
+**Frissítés az alkalmazásban:** induláskor és háromóránként megnézi, van-e új verzió (minden változásnál új build készül).
+Windowson a háttérben letölti, a fejlécben megjelenik: *Új verzió kész – **Újraindítás és frissítés***; ha nem
+kattintasz, a következő kilépéskor települ. Macen (az alkalmazás nincs Apple-lel aláírva, így nem cserélheti le
+magát) a fejlécben *Új verzió – **Letöltés***: a DMG-ből húzd át az új verziót az Alkalmazások mappába.
+Kézzel: *Fájl → Frissítések keresése…*. (Az első, ilyen frissítést tudó verziót még kézzel kell letölteni.)
+
+Ami a böngészőhöz képest még több:
 
 - **saját képernyő-/ablakválasztó**, a **rendszerhang magától megy** Windowson és Macen is (nem kell pipát keresni,
   Macen semmit nem kell mellé telepíteni),
@@ -242,7 +252,9 @@ Képernyő- és rendszerhangfelvétel* → kapcsold be a Screen Share-t a rendsz
 5.1 – ha ez sztereó, sztereó megy. A megosztó panel **Hang** dobozában látszik: *Hang megosztva: 7.1 térhang*, a
 nézőlistában pedig, ki kapja térhangban. A néző statisztikájában (**S**) a *Hang* sorban: *7.1 térhang*.
 
-**Szerver címe:** *Fájl → Szerver címe…* (alap: `https://mozizas.hu`).
+**Szerver címe:** *Fájl → Szerver címe…* (alap: `https://mozizas.hu`). Az alkalmazás a szerverhez a saját,
+beépített oldaláról kapcsolódik (`app://screenshare`) – ehhez a szerveren is az új verzió kell
+(`sudo bash deploy/install.sh`).
 
 A `desktop/` mappában van (Electron). Az installereket a GitHub Actions (`.github/workflows/desktop.yml`)
 Windows és Mac gépen építi és teszteli minden változásnál; kézzel: `npm ci --prefix desktop`, majd
