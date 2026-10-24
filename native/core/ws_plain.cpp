@@ -50,9 +50,10 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
   PlainWebSocket(std::string url, WebSocketEvents ev) : url_(std::move(url)), ev_(std::move(ev)) {}
 
   void start() {
+    // the threads keep the object alive (it may end on one of them): never joined, detached at once
     auto self = shared_from_this();
-    reader_ = std::thread([self] { self->readLoop(); });
-    writer_ = std::thread([self] { self->writeLoop(); });
+    std::thread([self] { self->readLoop(); }).detach();
+    std::thread([self] { self->writeLoop(); }).detach();
   }
 
   ~PlainWebSocket() override {
@@ -76,8 +77,6 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
     }
     cv_.notify_all();
     if (sock_ != kNoSock) shutdownSock(sock_);
-    if (reader_.joinable()) reader_.detach();
-    if (writer_.joinable()) writer_.detach();
   }
 
  private:
@@ -277,8 +276,6 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
   std::atomic<bool> open_{false};
   bool closing_ = false;
   std::atomic<Sock> sock_{kNoSock};
-  std::thread reader_;
-  std::thread writer_;
 };
 
 /** Keeps the shared object alive for its threads; close() lets them finish on their own. */

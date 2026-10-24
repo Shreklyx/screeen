@@ -28,7 +28,7 @@ namespace {
 const GUID kFloatFormat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 
 const int kRate = 48000;
-const int kFrame = 240; // 5 ms
+const int kFrame = 120; // 2.5 ms: the least delay Opus has
 
 /** Samples of the device's mix format as float (most devices already are). */
 float sampleAt(const BYTE* p, const WAVEFORMATEX* f, size_t frame, int channel) {
@@ -186,7 +186,7 @@ std::string AudioCapture::layout() const { return impl_->layoutName; }
 
 namespace {
 const int kRing = kRate; // one second
-const int kMinTarget = 480, kMaxTarget = 4800;
+const int kMinTarget = 240, kMaxTarget = 4800; // 5 … 100 ms
 const float K = 0.70710678f;
 float soft(float x) { return x > 0.9f ? 0.9f + 0.1f * std::tanh((x - 0.9f) / 0.1f) : x < -0.9f ? -0.9f + 0.1f * std::tanh((x + 0.9f) / 0.1f) : x; }
 }  // namespace
@@ -198,7 +198,7 @@ struct AudioPlayer::Impl {
   std::vector<OpusDecoder*> decoders;
   long long read = LLONG_MIN;   // absolute sample index of the next output sample
   long long end = LLONG_MIN;    // one past the newest written sample
-  int target = 720;             // 15 ms to start with
+  int target = 480;             // 10 ms to start with
   long long calm = 0;
   std::atomic<float> volume{1.0f};
   std::thread thread;
@@ -212,7 +212,7 @@ struct AudioPlayer::Impl {
     channels = ch;
     ring.assign(size_t(ch), std::vector<float>(kRing, 0.0f));
     read = end = LLONG_MIN;
-    target = 720;
+    target = 480;
   }
 
   void push(int sub, const uint8_t* data, size_t n, double tsUs) {

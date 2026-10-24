@@ -9,7 +9,7 @@
 
 const RATE = 48000;
 const SIZE = RATE; // one second
-const MIN_TARGET = 480; // 10 ms
+const MIN_TARGET = 240; // 5 ms
 const MAX_TARGET = 4800; // 100 ms
 const K = Math.SQRT1_2;
 
@@ -22,7 +22,7 @@ class DirectAudio extends AudioWorkletProcessor {
     this.ring = Array.from({ length: this.channels }, () => new Float32Array(SIZE));
     this.read = null; // absolute sample index of the next output sample
     this.end = -Infinity; // one past the newest written sample
-    this.target = 720; // 15 ms to start with
+    this.target = 480; // 10 ms to start with
     this.calm = 0; // samples played since the last underrun
     this.port.onmessage = (e) => this.write(e.data);
   }

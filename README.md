@@ -236,7 +236,7 @@ lehető legrövidebb úton:
   („desynchronized”) vásznon rajzolja ki, amely nem vár a böngésző képösszeállítására; ha a gép nem bírja a tempót,
   mindig csak a legfrissebb kép kerül ki;
 - elveszett csomagot a néző azonnal újrakér (NACK); ha egy kép így sem lesz teljes, kihagyja, és kulcskockát kér;
-- a hang Opus, 5 ms-os csomagokban, 5.1/7.1 is (csatornapáronként); a néző csak 10–100 ms hangpuffert tart, amennyit a
+- a hang Opus, 2,5 ms-os csomagokban (az Opus legkisebb késése), 5.1/7.1 is (csatornapáronként); a néző csak 10–100 ms hangpuffert tart, amennyit a
   hálózat éppen kíván;
 - kapcsolat: a két alkalmazás a szerver UDP-portján (**3479**) megtudja a saját nyilvános címét, és közvetlenül
   egymásnak küld (helyi hálózaton a helyi címen); ha ez nem megy, a szerver továbbítja a (titkosított) csomagokat

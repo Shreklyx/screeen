@@ -54,22 +54,27 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # MSVC from whichever Visual Studio the runner has (vswhere), /MT: no runtime to install
       - name: Build
-        shell: bash
+        shell: cmd
         run: |
-          cmake -S native -B build -G "Visual Studio 17 2022" -A x64 -DSS_VERSION=2.0.${{ github.run_number }}
-          cmake --build build --config Release -j 4
-          ls -la build/windows/Release
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set GEN=NMake Makefiles
+          where ninja >nul 2>nul && set GEN=Ninja
+          cmake -S native -B build -G "%GEN%" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DSS_VERSION=2.0.${{ github.run_number }} || exit /b 1
+          cmake --build build || exit /b 1
+          dir build\windows
       - name: Core tests
         shell: bash
-        run: build/Release/sscore_test.exe
+        run: build/sscore_test.exe
       - name: "Smoke: the app shares the screen, a native viewer receives it; the app watches a native sharer"
         shell: bash
         run: |
           PORT=8090 HOST_PASSWORD=ci DIRECT_PORT=3479 node server/server.js &
           sleep 3
-          app=build/windows/Release/ScreenShare.exe
-          cli=build/Release/ss-cli.exe
+          app=build/windows/ScreenShare.exe
+          cli=build/ss-cli.exe
           "$app" --smoke-host http://127.0.0.1:8090 ci 20 host.log &
           appPid=$!
           for i in $(seq 1 80); do grep -q '^CODE' host.log 2>/dev/null && break; sleep 0.25; done
@@ -105,7 +110,7 @@ jobs:
           makensis=$(command -v makensis || echo "/c/Program Files (x86)/NSIS/makensis.exe")
           [ -x "$makensis" ] || { choco install nsis -y --no-progress; makensis="/c/Program Files (x86)/NSIS/makensis.exe"; }
           cd native/windows
-          "$makensis" -V2 -DVERSION=2.0.${{ github.run_number }} -DEXE=../../build/windows/Release/ScreenShare.exe -DOUT=../../ScreenShare-Native-Setup.exe installer.nsi
+          "$makensis" -V2 -DVERSION=2.0.${{ github.run_number }} -DEXE=../../build/windows/ScreenShare.exe -DOUT=../../ScreenShare-Native-Setup.exe installer.nsi
           cd ../..
           ls -la ScreenShare-Native-Setup.exe
           printf '{"version":"2.0.%s","windows":"ScreenShare-Native-Setup.exe"}\n' "${{ github.run_number }}" > native-latest.json

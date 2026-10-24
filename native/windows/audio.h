@@ -1,7 +1,7 @@
 // Sound on Windows. Sharer: everything the computer plays (WASAPI loopback, 5.1 / 7.1 too), as
-// Opus in 5 ms packets, one encoder per channel pair (what the viewers' decoders expect). Viewer:
+// Opus in 2.5 ms packets, one encoder per channel pair (what the viewers' decoders expect). Viewer:
 // the packets are decoded and placed by their timestamps; a small buffer that grows only when the
-// network makes it run dry (10–100 ms), played through WASAPI (downmixed for fewer speakers).
+// network makes it run dry (5–100 ms), played through WASAPI (downmixed for fewer speakers).
 #pragma once
 
 #include <cstdint>

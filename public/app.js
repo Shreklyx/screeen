@@ -2663,7 +2663,7 @@ function onNativeEvent(name, id, info) {
   }
 }
 
-/* ---- sharer: audio (Opus, 5 ms packets; 5.1/7.1 as channel pairs) ---- */
+/* ---- sharer: audio (Opus, 2.5 ms packets – its least delay; 5.1/7.1 as channel pairs) ---- */
 
 function startDirectAudio(track) {
   stopDirectAudio();
@@ -2719,7 +2719,7 @@ function encodeDirectAudio(pipe, data) {
         output: (chunk) => sendDirectAudio(pipe, pair, channels, chunk),
         error: (err) => console.warn('direct audio encoder', err),
       });
-      enc.configure({ codec: 'opus', sampleRate: data.sampleRate, numberOfChannels: ch, bitrate: ch * 128000, opus: { frameDuration: 5000, application: 'lowdelay' } });
+      enc.configure({ codec: 'opus', sampleRate: data.sampleRate, numberOfChannels: ch, bitrate: ch * 128000, opus: { frameDuration: 2500, application: 'lowdelay' } });
       return enc;
     });
     pipe.channels = channels;
