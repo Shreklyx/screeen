@@ -16,8 +16,9 @@
 //  - the computer does not go to sleep while sharing,
 //  - direct mode between two apps: the picture goes without WebRTC, over the app's own
 //    UDP transport (direct.js) – no jitter buffer, the least delay,
-//  - on Windows with an NVIDIA card, direct mode's picture comes from native code
-//    (native/ss-capture.cpp: DXGI capture + NVENC on the GPU) straight to that transport.
+//  - direct mode's picture comes from native code straight to that transport: on Windows with
+//    an NVIDIA card native/ss-capture.cpp (DXGI capture + NVENC), on macOS
+//    native/ss-capture-mac.swift (ScreenCaptureKit + VideoToolbox) – the image stays on the GPU.
 
 const { app, BrowserWindow, Menu, desktopCapturer, dialog, ipcMain, powerSaveBlocker, protocol, screen, session, shell, systemPreferences } = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
@@ -36,9 +37,12 @@ const SYSTEM_AUDIO = IS_WIN || (IS_MAC && Number(os.release().split('.')[0]) >= 
 const AUDIO_HELPER = process.env.SS_AUDIO_HELPER
   || (IS_WIN ? path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, 'native'), 'ss-audio.exe') : '');
 const HAS_AUDIO_HELPER = Boolean(AUDIO_HELPER) && fs.existsSync(AUDIO_HELPER);
-// screen capture + NVENC helper (Windows, NVIDIA): direct mode's picture without the page
+// screen capture + hardware encoding helper: direct mode's picture without the page
 const CAPTURE_HELPER = process.env.SS_CAPTURE_HELPER
-  || (IS_WIN ? path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, 'native'), 'ss-capture.exe') : '');
+  || (IS_WIN || IS_MAC ? path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, 'native'), IS_WIN ? 'ss-capture.exe' : 'ss-capture-mac') : '');
+const NATIVE_ENCODER = IS_MAC
+  ? { encoder: 'VideoToolbox', impl: 'ScreenCaptureKit + VideoToolbox' }
+  : { encoder: 'NVENC', impl: 'DXGI + NVENC' };
 const HAS_CAPTURE_HELPER = Boolean(CAPTURE_HELPER) && fs.existsSync(CAPTURE_HELPER);
 
 /* ------------------------------------------------ the built-in pages */
@@ -547,13 +551,14 @@ async function openDirect(wc, role) {
   return self;
 }
 
-/* ------------------------------------------------ native capture + NVENC (Windows) */
+/* ------------------------------------------------ native capture + hardware encoding */
 
-// When the page shares a whole screen of an NVIDIA card, direct mode's picture comes from
-// native/ss-capture.cpp: DXGI hands over each desktop image the moment Windows composes it,
-// NVENC encodes it on the GPU, and the frames go from here straight to the UDP transport –
-// never through the page. Anything else (a window, another GPU, an error) stays with the
-// page's WebCodecs encoder.
+// When the page shares a whole screen, direct mode's picture comes from native code: on Windows
+// (NVIDIA card) native/ss-capture.cpp – DXGI hands over each desktop image the moment Windows
+// composes it, NVENC encodes it on the GPU; on macOS native/ss-capture-mac.swift –
+// ScreenCaptureKit and VideoToolbox the same way. The frames go from here straight to the UDP
+// transport – never through the page. Anything else (a window, another GPU, an error) stays
+// with the page's WebCodecs encoder.
 let sharedScreen = null; // the screen picked last: { displayId }
 let nativeCapture = null; // { id, proc, wc, frames, bytes, encodeMs, lastKey, keyTimer }
 let nativeSeq = 0;
@@ -599,11 +604,14 @@ function nativeKeyframe() {
 /** Starts the helper on the shared screen; resolves to { id, width, height, fps, adapter } or { error }. */
 function startNativeCapture(wc, opts) {
   stopNativeCapture();
-  const rect = sharedScreenRect();
   if (!HAS_CAPTURE_HELPER) return Promise.resolve({ error: 'unavailable' });
-  if (!rect) return Promise.resolve({ error: 'not-a-screen' });
+  // which screen: macOS by its display id, Windows by its place on the desktop
+  let target = null;
+  if (IS_MAC && sharedScreen) target = /^\d+$/.test(String(sharedScreen.displayId)) ? ['--display', String(sharedScreen.displayId)] : [];
+  else if (!IS_MAC && sharedScreenRect()) target = ['--rect', sharedScreenRect().join(',')];
+  if (!target) return Promise.resolve({ error: 'not-a-screen' });
   const num = (x, min, max) => Math.max(min, Math.min(max, Math.round(Number(x) || 0)));
-  const args = ['--rect', rect.join(','), '--fps', String(num(opts?.fps, 1, 240)), '--bitrate', String(num(opts?.bitrate, 500000, 800000000))];
+  const args = [...target, '--fps', String(num(opts?.fps, 1, 240)), '--bitrate', String(num(opts?.bitrate, 500000, 800000000))];
   if (opts?.width > 0 && opts?.height > 0) args.push('--width', String(num(opts.width, 16, 8192)), '--height', String(num(opts.height, 16, 8192)));
   return new Promise((resolve) => {
     let proc;
@@ -613,7 +621,7 @@ function startNativeCapture(wc, opts) {
       resolve({ error: err.message });
       return;
     }
-    const self = { id: ++nativeSeq, proc, wc, bps: Number(args[5]), frames: 0, bytes: 0, encodeMs: null, lastKey: 0, keyTimer: null, statsTimer: null };
+    const self = { id: ++nativeSeq, proc, wc, bps: Number(args[args.indexOf('--bitrate') + 1]), frames: 0, bytes: 0, encodeMs: null, lastKey: 0, keyTimer: null, statsTimer: null };
     nativeCapture = self;
     let settled = false;
     const settle = (value) => {
@@ -654,7 +662,7 @@ function startNativeCapture(wc, opts) {
           direct.ep.sendMedia({ stream: 0, key: body[0] === 1, ts: Math.round(capture * 1000), capture }, body.subarray(16));
         } else if (tag === 'INF1' && size >= 20) {
           // a new size after a display mode change comes the same way
-          const info = { id: self.id, width: body.readUInt32LE(0), height: body.readUInt32LE(4), fps: body.readUInt32LE(8), adapter: body.toString('utf8', 20) };
+          const info = { id: self.id, width: body.readUInt32LE(0), height: body.readUInt32LE(4), fps: body.readUInt32LE(8), adapter: body.toString('utf8', 20), ...NATIVE_ENCODER };
           if (settled && !wc.isDestroyed()) wc.send('native:event', 'info', self.id, info);
           settle(info);
         } else if (tag === 'ERR1') {
@@ -905,8 +913,9 @@ async function runSmokeTest() {
       })`, true);
       log('audio helper start', JSON.stringify(started));
     }
-    if (IS_WIN) {
-      // the capture + NVENC helper is packaged and runs (a runner has no NVIDIA card: reported, not fatal)
+    if (IS_WIN || IS_MAC) {
+      // the capture + encoding helper is packaged and runs (a runner has no NVIDIA card / may have no
+      // hardware encoder: reported, not fatal)
       if (!HAS_CAPTURE_HELPER) throw new Error(`capture helper missing: ${CAPTURE_HELPER}`);
       const probe = spawnSync(CAPTURE_HELPER, ['--probe'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
       log('capture helper probe', (probe.stdout || '').trim(), `exit ${probe.status}`);
@@ -915,8 +924,10 @@ async function runSmokeTest() {
       } catch {
         throw new Error(`capture helper did not run: ${probe.error?.message || probe.stderr || probe.status}`);
       }
-      const grab = spawnSync(CAPTURE_HELPER, ['--probe-capture'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
-      log('capture helper grab', (grab.stdout || '').trim(), `exit ${grab.status}`);
+      if (IS_WIN) {
+        const grab = spawnSync(CAPTURE_HELPER, ['--probe-capture'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+        log('capture helper grab', (grab.stdout || '').trim(), `exit ${grab.status}`);
+      }
     }
     // direct mode: two endpoints in this process exchange a frame (UDP, X25519, AES-GCM)
     const loop = await directSelfTest();

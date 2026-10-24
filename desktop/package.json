@@ -89,6 +89,12 @@
         }
       ],
       "icon": "build/icon.png",
+      "extraResources": [
+        {
+          "from": "native/ss-capture-mac-${arch}",
+          "to": "ss-capture-mac"
+        }
+      ],
       "category": "public.app-category.video",
       "identity": "-",
       "hardenedRuntime": false,

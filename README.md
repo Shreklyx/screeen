@@ -225,6 +225,11 @@ lehető legrövidebb úton:
   egyenesen az UDP-re mennek – az oldalt nem is érintik. A nézőlistában: *H.264 · NVENC (natív)*. Ablak megosztásánál,
   ha a képernyő nem az NVIDIA kártyán van (pl. laptop belső kijelzője Intel-lel), régi illesztőprogramnál vagy bármilyen
   hibánál magától a WebCodecs kódoló veszi át;
+- **Macen ugyanígy natív kód** (`desktop/native/ss-capture-mac.swift`, macOS 12.3+): a **ScreenCaptureKit** a
+  kirajzolás pillanatában adja a képet, már a küldött méretre méretezve és YUV-ra alakítva a GPU-n, a **VideoToolbox**
+  ezt a felületet közvetlenül kódolja a hardveres kódolón (alacsony késleltetésű sebességszabályozás, B-kocka nélkül,
+  kulcskocka csak kérésre). A nézőlistában: *H.264 · VideoToolbox (natív)*. Ablak megosztásánál vagy hibánál itt is a
+  WebCodecs kódoló dolgozik;
 - a képkockák ~1,1 KB-os UDP-csomagokban mennek, AES-GCM titkosítással (a kulcsot a két alkalmazás X25519-cel
   egyezteti, a szerver sem látja a képet), a küldés gyors és csak enyhén tagolt (a célbitráta 3-szorosával);
 - a néző **puffer nélkül** dolgozik: minden teljes képkockát azonnal dekódol, és egy alacsony késleltetésű
@@ -280,7 +285,9 @@ Windows és Mac gépen építi és teszteli minden változásnál; kézzel: `npm
 `desktop/native/build.sh` MinGW-vel, vagy Visual Studio parancssorban
 `cl /std:c++17 /O2 /EHsc /MT /Fe:desktop\native\ss-audio.exe desktop\native\ss-audio.cpp ole32.lib avrt.lib winmm.lib` és
 `cl /std:c++17 /O2 /EHsc /MT /Fe:desktop\native\ss-capture.exe desktop\native\ss-capture.cpp d3d11.lib dxgi.lib avrt.lib user32.lib`) vagy
-`npm run dist:mac --prefix desktop` (Macen).
+`npm run dist:mac --prefix desktop` (Macen, előtte a natív képrögzítő architektúránként:
+`cd desktop/native && xcrun swiftc -O -target arm64-apple-macos12.3 -o ss-capture-mac-arm64 ss-capture-mac.swift`, és
+ugyanez `x86_64-apple-macos12.3` / `ss-capture-mac-x64` – az univerzális alkalmazás mindkettőt egybefűzi).
 
 ## Fejlesztés
 
@@ -306,6 +313,7 @@ A képernyőmegosztás csak HTTPS-en vagy `localhost`-on működik. TURN relé n
   címfelderítés és relé, csak a munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része
   (WebCodecs kódolás/dekódolás, kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet),
   `public/direct-web.js` (ugyanez a böngészőben: WebCrypto + WebSocket a szerveren át),
+  `desktop/native/ss-capture-mac.swift` (macOS: ScreenCaptureKit + VideoToolbox),
   `desktop/native/ss-capture.cpp` (Windows: DXGI képrögzítés + NVENC; az NVIDIA Video Codec SDK 11.1 API-fejléce a
   `third_party/` mappában, MIT licenc – a futáshoz csak az NVIDIA illesztőprogram kell).
 - `docker-compose.yml` – `app` (Node), `caddy` (HTTPS, beállítás: `deploy/caddy/Caddyfile`), `turn` (coturn, host

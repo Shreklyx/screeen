@@ -1,7 +1,7 @@
-# Builds the Windows and macOS desktop app (on Windows also the 5.1/7.1 audio
-# helper), tests that it starts (and on Windows that screen capture and the
-# helper work), and publishes the installers to the "desktop-latest" release
-# that the website links to.
+# Builds the Windows and macOS desktop app with its native helpers (Windows: 5.1/7.1
+# audio, DXGI + NVENC capture; macOS: ScreenCaptureKit + VideoToolbox capture),
+# tests that it starts (and that screen capture and the helpers run), and publishes
+# the installers to the "desktop-latest" release that the website links to.
 name: Desktop app
 
 on:
@@ -61,6 +61,17 @@ jobs:
           cl /nologo /std:c++17 /O2 /EHsc /W3 /MT /Fo:desktop\native\ /Fe:desktop\native\ss-audio.exe desktop\native\ss-audio.cpp ole32.lib avrt.lib winmm.lib || exit /b 1
           cl /nologo /std:c++17 /O2 /EHsc /W3 /MT /Fo:desktop\native\ /Fe:desktop\native\ss-capture.exe desktop\native\ss-capture.cpp d3d11.lib dxgi.lib avrt.lib user32.lib || exit /b 1
 
+      # ss-capture-mac: screen capture + VideoToolbox for direct mode, one per architecture
+      # (the universal app gets both, joined)
+      - name: Build the native helper (macOS)
+        if: runner.os == 'macOS'
+        working-directory: desktop/native
+        run: |
+          xcrun swiftc --version
+          xcrun swiftc -O -target arm64-apple-macos12.3 -o ss-capture-mac-arm64 ss-capture-mac.swift
+          xcrun swiftc -O -target x86_64-apple-macos12.3 -o ss-capture-mac-x64 ss-capture-mac.swift
+          lipo -info ss-capture-mac-arm64 ss-capture-mac-x64
+
       # every build gets a higher version: the installed apps update themselves to it (updates.js)
       - name: Build
         working-directory: desktop
@@ -72,7 +83,11 @@ jobs:
         run: |
           ls -la desktop/dist
           if [ "$RUNNER_OS" = Windows ]; then test -f desktop/dist/latest.yml && cat desktop/dist/latest.yml; fi
-          if [ "$RUNNER_OS" = macOS ]; then test -f desktop/dist/latest-mac.yml && cat desktop/dist/latest-mac.yml; fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            test -f desktop/dist/latest-mac.yml && cat desktop/dist/latest-mac.yml
+            # the capture helper is in the app, for both architectures
+            lipo -info "desktop/dist/mac-universal/Screen Share.app/Contents/Resources/ss-capture-mac" | tee /dev/stderr | grep -Eq "x86_64 arm64|arm64 x86_64"
+          fi
 
       - name: "Smoke test (app starts, loads the site; on Windows also screen capture and the audio helper)"
         shell: bash

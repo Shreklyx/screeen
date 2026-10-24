@@ -2595,9 +2595,9 @@ function adaptDirectSize(pipe) {
   }
 }
 
-/* ---- sharer: video from native code (Windows + NVIDIA) ---- */
-// A whole screen on an NVIDIA card: the app captures it itself (DXGI, the moment Windows
-// composes a new image), NVENC encodes it on the GPU and the app sends the frames – they never
+/* ---- sharer: video from native code (Windows + NVIDIA, macOS) ---- */
+// A whole screen: the app captures it itself (DXGI / ScreenCaptureKit, the moment a new image is
+// composed), the GPU encodes it (NVENC / VideoToolbox) and the app sends the frames – they never
 // pass through this page. Anything else, or an error, stays with the WebCodecs encoder above.
 
 const NATIVE = APP?.nativeCapture || null;
@@ -2635,7 +2635,7 @@ async function startNativeVideo() {
     updateDirectPipelines();
     return;
   }
-  Object.assign(n, { id: res.id, width: res.width, height: res.height, fps: res.fps, adapter: res.adapter });
+  Object.assign(n, { id: res.id, width: res.width, height: res.height, fps: res.fps, adapter: res.adapter, encoder: res.encoder, impl: res.impl });
   direct.hw = true;
   renderViewers();
 }
@@ -2756,8 +2756,8 @@ function directStats(v) {
     kbps: r?.kbps ?? null,
     codec: 'H264',
     hw: n ? true : direct.hw,
-    encoder: n ? 'NVENC (natív)' : null,
-    impl: n ? `natív: DXGI + NVENC · ${n.adapter}` : 'WebCodecs',
+    encoder: n ? `${n.encoder || 'NVENC'} (natív)` : null,
+    impl: n ? `natív: ${n.impl || 'DXGI + NVENC'} · ${n.adapter}` : 'WebCodecs',
     encodeMs: n ? n.stats?.encodeMs ?? null : direct.video?.encodeMs ?? null,
     limit: null,
     rtt: r?.rtt ?? d.rtt,
