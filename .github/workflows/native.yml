@@ -195,6 +195,7 @@ jobs:
             else {
               if (!host.width) problems.push('the app captured nothing: ' + host.error);
               if (!(got.frames > 10 && got.firstKey)) problems.push('the native viewer got too few frames from the app');
+              if (host.audioBuffers > 0 && !(got.audio > 100)) problems.push('the system sound did not reach the native viewer: ' + host.audioNote);
             }
             if (problems.length) { console.error(problems.join('\n')); process.exit(1); }
           "
