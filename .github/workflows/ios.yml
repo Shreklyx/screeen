@@ -81,11 +81,12 @@ jobs:
         with:
           name: screenshare-iOS
           path: out
+      # Only the asset is replaced; the release itself (name, notes, commit) belongs to the
+      # desktop workflow. Updating the release from here was refused (403 on update-a-release).
       - name: Add the IPA to the "desktop-latest" release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: desktop-latest
-          files: out/ScreenShare-iOS.ipa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload desktop-latest out/ScreenShare-iOS.ipa --clobber --repo "$GITHUB_REPOSITORY"
 
   # TestFlight: only when the Apple Developer account's App Store Connect API key is set up
   testflight-setup:
