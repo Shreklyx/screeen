@@ -106,7 +106,10 @@ final class Host: NSObject {
     func stop() {
         let sent = DispatchSemaphore(value: 0)
         queue.async {
-            guard !self.stopped, self.socket != nil else { return sent.signal() }
+            guard !self.stopped, self.socket != nil else {
+                sent.signal()
+                return
+            }
             self.send(["t": "close"]) { sent.signal() }
         }
         _ = sent.wait(timeout: .now() + 1)
