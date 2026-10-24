@@ -59,6 +59,10 @@
         {
           "from": "native/ss-audio.exe",
           "to": "ss-audio.exe"
+        },
+        {
+          "from": "native/ss-capture.exe",
+          "to": "ss-capture.exe"
         }
       ]
     },

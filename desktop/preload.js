@@ -60,4 +60,15 @@ contextBridge.exposeInMainWorld('screenshareApp', {
       ipcRenderer.on('direct:media', (_e, meta, data) => cb(meta, data));
     },
   },
+  // direct mode's picture from native code (Windows + NVIDIA: DXGI capture, NVENC), sent by the app itself
+  nativeCapture: process.argv.includes('--ss-native-capture')
+    ? {
+      start: (opts) => ipcRenderer.invoke('native:start', opts),
+      stop: (id) => ipcRenderer.send('native:stop', Number(id)),
+      onEvent: (cb) => {
+        ipcRenderer.removeAllListeners('native:event');
+        ipcRenderer.on('native:event', (_e, name, id, info) => cb(name, id, info));
+      },
+    }
+    : null,
 });

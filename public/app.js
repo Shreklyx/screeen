@@ -1219,6 +1219,7 @@ function setHostTracks({ video, audio, audio8 = null, stopSurround = null, surro
   if (oldStopSurround && oldStopSurround !== stopSurround) oldStopSurround();
 
   direct.forceKey = true;
+  direct.nativeOff = null; // a new share: native capture may work for it
   updateDirectPipelines();
 
   host.dims = '';
@@ -1401,6 +1402,7 @@ function updateSetting(key, value) {
     return;
   }
   if (key === 'kbps' && direct.kbps) direct.kbps = Math.min(direct.kbps, directTargetKbps());
+  if ((key === 'res' || key === 'fps') && direct.native) updateDirectPipelines(); // the native encoder starts again at the new size
   applyAllSenders();
   updateCaptureInfo();
 }
@@ -1456,8 +1458,8 @@ async function hostStatsTick() {
     if (v.direct) {
       v.stats = directStats(v);
       if (v.stats && host.tick % 2 === 0) {
-        const { encodeMs, hw } = v.stats;
-        host.signal?.send({ t: 'signal', to: v.id, data: { type: 'stats', session: v.session, encodeMs, hw, encoder: hw ? gpu.encoderName : null, codec: 'H264' } });
+        const { encodeMs, hw, encoder } = v.stats;
+        host.signal?.send({ t: 'signal', to: v.id, data: { type: 'stats', session: v.session, encodeMs, hw, encoder: hw ? encoder || gpu.encoderName : null, codec: 'H264' } });
       }
       continue;
     }
@@ -1574,7 +1576,7 @@ function renderViewers() {
       const stats = document.createElement('div');
       stats.className = 'viewer-stats';
       const codec = CODEC_LABEL[s.codec] || s.codec || CODEC_LABEL[v.codec] || '';
-      const enc = s.hw === true ? ` · ${gpu.encoderName}` : s.hw === false ? ' · szoftveres' : '';
+      const enc = s.hw === true ? ` · ${s.encoder || gpu.encoderName}` : s.hw === false ? ' · szoftveres' : '';
       const line1 = document.createElement('div');
       line1.textContent = `${s.w || '?'}×${s.h || '?'} · ${s.fps != null ? Math.round(s.fps) : '–'} FPS · ${fmtKbps(s.kbps)}`;
       const line2 = document.createElement('div');
@@ -2244,6 +2246,8 @@ const direct = {
   lastCut: 0,
   lastRaise: 0,
   hw: null,
+  native: null, // the native capture + NVENC (Windows, NVIDIA) while it runs
+  nativeOff: null, // why it is not used for this share
 };
 
 const directOn = () => Boolean(DIRECT);
@@ -2392,10 +2396,17 @@ function updateDirectPipelines() {
   if (!DIRECT) return;
   if (!isLive() || !directViewers().length) {
     stopDirectVideo();
+    stopNativeVideo();
     stopDirectAudio();
     return;
   }
-  if (direct.video?.track !== host.video) startDirectVideo(host.video);
+  if (nativeWanted()) {
+    stopDirectVideo();
+    startNativeVideo();
+  } else {
+    stopNativeVideo();
+    if (direct.video?.track !== host.video) startDirectVideo(host.video);
+  }
   const audio = settings.audio ? host.audio8 || host.audio : null;
   if ((direct.audio?.track || null) !== (audio || null)) startDirectAudio(audio);
 }
@@ -2578,6 +2589,74 @@ function adaptDirectSize(pipe) {
   }
 }
 
+/* ---- sharer: video from native code (Windows + NVIDIA) ---- */
+// A whole screen on an NVIDIA card: the app captures it itself (DXGI, the moment Windows
+// composes a new image), NVENC encodes it on the GPU and the app sends the frames – they never
+// pass through this page. Anything else, or an error, stays with the WebCodecs encoder above.
+
+const NATIVE = APP?.nativeCapture || null;
+
+const nativeWanted = () => Boolean(NATIVE) && !direct.nativeOff && host.video?.readyState === 'live'
+  && host.video.getSettings().displaySurface === 'monitor';
+
+function nativeConfig() {
+  const target = RES_TARGETS[settings.res === 'auto' ? HW_TARGET.res : settings.res]; // null: the screen's own size
+  return {
+    width: target?.[0] || 0,
+    height: target?.[1] || 0,
+    fps: settings.fps === 'auto' ? HW_TARGET.fps : settings.fps,
+    bitrate: Math.round((direct.kbps || directTargetKbps()) * 1000),
+  };
+}
+
+async function startNativeVideo() {
+  const config = nativeConfig();
+  const key = `${config.width}x${config.height}@${config.fps}`;
+  if (direct.native && direct.native.key === key && direct.native.track === host.video) return;
+  stopNativeVideo();
+  const n = { key, track: host.video, id: null, width: null, height: null, fps: null, adapter: '', stats: null };
+  direct.native = n;
+  const res = await NATIVE.start(config).catch((err) => ({ error: err.message }));
+  if (direct.native !== n) {
+    if (res?.id) NATIVE.stop(res.id);
+    return;
+  }
+  if (!res || res.error) {
+    // not this screen / no NVIDIA / old driver: the page's encoder
+    console.info('native capture not used:', res?.error);
+    direct.native = null;
+    direct.nativeOff = res?.error || 'failed';
+    updateDirectPipelines();
+    return;
+  }
+  Object.assign(n, { id: res.id, width: res.width, height: res.height, fps: res.fps, adapter: res.adapter });
+  direct.hw = true;
+  renderViewers();
+}
+
+function stopNativeVideo() {
+  const n = direct.native;
+  if (!n) return;
+  direct.native = null;
+  if (n.id) NATIVE.stop(n.id);
+}
+
+function onNativeEvent(name, id, info) {
+  const n = direct.native;
+  if (!n || n.id !== id) return;
+  if (name === 'stats') {
+    n.stats = info;
+  } else if (name === 'info') {
+    Object.assign(n, { width: info.width, height: info.height });
+  } else if (name === 'ended') {
+    console.warn('native capture ended:', info);
+    direct.native = null;
+    direct.nativeOff = info || 'ended';
+    updateDirectPipelines();
+    renderViewers();
+  }
+}
+
 /* ---- sharer: audio (Opus, 5 ms packets; 5.1/7.1 as channel pairs) ---- */
 
 function startDirectAudio(track) {
@@ -2662,16 +2741,18 @@ function directStats(v) {
   const d = v.direct;
   if (d.state !== 'connected') return null;
   const r = d.report;
-  const cfg = direct.video?.config;
+  const n = direct.native?.id ? direct.native : null;
+  const cfg = n || direct.video?.config;
   return {
     w: cfg?.width,
     h: cfg?.height,
     fps: r?.fps ?? null,
     kbps: r?.kbps ?? null,
     codec: 'H264',
-    hw: direct.hw,
-    impl: 'WebCodecs',
-    encodeMs: direct.video?.encodeMs ?? null,
+    hw: n ? true : direct.hw,
+    encoder: n ? 'NVENC (natív)' : null,
+    impl: n ? `natív: DXGI + NVENC · ${n.adapter}` : 'WebCodecs',
+    encodeMs: n ? n.stats?.encodeMs ?? null : direct.video?.encodeMs ?? null,
     limit: null,
     rtt: r?.rtt ?? d.rtt,
     relay: d.path === 'relay',
@@ -3040,6 +3121,7 @@ function init() {
   initAppChrome();
   DIRECT?.onEvent(onDirectEvent);
   DIRECT?.onMedia(onDirectMedia);
+  NATIVE?.onEvent(onNativeEvent);
   initHostUi();
   initViewerUi();
 

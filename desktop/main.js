@@ -15,7 +15,9 @@
 //    running next to it cannot starve them),
 //  - the computer does not go to sleep while sharing,
 //  - direct mode between two apps: the picture goes without WebRTC, over the app's own
-//    UDP transport (direct.js) – no jitter buffer, the least delay.
+//    UDP transport (direct.js) – no jitter buffer, the least delay,
+//  - on Windows with an NVIDIA card, direct mode's picture comes from native code
+//    (native/ss-capture.cpp: DXGI capture + NVENC on the GPU) straight to that transport.
 
 const { app, BrowserWindow, Menu, desktopCapturer, dialog, ipcMain, powerSaveBlocker, protocol, screen, session, shell, systemPreferences } = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
@@ -34,6 +36,10 @@ const SYSTEM_AUDIO = IS_WIN || (IS_MAC && Number(os.release().split('.')[0]) >= 
 const AUDIO_HELPER = process.env.SS_AUDIO_HELPER
   || (IS_WIN ? path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, 'native'), 'ss-audio.exe') : '');
 const HAS_AUDIO_HELPER = Boolean(AUDIO_HELPER) && fs.existsSync(AUDIO_HELPER);
+// screen capture + NVENC helper (Windows, NVIDIA): direct mode's picture without the page
+const CAPTURE_HELPER = process.env.SS_CAPTURE_HELPER
+  || (IS_WIN ? path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, 'native'), 'ss-capture.exe') : '');
+const HAS_CAPTURE_HELPER = Boolean(CAPTURE_HELPER) && fs.existsSync(CAPTURE_HELPER);
 
 /* ------------------------------------------------ the built-in pages */
 
@@ -203,7 +209,12 @@ function createMainWindow() {
       nodeIntegration: false,
       backgroundThrottling: false,
       spellcheck: false,
-      additionalArguments: [`--ss-version=${app.getVersion()}`, ...(HAS_AUDIO_HELPER ? ['--ss-surround'] : []), ...(updatesSupported() ? ['--ss-updates'] : [])],
+      additionalArguments: [
+        `--ss-version=${app.getVersion()}`,
+        ...(HAS_AUDIO_HELPER ? ['--ss-surround'] : []),
+        ...(HAS_CAPTURE_HELPER ? ['--ss-native-capture'] : []),
+        ...(updatesSupported() ? ['--ss-updates'] : []),
+      ],
     },
   });
 
@@ -383,6 +394,8 @@ function setupDisplayMedia(ses) {
         source = sources.find((s) => s.id === choice.id);
       }
       if (!source) return callback(null);
+      // a whole screen can also be captured natively (direct mode, see startNativeCapture)
+      sharedScreen = source.id.startsWith('screen:') ? { displayId: source.display_id } : null;
       const streams = { video: source };
       if (process.env.SS_DEBUG) console.log('display media:', JSON.stringify({ choice, source: source.id, audioRequested: request.audioRequested }));
       // The whole system sound ("loopback"). macOS asks once for "System Audio Recording";
@@ -502,6 +515,7 @@ function startAudioHelper(wc) {
 let direct = null; // { ep, role, wc }
 
 function stopDirect() {
+  stopNativeCapture();
   direct?.ep.close();
   direct = null;
 }
@@ -524,10 +538,137 @@ async function openDirect(wc, role) {
   for (const name of ['state', 'keyframe', 'report', 'clock', 'stats']) {
     ep.on(name, (...args) => { if (live()) wc.send('direct:event', name, ...args); });
   }
+  // the native encoder answers keyframe requests itself, and gives a new viewer one at once
+  ep.on('keyframe', () => { if (live()) nativeKeyframe(); });
+  ep.on('state', (id, s) => { if (live() && s?.state === 'connected') nativeKeyframe(); });
   ep.on('media', (meta, data) => { if (live()) wc.send('direct:media', meta, data); });
   ep.on('log', (line) => { if (process.env.SS_DEBUG) console.log(line); });
   await ep.open();
   return self;
+}
+
+/* ------------------------------------------------ native capture + NVENC (Windows) */
+
+// When the page shares a whole screen of an NVIDIA card, direct mode's picture comes from
+// native/ss-capture.cpp: DXGI hands over each desktop image the moment Windows composes it,
+// NVENC encodes it on the GPU, and the frames go from here straight to the UDP transport –
+// never through the page. Anything else (a window, another GPU, an error) stays with the
+// page's WebCodecs encoder.
+let sharedScreen = null; // the screen picked last: { displayId }
+let nativeCapture = null; // { id, proc, wc, frames, bytes, encodeMs, lastKey, keyTimer }
+let nativeSeq = 0;
+
+/** The picked screen in physical pixels [left, top, right, bottom] (what DXGI calls it). */
+function sharedScreenRect() {
+  if (!sharedScreen) return null;
+  const displays = screen.getAllDisplays();
+  const d = displays.find((x) => String(x.id) === String(sharedScreen.displayId)) || (displays.length === 1 ? displays[0] : null);
+  if (!d) return null;
+  const r = IS_WIN ? screen.dipToScreenRect(null, d.bounds) : d.bounds;
+  return [r.x, r.y, r.x + r.width, r.y + r.height].map(Math.round);
+}
+
+function stopNativeCapture(id) {
+  const n = nativeCapture;
+  if (!n || (id != null && n.id !== id)) return;
+  nativeCapture = null;
+  clearTimeout(n.keyTimer);
+  clearInterval(n.statsTimer);
+  n.proc.stdin.end(); // the helper exits when its stdin closes
+  setTimeout(() => {
+    if (n.proc.exitCode == null && n.proc.signalCode == null) n.proc.kill();
+  }, 1000);
+}
+
+function nativeCommand(line) {
+  if (nativeCapture && !nativeCapture.proc.stdin.destroyed) nativeCapture.proc.stdin.write(`${line}\n`);
+}
+
+// at most 4 keyframes a second (each is big), and a request in between is served after
+function nativeKeyframe() {
+  const n = nativeCapture;
+  if (!n || n.keyTimer) return;
+  const wait = Math.max(0, n.lastKey + 250 - Date.now());
+  n.keyTimer = setTimeout(() => {
+    n.keyTimer = null;
+    n.lastKey = Date.now();
+    if (nativeCapture === n) nativeCommand('K');
+  }, wait);
+}
+
+/** Starts the helper on the shared screen; resolves to { id, width, height, fps, adapter } or { error }. */
+function startNativeCapture(wc, opts) {
+  stopNativeCapture();
+  const rect = sharedScreenRect();
+  if (!HAS_CAPTURE_HELPER) return Promise.resolve({ error: 'unavailable' });
+  if (!rect) return Promise.resolve({ error: 'not-a-screen' });
+  const num = (x, min, max) => Math.max(min, Math.min(max, Math.round(Number(x) || 0)));
+  const args = ['--rect', rect.join(','), '--fps', String(num(opts?.fps, 1, 240)), '--bitrate', String(num(opts?.bitrate, 500000, 800000000))];
+  if (opts?.width > 0 && opts?.height > 0) args.push('--width', String(num(opts.width, 16, 8192)), '--height', String(num(opts.height, 16, 8192)));
+  return new Promise((resolve) => {
+    let proc;
+    try {
+      proc = spawn(CAPTURE_HELPER, args, { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+    } catch (err) {
+      resolve({ error: err.message });
+      return;
+    }
+    const self = { id: ++nativeSeq, proc, wc, bps: Number(args[5]), frames: 0, bytes: 0, encodeMs: null, lastKey: 0, keyTimer: null, statsTimer: null };
+    nativeCapture = self;
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (value.error) stopNativeCapture(self.id);
+      resolve(value);
+    };
+    // the end of a running capture (error, or the helper is gone): the page takes over again
+    const ended = (why) => {
+      if (!settled) return settle({ error: why });
+      if (nativeCapture !== self) return;
+      stopNativeCapture(self.id);
+      if (!wc.isDestroyed()) wc.send('native:event', 'ended', self.id, why);
+    };
+    const timer = setTimeout(() => settle({ error: 'timeout' }), 8000);
+    proc.on('error', (err) => ended(err.message));
+    proc.on('exit', () => ended('exited'));
+    proc.stdin.on('error', () => {}); // already gone
+    let pending = Buffer.alloc(0);
+    proc.stdout.on('data', (chunk) => {
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      while (pending.length >= 8) {
+        const size = pending.readUInt32LE(4);
+        if (pending.length < 8 + size) break;
+        const tag = pending.toString('latin1', 0, 4);
+        const body = pending.subarray(8, 8 + size);
+        pending = pending.subarray(8 + size);
+        if (nativeCapture !== self) continue;
+        if (tag === 'VID1' && size > 16) {
+          if (direct?.role !== 'host' || direct.wc !== wc) continue;
+          const capture = body.readDoubleLE(8);
+          const ms = body.readUInt32LE(4) / 1000;
+          self.encodeMs = self.encodeMs == null ? ms : self.encodeMs * 0.9 + ms * 0.1;
+          self.frames++;
+          self.bytes += size - 16;
+          direct.ep.sendMedia({ stream: 0, key: body[0] === 1, ts: Math.round(capture * 1000), capture }, body.subarray(16));
+        } else if (tag === 'INF1' && size >= 20) {
+          // a new size after a display mode change comes the same way
+          const info = { id: self.id, width: body.readUInt32LE(0), height: body.readUInt32LE(4), fps: body.readUInt32LE(8), adapter: body.toString('utf8', 20) };
+          if (settled && !wc.isDestroyed()) wc.send('native:event', 'info', self.id, info);
+          settle(info);
+        } else if (tag === 'ERR1') {
+          ended(body.toString('utf8'));
+        }
+      }
+    });
+    self.statsTimer = setInterval(() => {
+      if (nativeCapture !== self || wc.isDestroyed()) return;
+      wc.send('native:event', 'stats', self.id, { fps: self.frames, kbps: Math.round((self.bytes * 8) / 1000), encodeMs: self.encodeMs });
+      self.frames = 0;
+      self.bytes = 0;
+    }, 1000);
+  });
 }
 
 /* ------------------------------------------------ updates (updates.js) */
@@ -600,7 +741,19 @@ function setupIpc() {
   ipcMain.on('direct:remove', (e, id) => { if (direct?.wc === e.sender) direct.ep.removePeer(String(id)); });
   ipcMain.on('direct:send', (e, meta, data) => { if (direct?.wc === e.sender && direct.role === 'host' && meta && data) direct.ep.sendMedia(meta, data); });
   ipcMain.on('direct:keyframe', (e) => { if (direct?.wc === e.sender && direct.role === 'viewer') direct.ep.keyframe('host'); });
-  ipcMain.on('direct:bitrate', (e, bps) => { if (direct?.wc === e.sender && direct.role === 'host') direct.ep.setBitrate(Number(bps)); });
+  ipcMain.on('direct:bitrate', (e, bps) => {
+    if (direct?.wc !== e.sender || direct.role !== 'host' || !(Number(bps) > 0)) return;
+    direct.ep.setBitrate(Number(bps));
+    if (nativeCapture?.wc === e.sender && nativeCapture.bps !== Math.round(Number(bps))) {
+      nativeCapture.bps = Math.round(Number(bps));
+      nativeCommand(`B ${nativeCapture.bps}`);
+    }
+  });
+  ipcMain.handle('native:start', (e, opts) => {
+    if (direct?.wc !== e.sender || direct.role !== 'host' || !isAppPage(e.senderFrame?.url)) return { error: 'unavailable' };
+    return startNativeCapture(e.sender, opts);
+  });
+  ipcMain.on('native:stop', (e, id) => { if (nativeCapture?.wc === e.sender) stopNativeCapture(Number(id)); });
   ipcMain.on('direct:stop', (e) => { if (direct?.wc === e.sender) stopDirect(); });
   ipcMain.handle('update:state', (e) => (isAppPage(e.senderFrame?.url) && updater ? { ...updater.state } : null));
   ipcMain.on('update:check', (e) => { if (isAppPage(e.senderFrame?.url)) checkForUpdates(); });
@@ -751,6 +904,19 @@ async function runSmokeTest() {
         return r;
       })`, true);
       log('audio helper start', JSON.stringify(started));
+    }
+    if (IS_WIN) {
+      // the capture + NVENC helper is packaged and runs (a runner has no NVIDIA card: reported, not fatal)
+      if (!HAS_CAPTURE_HELPER) throw new Error(`capture helper missing: ${CAPTURE_HELPER}`);
+      const probe = spawnSync(CAPTURE_HELPER, ['--probe'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+      log('capture helper probe', (probe.stdout || '').trim(), `exit ${probe.status}`);
+      try {
+        JSON.parse(probe.stdout);
+      } catch {
+        throw new Error(`capture helper did not run: ${probe.error?.message || probe.stderr || probe.status}`);
+      }
+      const grab = spawnSync(CAPTURE_HELPER, ['--probe-capture'], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+      log('capture helper grab', (grab.stdout || '').trim(), `exit ${grab.status}`);
     }
     // direct mode: two endpoints in this process exchange a frame (UDP, X25519, AES-GCM)
     const loop = await directSelfTest();

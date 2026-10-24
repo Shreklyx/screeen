@@ -215,6 +215,14 @@ Ha a megosztó és a néző is az asztali alkalmazást használja, a kép a lehe
 
 - a megosztó gép **egyszer** kódol (H.264, a videókártyán – WebCodecs, „realtime” mód) minden alkalmazásos nézőnek,
   és ha a kódoló épp dolgozik, a következő képkockát kihagyja ahelyett, hogy sorba állna (a sor csak késés);
+- **Windowson, NVIDIA kártyával, teljes képernyő megosztásakor natív kód** dolgozik (`desktop/native/ss-capture.cpp`):
+  a DXGI Desktop Duplication abban a pillanatban adja át az új képet, amikor a Windows összeállította (nem fix
+  ütemben kérdez, mint a böngésző), a kép a videókártyán marad (az egérmutató berajzolva, a méretezés egyetlen
+  GPU-rajzolás), az **NVENC közvetlenül ezt a textúrát kódolja** (P1, „ultra low latency”, B-kocka és előretekintés
+  nélkül, CBR kétképkockás pufferrel, kulcskocka csak kérésre), és a kódolt képkockák a megosztó alkalmazásból
+  egyenesen az UDP-re mennek – az oldalt nem is érintik. A nézőlistában: *H.264 · NVENC (natív)*. Ablak megosztásánál,
+  ha a képernyő nem az NVIDIA kártyán van (pl. laptop belső kijelzője Intel-lel), régi illesztőprogramnál vagy bármilyen
+  hibánál magától a WebCodecs kódoló veszi át;
 - a képkockák ~1,1 KB-os UDP-csomagokban mennek, AES-GCM titkosítással (a kulcsot a két alkalmazás X25519-cel
   egyezteti, a szerver sem látja a képet), a küldés gyors és csak enyhén tagolt (a célbitráta 3-szorosával);
 - a néző **puffer nélkül** dolgozik: minden teljes képkockát azonnal dekódol, és egy alacsony késleltetésű
@@ -224,15 +232,16 @@ Ha a megosztó és a néző is az asztali alkalmazást használja, a kép a lehe
 - a hang Opus, 5 ms-os csomagokban, 5.1/7.1 is (csatornapáronként); a néző csak 10–100 ms hangpuffert tart, amennyit a
   hálózat éppen kíván;
 - kapcsolat: a két alkalmazás a szerver UDP-portján (**3479**) megtudja a saját nyilvános címét, és közvetlenül
-  egymásnak küld (helyi hálózaton a helyi címen); ha ez nem megy, a szerver továbbítja a (titkosított) csomagokat;
-  ha egyáltalán nem jön létre a kapcsolat, magától **WebRTC-re vált**;
+  egymásnak küld (helyi hálózaton a helyi címen); ha ez nem megy, a szerver továbbítja a (titkosított) csomagokat
+  (3479/udp, vagy a TURN szerveren át); ha semmilyen UDP nem jut át (szigorú tűzfal), a szerver HTTPS-portján,
+  WebSocketben mennek. Két alkalmazás között **nincs WebRTC**: ha a kapcsolat megszakad, újra felépül;
 - a bitrátát a néző jelentései szabályozzák (csomagvesztés, kihagyott kép, növekvő RTT → kevesebb; ha minden rendben,
   lassan több); szoftveres kódolásnál, ha a kódoló nem bírja a tempót, kisebb felbontásra vált.
 
 A néző statisztikájában (**S**) a *Mód* sorban: *Közvetlen*, a *Késés (mért)* a valódi, végponttól végpontig mért
 késés (a megosztó gépen a rögzítéstől a néző vásznára rajzolásig, a két gép órájának eltérésével korrigálva).
-A megosztó *Beállítások* → **Kapcsolat alkalmazásos nézőkkel**: *Közvetlen* (alap) vagy *WebRTC*. A néző
-„Simább” / „Stabil” pufferrel WebRTC-re vált (a közvetlen módban nincs puffer), „Minimális”-ra visszaállva vissza.
+Böngészős és telefonos nézők WebRTC-t kapnak (a böngésző mást nem tud); a megosztó nézőlistájában látszik, ki
+melyiket kapja és miért.
 
 Windowson az első közvetlen kapcsolatnál a Windows tűzfal rákérdezhet a Screen Share-re: engedélyezd (enélkül is
 működik, de a helyi hálózaton a közvetlen út biztosabb). A szerveren a telepítő megnyitja a **3479/udp** portot; ha a
@@ -258,8 +267,10 @@ beépített oldaláról kapcsolódik (`app://screenshare`) – ehhez a szerveren
 
 A `desktop/` mappában van (Electron). Az installereket a GitHub Actions (`.github/workflows/desktop.yml`)
 Windows és Mac gépen építi és teszteli minden változásnál; kézzel: `npm ci --prefix desktop`, majd
-`npm run dist:win --prefix desktop` (Windowson, előtte a 7.1 segédprogram: `desktop/native/build.sh` MinGW-vel, vagy
-Visual Studio parancssorban `cl /std:c++17 /O2 /EHsc /MT /Fe:desktop\native\ss-audio.exe desktop\native\ss-audio.cpp ole32.lib avrt.lib winmm.lib`) vagy
+`npm run dist:win --prefix desktop` (Windowson, előtte a két segédprogram – 7.1 hang és natív képrögzítés/NVENC:
+`desktop/native/build.sh` MinGW-vel, vagy Visual Studio parancssorban
+`cl /std:c++17 /O2 /EHsc /MT /Fe:desktop\native\ss-audio.exe desktop\native\ss-audio.cpp ole32.lib avrt.lib winmm.lib` és
+`cl /std:c++17 /O2 /EHsc /MT /Fe:desktop\native\ss-capture.exe desktop\native\ss-capture.cpp d3d11.lib dxgi.lib avrt.lib user32.lib`) vagy
 `npm run dist:mac --prefix desktop` (Macen).
 
 ## Fejlesztés
@@ -284,6 +295,8 @@ A képernyőmegosztás csak HTTPS-en vagy `localhost`-on működik. TURN relé n
 - Közvetlen mód: `desktop/direct.js` (az alkalmazás UDP-átvitele: titkosítás, darabolás, NACK, kulcskocka-kérés,
   óra-egyeztetés, lyukasztás a NAT-on, szerveres relé), `server/direct-relay.js` (a szerver 3479/udp portja:
   címfelderítés és relé, csak a munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része
-  (WebCodecs kódolás/dekódolás, kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet).
+  (WebCodecs kódolás/dekódolás, kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet),
+  `desktop/native/ss-capture.cpp` (Windows: DXGI képrögzítés + NVENC; az NVIDIA Video Codec SDK 11.1 API-fejléce a
+  `third_party/` mappában, MIT licenc – a futáshoz csak az NVIDIA illesztőprogram kell).
 - `docker-compose.yml` – `app` (Node), `caddy` (HTTPS, beállítás: `deploy/caddy/Caddyfile`), `turn` (coturn, host
   hálózaton; a belső/foglalt címek felé tiltott relézéssel).
