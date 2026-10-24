@@ -77,6 +77,22 @@ test('serves the page with security headers', async () => {
   assert.equal((await fetch(`http://${base}/healthz`)).status, 200);
 });
 
+test('serves the home-screen app manifest and icons', async () => {
+  const manifest = await fetch(`http://${base}/manifest.webmanifest`);
+  assert.equal(manifest.status, 200);
+  assert.match(manifest.headers.get('content-type'), /application\/manifest\+json/);
+  const m = await manifest.json();
+  assert.equal(m.display, 'standalone');
+  for (const icon of m.icons) {
+    const res = await fetch(`http://${base}${icon.src}`);
+    assert.equal(res.status, 200, icon.src);
+    assert.equal(res.headers.get('content-type'), 'image/png');
+  }
+  const apple = await fetch(`http://${base}/apple-touch-icon.png`);
+  assert.equal(apple.status, 200);
+  assert.deepEqual([...new Uint8Array(await apple.arrayBuffer()).slice(1, 4)], [0x50, 0x4e, 0x47]); // "PNG"
+});
+
 test('odd request lines do not crash the server', async () => {
   const net = await import('node:net');
   const [host, port] = base.split(':');

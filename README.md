@@ -103,6 +103,15 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
   Böngészőből egy Chrome-lap hangja megosztható (*Chrome-lap* fül → lap hangja); a Safari nem tud hangot megosztani.
 - A Mac a H.264-et hardveresen kódolja (VideoToolbox) – a Kodek maradjon „Automatikus”.
 
+### iPhone / iPad
+
+- **Nézni** iPhone-on és iPaden is lehet, Safariban. Alkalmazásként: Safari → **Megosztás** gomb (négyzet felfelé
+  nyíllal) → **Főképernyőhöz adás**. Utána ikonról indul, teljes képernyőn, címsor nélkül (App Store nem kell).
+  A kapott link Safariban nyílik meg; a főképernyős alkalmazásban a kódot a **Nézek** mezőbe írd.
+- Fekvő telefonon a kép kitölti a kijelzőt; a teljes képernyő gomb az iPhone saját lejátszóját nyitja (kép a képben is megy).
+- **Megosztani** iPhone-ról / iPadről nem lehet: az Apple böngészőből nem enged képernyőt rögzíteni. Ehhez natív
+  iOS-alkalmazás kellene (ReplayKit), amit csak fizetős Apple fejlesztői fiókkal (99 USD/év) lehet telepíteni.
+
 ### Tippek, hogy ne akadjon
 
 - **Vezetékes net** a megosztó gépen, és elég feltöltési sávszélesség: 4K60-hoz kb. 20–30 Mbit/s nézőnként.

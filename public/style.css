@@ -504,3 +504,28 @@ input[type="password"] {
   .controls { opacity: 1; padding: 18px 10px 10px; gap: 8px; }
   .stats { left: 8px; right: 8px; top: 8px; min-width: 0; }
 }
+
+/* ---------- iPhone / iPad ---------- */
+.is-ios .volume { display: none; }
+.is-ios .cards > .card:first-child { order: 2; } /* watching first: sharing needs a computer */
+@media (hover: none) { .kbd-hints { display: none; } } /* touch screens have no keyboard shortcuts */
+
+/* Phone held sideways: the picture fills the screen */
+@media (orientation: landscape) and (max-height: 520px) {
+  body.viewing .topbar, body.viewing .viewer-meta { display: none; }
+  body.viewing main { padding: 0 !important; max-width: none; }
+  body.viewing .player { height: 100vh; height: 100dvh; max-height: none; aspect-ratio: auto; border-radius: 0; border: 0; }
+}
+
+/* Phones: keep clear of the notch, rounded corners and home indicator (viewport-fit=cover) */
+@media (max-width: 720px), (orientation: landscape) and (max-height: 520px) {
+  @supports (padding: max(0px)) {
+    .topbar { padding-left: max(16px, env(safe-area-inset-left)); padding-right: max(16px, env(safe-area-inset-right)); }
+    main { padding-left: max(16px, env(safe-area-inset-left)); padding-right: max(16px, env(safe-area-inset-right)); }
+    .controls {
+      padding-left: max(10px, env(safe-area-inset-left));
+      padding-right: max(10px, env(safe-area-inset-right));
+      padding-bottom: max(10px, env(safe-area-inset-bottom));
+    }
+  }
+}

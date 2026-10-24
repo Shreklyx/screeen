@@ -6,6 +6,13 @@
   <title>Screen Share – 4K képernyőmegosztás hanggal</title>
   <meta name="description" content="Képernyőmegosztás 4K-ban, 60 FPS-sel és rendszerhanggal, minimális késleltetéssel. Regisztráció és telepítés nélkül, közvetlenül a böngészőből.">
   <meta name="theme-color" content="#0b0b10">
+  <!-- home-screen app: iPhone / iPad (Safari → Megosztás → Főképernyőhöz adás), Android -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="Screen Share">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d5e'/%3E%3Cpath d='M8 10.5h16v10H8zM13 24h6' fill='none' stroke='white' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
   <script src="app.js" defer></script>
@@ -72,6 +79,13 @@
         <div class="dl-buttons">
           <a id="dlWin" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-Setup.exe">Windows</a>
           <a id="dlMac" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-mac.dmg">Mac</a>
+        </div>
+      </section>
+
+      <section id="iosInstall" class="downloads" hidden aria-labelledby="ios-title">
+        <div>
+          <h2 id="ios-title">iPhone / iPad alkalmazás</h2>
+          <p class="hint">Safariban koppints a <b>Megosztás</b> gombra (négyzet felfelé nyíllal), majd a <b>Főképernyőhöz adás</b>-ra. Utána ikonról indul, teljes képernyőn. A kapott linket nyisd meg, vagy írd be a kódot a „Nézek” mezőbe.</p>
         </div>
       </section>
 
@@ -228,7 +242,7 @@
 
         <button id="btnUnmute" class="unmute" type="button" hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>
-          Kattints a hang bekapcsolásához
+          Hang bekapcsolása
         </button>
 
         <div id="stats" class="stats" hidden></div>
@@ -255,7 +269,7 @@
           </button>
         </div>
       </div>
-      <p class="viewer-meta">Szoba: <b id="viewerRoom"></b> · <span id="viewerCountText">–</span> · Dupla kattintás: teljes képernyő · M: némítás · S: statisztika</p>
+      <p class="viewer-meta">Szoba: <b id="viewerRoom"></b> · <span id="viewerCountText">–</span><span class="kbd-hints"> · Dupla kattintás: teljes képernyő · M: némítás · S: statisztika</span></p>
     </section>
   </main>
 

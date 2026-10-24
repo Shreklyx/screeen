@@ -41,7 +41,11 @@ const SW_TIERS = [
   { res: '1080', fps: 60, kbps: 35000 },
   { res: '1440', fps: 60, kbps: 50000 },
 ];
-const IS_MAC = /Macintosh/.test(navigator.userAgent);
+// iPhone / iPad – iPadOS Safari presents itself as a Mac, the touch screen gives it away
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+const IS_MAC = !IS_IOS && /Macintosh/.test(navigator.userAgent);
+// started from the home-screen icon (iOS / Android web app)
+const STANDALONE = Boolean(window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone);
 // The Windows/Mac desktop app (desktop/preload.js) exposes a small API; null in a plain browser.
 const APP = window.screenshareApp || null;
 const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
@@ -90,6 +94,7 @@ const randomId = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), (b)
 
 function showView(id) {
   for (const el of document.querySelectorAll('[data-view]')) el.hidden = el.id !== id;
+  document.body.classList.toggle('viewing', id === 'view-viewer');
 }
 
 let toastTimer;
@@ -1576,6 +1581,8 @@ function initHostUi() {
 
   if (APP) {
     document.documentElement.classList.add('in-app');
+  } else if (IS_IOS) {
+    $('#iosInstall').hidden = STANDALONE; // already on the home screen
   } else {
     $('#downloads').hidden = false;
     $(IS_MAC ? '#dlMac' : '#dlWin').classList.add('btn-primary');
@@ -1593,6 +1600,7 @@ function initHostUi() {
   if (!navigator.mediaDevices?.getDisplayMedia || !window.RTCPeerConnection) {
     $('#btnShare').disabled = true;
     $('#shareUnsupported').hidden = false;
+    if (IS_IOS) $('#shareUnsupported').textContent = 'iPhone-on és iPaden az Apple nem enged képernyőt megosztani a böngészőből – innen nézni tudsz. Megosztani számítógépről lehet (böngészőből vagy a Windows / Mac alkalmazással).';
   } else if (IS_MAC) {
     $('#macHint').hidden = false;
   }
@@ -2087,6 +2095,7 @@ function initViewerUi() {
 /* ============================== boot ============================== */
 
 function init() {
+  if (IS_IOS) document.documentElement.classList.add('is-ios'); // no volume control: iOS keeps media at full volume
   initHostUi();
   initViewerUi();
 
