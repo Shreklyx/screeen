@@ -9,10 +9,10 @@ import WebRTC
 /// running inside the broadcast extension: one RTCPeerConnection per viewer, the host
 /// always makes the offers, the viewers answer (see public/app.js).
 final class Host: NSObject {
-    private static let maxVideoBps = 8_000_000
+    private static let maxVideoBps = 12_000_000
     private static let startKbps = 3_000
     private static let maxKbps = 20_000
-    private static let fps: Int32 = 30
+    private static let fps: Int32 = 60
 
     private final class Viewer {
         let id: String

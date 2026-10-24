@@ -32,7 +32,12 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   Az alkalmazás (asztali és iOS) egy képkockát a célbitráta 3-szorosával küld ki (a WebRTC alapból 1,1-szeresével,
   ami 4K-ban egy képkockát majdnem a teljes képkocka-időre szétteríti), és a küldési sor legfeljebb 200 ms lehet –
   nagy bitrátán a küldő oldali várakozás a tesztben ~50 → ~5 ms. 120/144 Hz-es monitorhoz kézzel **120 FPS** is
-  választható (kétszer gyakoribb képkocka, de a kódolót is kétszer annyira terheli). A késést méri is: a néző statisztikájában és a megosztó
+  választható (kétszer gyakoribb képkocka, de a kódolót is kétszer annyira terheli). Böngészőből megosztva ezek
+  nem állíthatók: mozgalmas, nagy bitrátájú képnél a néző Chrome-ja a tesztben ~190 ms jitter puffert tartott
+  (képtől képig ~240 ms), az alkalmazásból megosztva ~4 ms-ot (~50 ms) – ezért a böngészős megosztó erre tippet kap.
+  (A néző oldaláról ez nem kerülhető meg: a Chrome a fogadott képkockák időbélyegét nem engedi átírni.)
+  0 ms nem lehetséges: a képet rögzíteni, kódolni, átküldeni, dekódolni és a monitornak kirajzolni is idő
+  (60 Hz-en egy képkocka 16,7 ms). A késést méri is: a néző statisztikájában és a megosztó
   nézőlistájában nézőnként látszik (kódolás + hálózat + fogadástól a megjelenésig).
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).
@@ -121,7 +126,7 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
 
 Az `ios/` mappában van (SwiftUI + ReplayKit közvetítés-kiegészítő + WebRTC). Két füle van:
 **Megosztás** (szerver, jelszó, „Képernyő megosztása”, a szobakód és a link küldése) és **Nézés** (az oldal).
-Megosztáskor a telefon képernyője (H.264 hardveres kódolás, max. 1080p 30 FPS) és **az alkalmazások hangja**
+Megosztáskor a telefon képernyője (H.264 hardveres kódolás, max. 1080p 60 FPS) és **az alkalmazások hangja**
 (pl. YouTube, játék – a mikrofon nem) megy, akkor is, ha közben más alkalmazásra váltasz.
 
 **Telepítés** – az IPA-t a saját Apple ID-ddal kell aláírni, App Store nélkül:

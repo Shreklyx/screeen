@@ -74,7 +74,7 @@
       <section id="downloads" class="downloads" hidden aria-labelledby="dl-title">
         <div>
           <h2 id="dl-title">Asztali alkalmazás</h2>
-          <p class="hint">A gép teljes hangját magától megosztja Windowson és Macen is (semmit nem kell mellé telepíteni), 5.1 / 7.1 hangszórókról térhangban (Windows). Laptopon az erősebb videókártyát használja (NVIDIA), és a háttérben sem lassul le a megosztás.</p>
+          <p class="hint">A gép teljes hangját magától megosztja Windowson és Macen is (semmit nem kell mellé telepíteni), 5.1 / 7.1 hangszórókról térhangban (Windows). Laptopon az erősebb videókártyát használja (NVIDIA), és a háttérben sem lassul le a megosztás. A legkisebb késést is ez adja: a nézők pufferelés nélkül, azonnal kapják a képet.</p>
         </div>
         <div class="dl-buttons">
           <a id="dlWin" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-Setup.exe">Windows</a>
@@ -160,6 +160,7 @@
           <h3>Kódolás</h3>
           <p id="gpuName" class="enc-gpu"></p>
           <p id="encoderStatus" class="hint">Az első néző csatlakozásakor kiderül, hogy a videókártya kódol-e.</p>
+          <p id="latencyTip" class="hint" hidden>Tipp a legkisebb késéshez: oszd meg az asztali alkalmazásból. Böngészőből megosztva mozgalmas, nagy felbontású képnél a nézők böngészője akár 100–200 ms-ot is pufferel, az alkalmazásból semmit.</p>
         </section>
 
         <section class="box">

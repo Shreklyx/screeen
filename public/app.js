@@ -1272,6 +1272,8 @@ function updateCaptureInfo() {
   const fps = Math.min(s.frameRate ? Math.round(s.frameRate) : t.fps, t.fps);
   $('#captureInfo').textContent = w && h ? `${w}×${h} · ${fps} FPS` : '';
   renderAutoProfile();
+  // only the apps can tell viewers to show frames without a jitter buffer
+  $('#latencyTip').hidden = !host.video || Boolean(APP);
 
   const el = $('#audioStatus');
   if (!host.video) {
