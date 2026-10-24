@@ -100,17 +100,43 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
 - Első megosztáskor engedélyezd a böngészőnek a képernyőfelvételt: *Rendszerbeállítások → Adatvédelem és biztonság →
   Képernyőfelvétel* (újabb macOS-en *Képernyő- és rendszerhangfelvétel*), majd indítsd újra a böngészőt.
 - Hang: a Mac **teljes rendszerhangjához az asztali alkalmazás** kell (lent) – semmit nem kell mellé telepíteni.
-  Böngészőből egy Chrome-lap hangja megosztható (*Chrome-lap* fül → lap hangja); a Safari nem tud hangot megosztani.
+  Böngészőből egy Chrome-lap hangja megosztható (*Chrome-lap* fül → lap hangja).
+- **Safari:** a képernyő megosztása megy, a gép hangja nem (a Safari nem adja). Hanghoz a **Hangforrás** listából
+  választható egy hangbemenet, vagy oszd meg Chrome-ból / a Mac alkalmazásból.
 - A Mac a H.264-et hardveresen kódolja (VideoToolbox) – a Kodek maradjon „Automatikus”.
 
 ### iPhone / iPad
 
-- **Nézni** iPhone-on és iPaden is lehet, Safariban. Alkalmazásként: Safari → **Megosztás** gomb (négyzet felfelé
-  nyíllal) → **Főképernyőhöz adás**. Utána ikonról indul, teljes képernyőn, címsor nélkül (App Store nem kell).
-  A kapott link Safariban nyílik meg; a főképernyős alkalmazásban a kódot a **Nézek** mezőbe írd.
-- Fekvő telefonon a kép kitölti a kijelzőt; a teljes képernyő gomb az iPhone saját lejátszóját nyitja (kép a képben is megy).
-- **Megosztani** iPhone-ról / iPadről nem lehet: az Apple böngészőből nem enged képernyőt rögzíteni. Ehhez natív
-  iOS-alkalmazás kellene (ReplayKit), amit csak fizetős Apple fejlesztői fiókkal (99 USD/év) lehet telepíteni.
+- **Nézni** Safariban lehet. Alkalmazásként: Safari → **Megosztás** gomb (négyzet felfelé nyíllal) →
+  **Főképernyőhöz adás**. Utána ikonról indul, teljes képernyőn (App Store nem kell). A kapott link Safariban nyílik
+  meg; a főképernyős alkalmazásban a kódot a **Nézek** mezőbe írd. Fekvő telefonon a kép kitölti a kijelzőt.
+- **Megosztani** a böngészőből nem lehet (az Apple egyik iOS-böngészőben sem engedi), ehhez a **Screen Share iOS
+  alkalmazás** kell – lásd lent.
+
+### Screen Share iOS alkalmazás (iPhone / iPad képernyő megosztása)
+
+Az `ios/` mappában van (SwiftUI + ReplayKit közvetítés-kiegészítő + WebRTC). Két füle van:
+**Megosztás** (szerver, jelszó, „Képernyő megosztása”, a szobakód és a link küldése) és **Nézés** (az oldal).
+Megosztáskor a telefon képernyője (H.264 hardveres kódolás, max. 1080p 30 FPS) és **az alkalmazások hangja**
+(pl. YouTube, játék – a mikrofon nem) megy, akkor is, ha közben más alkalmazásra váltasz.
+
+**Telepítés** – az IPA-t a saját Apple ID-ddal kell aláírni, App Store nélkül:
+
+1. Töltsd le: <https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-iOS.ipa>
+2. Telepítsd a **Sideloadly**-t (<https://sideloadly.io>, Windows / Mac; Windowson az Apple weboldaláról letöltött
+   iTunes és iCloud is kell hozzá).
+3. Csatlakoztasd a telefont USB-vel, a Sideloadly-ben add meg az Apple ID-d, húzd be az IPA-t, **Start**.
+4. iPhone: *Beállítások → Általános → VPN és eszközkezelés* → a saját Apple ID-d → **Megbízom**; iOS 16-tól még
+   *Beállítások → Adatvédelem és biztonság → Fejlesztői mód* → be (újraindítás).
+5. Ingyenes Apple ID-vel az alkalmazás 7 napig fut, utána újra kell telepíteni (a Sideloadly ezt tudja magától is);
+   fizetős Apple fejlesztői fiókkal (99 USD/év) 1 évig.
+
+**Megosztás:** nyisd meg az alkalmazást → add meg a jelszót → **Képernyő megosztása** → **Közvetítés indítása**.
+Leállítás: a piros jelzés a képernyő tetején, vagy a Vezérlőközpont. Egyes alkalmazások (pl. Netflix) a
+képernyőfelvételnél fekete képet adnak – ez az Apple / az alkalmazás korlátja.
+
+Fordítás: a GitHub Actions (`.github/workflows/ios.yml`) macOS gépen építi minden változásnál; kézzel Macen:
+`brew install xcodegen`, `cd ios && xcodegen generate`, majd Xcode-ban megnyitható.
 
 ### Tippek, hogy ne akadjon
 

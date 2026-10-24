@@ -49,6 +49,9 @@ const STANDALONE = Boolean(window.matchMedia?.('(display-mode: standalone)').mat
 // The Windows/Mac desktop app (desktop/preload.js) exposes a small API; null in a plain browser.
 const APP = window.screenshareApp || null;
 const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
+// the website inside the iOS app (ios/App/WatchView.swift); sharing is its own tab there
+const IN_IOS_APP = /ScreenShareApp\//.test(navigator.userAgent);
+const IOS_APP_URL = 'https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-iOS.ipa';
 
 const ERROR_TEXT = {
   auth: 'Hibás jelszó.',
@@ -646,7 +649,9 @@ async function startSurroundAudio() {
 async function captureScreen() {
   const fps = captureFps();
   const video = { frameRate: { ideal: fps, max: fps }, cursor: 'always' };
-  const audio = settings.audio && !useDeviceAudio() ? { ...RAW_AUDIO, suppressLocalAudioPlayback: false } : false;
+  // Safari never shares the computer's sound, and a second try would no longer count as
+  // a click (Safari refuses screen capture outside one): ask for the picture only.
+  const audio = settings.audio && !useDeviceAudio() && !IS_SAFARI ? { ...RAW_AUDIO, suppressLocalAudioPlayback: false } : false;
   const extras = {
     systemAudio: audio ? 'include' : 'exclude',
     selfBrowserSurface: 'exclude',
@@ -1290,7 +1295,7 @@ function updateCaptureInfo() {
         ? 'A macOS nem engedi a rendszerhangot: Rendszerbeállítások → Adatvédelem és biztonság → Képernyő- és rendszerhangfelvétel → a rendszerhang-felvételnél kapcsold be a Screen Share-t, majd indítsd újra az alkalmazást.'
         : 'Nincs hang: a választóban hagyd bekapcsolva a „Rendszerhang megosztása” opciót (Forrás váltása). macOS 13 vagy újabb kell hozzá.';
     } else if (IS_SAFARI) {
-      el.textContent = 'A Safari nem tud hangot megosztani. Ha hang is kell, oszd meg Chrome-ból.';
+      el.textContent = 'A Safari a gép hangját nem tudja megosztani. Hanghoz válassz egy hangbemenetet a Hangforrás listában, vagy oszd meg Chrome-ból / a Mac alkalmazásból (az a teljes rendszerhangot viszi).';
     } else if (IS_MAC) {
       el.textContent = 'Nincs hang. A Mac teljes rendszerhangjához használd a Screen Share alkalmazást (semmit nem kell mellé telepíteni). Böngészőből egy lap hangja megosztható: Forrás váltása → „Chrome-lap” fül → lap hangjának megosztása.';
     } else {
@@ -1582,7 +1587,7 @@ function initHostUi() {
   if (APP) {
     document.documentElement.classList.add('in-app');
   } else if (IS_IOS) {
-    $('#iosInstall').hidden = STANDALONE; // already on the home screen
+    $('#iosInstall').hidden = STANDALONE || IN_IOS_APP; // already installed
   } else {
     $('#downloads').hidden = false;
     $(IS_MAC ? '#dlMac' : '#dlWin').classList.add('btn-primary');
@@ -1600,7 +1605,16 @@ function initHostUi() {
   if (!navigator.mediaDevices?.getDisplayMedia || !window.RTCPeerConnection) {
     $('#btnShare').disabled = true;
     $('#shareUnsupported').hidden = false;
-    if (IS_IOS) $('#shareUnsupported').textContent = 'iPhone-on és iPaden az Apple nem enged képernyőt megosztani a böngészőből – innen nézni tudsz. Megosztani számítógépről lehet (böngészőből vagy a Windows / Mac alkalmazással).';
+    if (IN_IOS_APP) {
+      $('#shareUnsupported').textContent = 'A képernyőd megosztása: lent a „Megosztás” fülön.';
+    } else if (IS_IOS) {
+      // Apple allows no screen capture in any iOS browser – the iOS app can (ReplayKit)
+      $('#shareUnsupported').replaceChildren(
+        'iPhone-on és iPaden a böngésző nem oszthat meg képernyőt (Apple-korlát). Megosztani a ',
+        Object.assign(document.createElement('a'), { href: IOS_APP_URL, textContent: 'Screen Share iOS alkalmazással' }),
+        ' lehet (telepítés: lent).',
+      );
+    }
   } else if (IS_MAC) {
     $('#macHint').hidden = false;
   }
