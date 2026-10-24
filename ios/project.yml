@@ -1,0 +1,52 @@
+# Xcode project for the iOS app – generate it with XcodeGen: `cd ios && xcodegen generate`
+name: ScreenShare
+options:
+  bundleIdPrefix: hu.mozizas
+  deploymentTarget:
+    iOS: "16.0"
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC.git
+    exactVersion: "155.0.0"
+settings:
+  base:
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    # signed afterwards: ad hoc in CI, then with your Apple ID by the sideloading tool
+    CODE_SIGNING_ALLOWED: "NO"
+targets:
+  ScreenShare:
+    type: application
+    platform: iOS
+    sources: [App, Shared]
+    settings:
+      base:
+        PRODUCT_NAME: ScreenShare
+        PRODUCT_BUNDLE_IDENTIFIER: hu.mozizas.screenshare
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/App.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: Broadcast
+      - package: WebRTC
+  Broadcast:
+    type: app-extension
+    platform: iOS
+    sources: [Broadcast, Shared]
+    settings:
+      base:
+        PRODUCT_NAME: Broadcast
+        PRODUCT_BUNDLE_IDENTIFIER: hu.mozizas.screenshare.broadcast
+        INFOPLIST_FILE: Broadcast/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Broadcast/Broadcast.entitlements
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+    dependencies:
+      - package: WebRTC
+schemes:
+  ScreenShare:
+    build:
+      targets:
+        ScreenShare: all
+        Broadcast: all

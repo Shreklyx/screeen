@@ -1,0 +1,81 @@
+# Builds the iOS app (ios/, Swift + a ReplayKit broadcast extension), runs its plain
+# checks, and publishes an unsigned-for-distribution IPA to the "desktop-latest"
+# release. It is signed on install with the user's own Apple ID (Sideloadly, AltStore).
+name: iOS app
+
+on:
+  push:
+    branches: [claude/elegant-gauss-mi4rl5, main]
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checks (SDP tuning, settings)
+        working-directory: ios
+        run: |
+          swiftc -o "$RUNNER_TEMP/checks" Broadcast/Sdp.swift Shared/Shared.swift Tests/main.swift
+          "$RUNNER_TEMP/checks"
+
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build
+        working-directory: ios
+        run: |
+          xcodebuild -quiet -project ScreenShare.xcodeproj -scheme ScreenShare -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO build
+
+      # Ad-hoc signatures that carry the entitlements (App Group shared by the app and the
+      # extension), so the sideloading tool knows what to request for your Apple ID.
+      - name: Package the IPA
+        working-directory: ios
+        run: |
+          APP=build/Build/Products/Release-iphoneos/ScreenShare.app
+          EXT="$APP/PlugIns/Broadcast.appex"
+          test -x "$EXT/Broadcast"
+          find "$APP" -name "*.framework" -maxdepth 3 -print
+          find "$APP" -name "*.framework" -print0 | xargs -0 -I{} codesign --force --sign - {}
+          codesign --force --sign - --entitlements Broadcast/Broadcast.entitlements "$EXT"
+          codesign --force --sign - --entitlements App/App.entitlements "$APP"
+          codesign -d --entitlements - "$EXT" 2>/dev/null | grep -q group.hu.mozizas.screenshare
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry ScreenShare-iOS.ipa Payload
+          ls -la ScreenShare-iOS.ipa
+          du -sh "$APP" "$EXT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshare-iOS
+          path: ios/ScreenShare-iOS.ipa
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: screenshare-iOS
+          path: out
+      - name: Add the IPA to the "desktop-latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: desktop-latest
+          files: out/ScreenShare-iOS.ipa
