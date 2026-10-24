@@ -911,6 +911,13 @@ void Engine::setEncoderStats(double encodeMs, int width, int height) {
   });
 }
 
+void Engine::setEncoder(const std::string& name, bool hardware) {
+  impl_->loop.post([this, name, hardware] {
+    impl_->cfg.encoderName = name;
+    impl_->cfg.hardware = hardware;
+  });
+}
+
 void Engine::join(const std::string& code) {
   impl_->loop.post([this, code] { impl_->startView(code); });
 }

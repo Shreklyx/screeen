@@ -1,0 +1,30 @@
+#include <windows.h>
+
+1 ICON "app.ico"
+1 RT_MANIFEST "app.manifest"
+
+#include "version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION SS_VERSION_NUMBERS
+PRODUCTVERSION SS_VERSION_NUMBERS
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040e04b0"
+    BEGIN
+      VALUE "CompanyName", "Screen Share"
+      VALUE "FileDescription", "Screen Share"
+      VALUE "FileVersion", SS_VERSION_TEXT
+      VALUE "ProductName", "Screen Share"
+      VALUE "ProductVersion", SS_VERSION_TEXT
+      VALUE "OriginalFilename", "ScreenShare.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x040e, 1200
+  END
+END

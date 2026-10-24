@@ -69,6 +69,8 @@ class Engine {
   void sendAudio(int pair, int channels, const uint8_t* data, size_t n, double tsUs);
   /** Sharer: what the encoder measured, for the viewers' statistics. */
   void setEncoderStats(double encodeMs, int width, int height);
+  /** Sharer: which encoder works ("NVENC", "Intel Quick Sync", …) and whether it is the GPU. */
+  void setEncoder(const std::string& name, bool hardware);
 
   /** Viewer: joins a room by its code. */
   void join(const std::string& code);
