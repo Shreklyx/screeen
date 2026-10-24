@@ -509,7 +509,15 @@ function stopDirect() {
 async function openDirect(wc, role) {
   if (direct && direct.role === role && direct.wc === wc) return direct;
   stopDirect();
-  const ep = new DirectEndpoint({ role, serverHost: new URL(serverUrl).hostname, forceRelay: process.env.SS_DIRECT_RELAY === '1', forceTurn: process.env.SS_DIRECT_TURN === '1' });
+  const server = new URL(serverUrl);
+  const ep = new DirectEndpoint({
+    role,
+    serverHost: server.hostname,
+    tcpUrl: `${server.protocol === 'https:' ? 'wss' : 'ws'}://${server.host}/direct`, // the last resort, over HTTPS
+    forceRelay: process.env.SS_DIRECT_RELAY === '1',
+    forceTurn: process.env.SS_DIRECT_TURN === '1',
+    forceTcp: process.env.SS_DIRECT_TCP === '1',
+  });
   const self = { ep, role, wc };
   direct = self;
   const live = () => direct === self && !wc.isDestroyed();

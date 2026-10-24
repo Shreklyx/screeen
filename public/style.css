@@ -357,6 +357,8 @@ input[type="password"] {
 /* ---------- the desktop app: an app, not a website ---------- */
 :root:not(.in-app) .app-only { display: none; }
 .in-app .web-only, .in-app .hero, .in-app .features, .in-app .howto, .in-app #downloads, .in-app #iosInstall { display: none !important; }
+/* the app always plays without a buffer */
+.in-app #latency { display: none; }
 .app-hero { max-width: 920px; margin: 24px auto 28px; }
 .app-hero h1 { font-size: 28px; letter-spacing: -0.025em; margin: 0 0 6px; }
 .app-hero p { color: var(--text-muted); margin: 0; }

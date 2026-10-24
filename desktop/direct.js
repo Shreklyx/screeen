@@ -13,7 +13,8 @@
 // Connection: both ends register at the server's UDP port (the answer is their public
 // address), exchange addresses over signaling and probe each other (UDP hole punching).
 // When no direct path answers, packets go through the server's UDP relay – or, when that
-// port is blocked, through the TURN server (the same one WebRTC uses, port 3478).
+// port is blocked, through the TURN server (the same one WebRTC uses, port 3478) – or, when no
+// UDP gets through at all, in a WebSocket to the server (HTTPS port, wss://…/direct).
 
 const dgram = require('node:dgram');
 const crypto = require('node:crypto');
@@ -441,12 +442,14 @@ class DirectEndpoint extends EventEmitter {
    * role: 'host' (sends the picture) or 'viewer'
    * serverHost: the signaling server's host name; its UDP port comes with each session
    */
-  constructor({ role, serverHost, forceRelay = false, forceTurn = false }) {
+  constructor({ role, serverHost, tcpUrl = null, forceRelay = false, forceTurn = false, forceTcp = false }) {
     super();
     this.role = role;
     this.serverHost = serverHost;
+    this.tcpUrl = tcpUrl; // wss://server/direct – the last resort
     this.forceRelay = forceRelay; // tests / troubleshooting: only the server's relay …
-    this.forceTurn = forceTurn; // … or only the TURN server
+    this.forceTurn = forceTurn; // … or only the TURN server …
+    this.forceTcp = forceTcp; // … or only the WebSocket
     this.turn = null;
     this.turnPromise = null;
     this.socket = null;
@@ -565,6 +568,11 @@ class DirectEndpoint extends EventEmitter {
 
   /** Sends to an address – through the TURN server when it is the other app's relayed address. */
   transmit(packet, address, port) {
+    if (address.startsWith('tcp:')) {
+      const ws = this.bySession.get(Number(address.slice(4)))?.tcp;
+      if (ws?.ready && ws.bufferedAmount < 4 << 20) ws.send(packet);
+      return;
+    }
     if (!this.socket) return;
     const wrapped = this.turn?.wrap(address, port, packet);
     if (wrapped) this.socket.send(wrapped, this.turn.server.port, this.turn.server.address);
@@ -613,14 +621,49 @@ class DirectEndpoint extends EventEmitter {
     peer.failTimer = setTimeout(() => {
       if (peer.state !== 'connecting' || this.peers.get(id) !== peer) return;
       // what could be reached, for the page to explain
-      this.setState(peer, 'failed', { server: Boolean(peer.publicAddr), turn: Boolean(this.turn?.relayed), remote: peer.cands.length });
-    }, 7000);
+      this.setState(peer, 'failed', { server: Boolean(peer.publicAddr), turn: Boolean(this.turn?.relayed), tcp: Boolean(peer.tcp?.ready), remote: peer.cands.length });
+    }, 8000);
+  }
+
+  /** The TCP fallback: a WebSocket to the server, which passes the packets to the other app. */
+  openTcp(peer) {
+    if (!this.tcpUrl || peer.tcp || typeof WebSocket !== 'function' || now() - (peer.tcpAt || 0) < 3000) return;
+    peer.tcpAt = now();
+    let ws;
+    try {
+      ws = new WebSocket(this.tcpUrl);
+    } catch (err) {
+      this.emit('log', `direct: TCP fallback (${err.message})`);
+      return;
+    }
+    ws.binaryType = 'arraybuffer';
+    ws.ready = false;
+    peer.tcp = ws;
+    ws.onopen = () => {
+      const role = ROLE[this.role];
+      const nonce = crypto.randomBytes(8).toString('hex');
+      const mac = hmac16(peer.secret, Buffer.from(`tcp:${peer.session}:${role}:${nonce}`)).toString('base64');
+      ws.send(JSON.stringify({ session: peer.session, role, nonce, mac }));
+    };
+    ws.onmessage = (e) => {
+      if (typeof e.data === 'string') {
+        if (e.data === 'ok') ws.ready = true;
+        return;
+      }
+      this.onMessage(Buffer.from(e.data), { address: `tcp:${peer.session}`, port: 0, tcp: true });
+    };
+    ws.onclose = () => {
+      if (peer.tcp === ws) peer.tcp = null;
+    };
+    ws.onerror = () => {};
   }
 
   removePeer(id) {
     const peer = this.peers.get(id);
     if (!peer) return;
     if (peer.path) peer.send(T.BYE, Buffer.alloc(1));
+    try { peer.tcp?.close(); } catch { /* closed */ }
+    peer.tcp = null;
     clearInterval(peer.regTimer);
     clearTimeout(peer.failTimer);
     this.peers.delete(id);
@@ -644,10 +687,14 @@ class DirectEndpoint extends EventEmitter {
     if (t < peer.nextProbe || t > peer.probeUntil || !peer.keys) return;
     peer.nextProbe = t + 100;
     const since = t - peer.probeStart;
-    const targets = this.forceRelay || this.forceTurn ? [] : peer.cands.filter((c) => !c.turn);
+    const forced = this.forceRelay || this.forceTurn || this.forceTcp;
+    const targets = forced ? [] : peer.cands.filter((c) => !c.turn);
     // the relays only after a moment: a direct path is better
-    if (this.server && !this.forceTurn && (this.forceRelay || since > 1000)) targets.push({ ...this.server, relay: true });
-    if (this.turn && !this.forceRelay && (this.forceTurn || since > 1500)) targets.push(...peer.cands.filter((c) => c.turn && this.turn.bound(c.address, c.port)));
+    if (this.server && (!forced || this.forceRelay) && (this.forceRelay || since > 1000)) targets.push({ ...this.server, relay: true });
+    if (this.turn && (!forced || this.forceTurn) && (this.forceTurn || since > 1500)) targets.push(...peer.cands.filter((c) => c.turn && this.turn.bound(c.address, c.port)));
+    // no UDP path yet after 2 s: the WebSocket too (opened once, probed like the others)
+    if (this.tcpUrl && (!forced || this.forceTcp) && (this.forceTcp || (since > 2000 && peer.state !== 'connected'))) this.openTcp(peer);
+    if (peer.tcp?.ready && (!forced || this.forceTcp) && (this.forceTcp || since > 2000)) targets.push({ address: `tcp:${peer.session}`, port: 0 });
     for (const target of targets) {
       const id = crypto.randomBytes(8);
       peer.probes.set(id.toString('hex'), { sent: t, relay: Boolean(target.relay) });
@@ -661,9 +708,9 @@ class DirectEndpoint extends EventEmitter {
     if (!probe) return;
     const t = now();
     const relay = Boolean(this.server && rinfo.address === this.server.address && rinfo.port === this.server.port);
-    const kind = rinfo.turn ? 'turn' : relay ? 'relay' : isPrivate(rinfo.address) ? 'lan' : 'internet';
+    const kind = rinfo.tcp ? 'tcp' : rinfo.turn ? 'turn' : relay ? 'relay' : isPrivate(rinfo.address) ? 'lan' : 'internet';
     const candidate = { address: rinfo.address, port: rinfo.port, kind, rtt: t - probe.sent };
-    const rank = (p) => ({ lan: 0, internet: 1, relay: 2, turn: 3 })[p.kind];
+    const rank = (p) => ({ lan: 0, internet: 1, relay: 2, turn: 3, tcp: 4 })[p.kind];
     const current = peer.path;
     // take it if there is none yet, or it is a better kind, or the same kind and clearly faster
     const better = !current || rank(candidate) < rank(current) || (rank(candidate) === rank(current) && candidate.rtt + 2 < current.rtt && current.address !== candidate.address);
@@ -971,7 +1018,10 @@ class DirectEndpoint extends EventEmitter {
     const t = now();
     let pending = false;
     for (const peer of this.peers.values()) {
-      peer.tokens = Math.min(64 * 1024, peer.tokens + (t - peer.lastFill) * this.paceRate);
+      // on the local network a frame goes out at (up to) gigabit speed: a 4K frame in ~2 ms
+      const lan = peer.path?.kind === 'lan';
+      const rate = lan ? Math.max(this.paceRate * 4, 125000) : this.paceRate;
+      peer.tokens = Math.min(lan ? 256 * 1024 : 64 * 1024, peer.tokens + (t - peer.lastFill) * rate);
       peer.lastFill = t;
       while (peer.outHead < peer.out.length && peer.tokens > 0) {
         const p = peer.out[peer.outHead++];

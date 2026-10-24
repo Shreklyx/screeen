@@ -245,7 +245,7 @@ test('TURN: direct mode through the TURN server (coturn) when nothing else gets 
   const proc = spawn(turnserver, ['-n', '--no-cli', '--log-file=stdout', `--listening-port=${turnPort}`, '--listening-ip=127.0.0.1', '--relay-ip=127.0.0.1',
     '--min-port=51000', '--max-port=51100', '--use-auth-secret', '--static-auth-secret=s3cret', '--realm=test', '--fingerprint',
     '--no-tls', '--no-dtls', '--no-tcp-relay', '--allow-loopback-peers', `--pidfile=/tmp/turn-${turnPort}.pid`], { stdio: 'ignore' });
-  await sleep(700);
+  await sleep(1500); // coturn starting up
   const relay = createRelay({ port: 0, host: '127.0.0.1' });
   const port = await relay.listen();
   const { session, secret } = relay.create({ room: 'r', viewer: 'v1' });
@@ -273,5 +273,41 @@ test('TURN: direct mode through the TURN server (coturn) when nothing else gets 
     viewer.close();
     relay.close();
     proc.kill();
+  }
+});
+
+test('TCP fallback: through the server\'s WebSocket when no UDP gets through', async () => {
+  const { createApp } = await import('../server/server.js');
+  const app = createApp({ port: 0, host: '127.0.0.1', hostPassword: 'x', turnSecret: '', directPort: 0 });
+  await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
+  const tcpUrl = `ws://127.0.0.1:${app.server.address().port}/direct`;
+  const { session, secret } = app.relay.create({ room: 'r', viewer: 'v1' });
+  const host = new DirectEndpoint({ role: 'host', serverHost: '127.0.0.1', tcpUrl, forceTcp: true });
+  const viewer = new DirectEndpoint({ role: 'viewer', serverHost: '127.0.0.1', tcpUrl, forceTcp: true });
+  try {
+    await host.open();
+    await viewer.open();
+    const states = [];
+    viewer.on('state', (id, s) => states.push(s));
+    const offer = await host.addPeer('v1', { session, secret, port: 0 });
+    const answer = await viewer.addPeer('host', { session, secret, port: 0 });
+    viewer.connectPeer('host', offer);
+    host.connectPeer('v1', answer);
+    await until(() => states.some((s) => s.state === 'connected'), 8000);
+    assert.equal(states.at(-1).path, 'tcp');
+    const got = await stream(host, viewer, { frames: 15, size: 4 * MAX_DATA });
+    await until(() => got.length === 15);
+    assert.ok(got.every((g) => g.ok));
+    // a wrong secret is not let in
+    const bad = new WebSocket(tcpUrl);
+    const closed = await new Promise((resolve) => {
+      bad.onopen = () => bad.send(JSON.stringify({ session, role: 2, nonce: 'aa', mac: Buffer.alloc(16).toString('base64') }));
+      bad.onclose = (e) => resolve(e.code);
+    });
+    assert.equal(closed, 1008);
+  } finally {
+    host.close();
+    viewer.close();
+    await app.close();
   }
 });

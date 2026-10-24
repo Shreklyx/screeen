@@ -6,6 +6,8 @@
 //  - Relay: when the two apps cannot reach each other directly, their (end-to-end
 //    encrypted) packets come here and are forwarded between the two registered addresses.
 //    Nothing is ever sent to an address that has not registered with the session secret.
+//  - TCP fallback (acceptTcp): when no UDP gets through at all (strict firewalls), the two apps
+//    send the same encrypted packets in a WebSocket (wss://…/direct) and this passes them on.
 
 import dgram from 'node:dgram';
 import crypto from 'node:crypto';
@@ -37,7 +39,46 @@ export function createRelay({ port = 0, host } = {}) {
   }
 
   function removeWhere(match) {
-    for (const [id, s] of sessions) if (match(s)) sessions.delete(id);
+    for (const [id, s] of sessions) {
+      if (!match(s)) continue;
+      sessions.delete(id);
+      for (const ws of Object.values(s.tcp || {})) ws.close();
+    }
+  }
+
+  /** A WebSocket from an app: the first (text) message proves the session, then binary packets pass through. */
+  function acceptTcp(ws) {
+    const timer = setTimeout(() => ws.terminate(), 10000);
+    ws.once('message', (data, isBinary) => {
+      clearTimeout(timer);
+      let m;
+      try {
+        m = isBinary ? null : JSON.parse(data.toString());
+      } catch {
+        m = null;
+      }
+      const s = m && sessions.get(Number(m.session));
+      const role = m && Number(m.role);
+      const mac = s && ROLES.includes(role) && typeof m.nonce === 'string' && typeof m.mac === 'string'
+        ? Buffer.from(m.mac, 'base64') : null;
+      if (!mac || mac.length !== 16 || !crypto.timingSafeEqual(hmac16(s.secret, Buffer.from(`tcp:${Number(m.session)}:${role}:${m.nonce}`)), mac)) {
+        ws.close(1008, 'auth');
+        return;
+      }
+      s.tcp ||= {};
+      if (s.tcp[role] && s.tcp[role] !== ws) s.tcp[role].close();
+      s.tcp[role] = ws;
+      ws.on('message', (packet, binary) => {
+        const other = s.tcp?.[role === 1 ? 2 : 1];
+        // late packets are worth nothing: a peer that does not keep up loses them (NACK / keyframe)
+        if (!binary || !other || other.readyState !== other.OPEN || other.bufferedAmount > 8 << 20) return;
+        s.relayed += packet.length;
+        other.send(packet, { binary: true });
+      });
+      ws.on('close', () => { if (s.tcp?.[role] === ws) delete s.tcp[role]; });
+      ws.send('ok');
+    });
+    ws.on('error', () => {});
   }
 
   function onRegister(msg, rinfo) {
@@ -89,6 +130,7 @@ export function createRelay({ port = 0, host } = {}) {
     sessions,
     create,
     removeWhere,
+    acceptTcp,
     listen() {
       return new Promise((resolve, reject) => {
         socket.once('error', reject);

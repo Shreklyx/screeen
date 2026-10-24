@@ -239,8 +239,9 @@ function handleStatic(req, res) {
 export function createApp(config = loadConfig()) {
   const rooms = new Map();
   let closing = false;
-  const relay = config.directPort ? createRelay({ port: config.directPort, host: config.host }) : null;
-  const relayReady = relay ? relay.listen().catch((err) => {
+  // direct mode sessions; the UDP port only when DIRECT_PORT is set (the TCP fallback always works)
+  const relay = createRelay({ port: config.directPort, host: config.host });
+  const relayReady = config.directPort ? relay.listen().catch((err) => {
     console.error(`[screenshare] direct mode UDP port ${config.directPort} unavailable: ${err.message}`);
     return null;
   }) : Promise.resolve(null);
@@ -253,8 +254,7 @@ export function createApp(config = loadConfig()) {
 
   const server = http.createServer(serveStatic);
   const wss = new WebSocketServer({
-    server,
-    path: '/ws',
+    noServer: true,
     maxPayload: LIMITS.maxPayload,
     verifyClient: ({ origin, req }) => {
       // Browsers always send Origin: only accept pages served from this host – and the desktop
@@ -266,6 +266,20 @@ export function createApp(config = loadConfig()) {
         return false;
       }
     },
+  });
+
+  // direct mode's TCP fallback: encrypted packets between two apps (see direct-relay.js)
+  const directWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
+  server.on('upgrade', (req, socket, head) => {
+    let pathname = '';
+    try {
+      pathname = new URL(req.url, 'http://x').pathname;
+    } catch {
+      // handled below
+    }
+    if (pathname === '/ws') wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    else if (pathname === '/direct') directWss.handleUpgrade(req, socket, head, (ws) => relay.acceptTcp(ws));
+    else socket.destroy();
   });
 
   const send = (conn, msg) => {
@@ -281,7 +295,7 @@ export function createApp(config = loadConfig()) {
   function closeRoom(room, reason = 'closed') {
     clearTimeout(room.awayTimer);
     rooms.delete(room.code);
-    relay?.removeWhere((s) => s.room === room.code);
+    relay.removeWhere((s) => s.room === room.code);
     for (const v of room.viewers.values()) {
       v.room = null;
       v.role = null;
@@ -299,7 +313,7 @@ export function createApp(config = loadConfig()) {
     if (!room) return;
     if (conn.role === 'viewer') {
       room.viewers.delete(conn.id);
-      relay?.removeWhere((s) => s.room === room.code && s.viewer === conn.id);
+      relay.removeWhere((s) => s.room === room.code && s.viewer === conn.id);
       if (room.host) send(room.host, { t: 'viewer-left', id: conn.id });
       broadcastCount(room);
     } else if (conn.role === 'host' && room.host === conn) {
@@ -421,16 +435,9 @@ export function createApp(config = loadConfig()) {
       if (!room || conn.role !== 'host' || room.host !== conn) return;
       const target = room.viewers.get(msg.to);
       if (!target || !target.caps?.direct) return;
-      let session;
-      let secret;
-      if (relay) {
-        relay.removeWhere((s) => s.room === room.code && s.viewer === target.id);
-        ({ session, secret } = relay.create({ room: room.code, viewer: target.id }));
-      } else {
-        session = crypto.randomBytes(4).readUInt32BE(0) || 1;
-        secret = crypto.randomBytes(16).toString('base64');
-      }
-      const info = { t: 'direct', session, secret, port: relay ? config.directPort : 0 };
+      relay.removeWhere((s) => s.room === room.code && s.viewer === target.id);
+      const { session, secret } = relay.create({ room: room.code, viewer: target.id });
+      const info = { t: 'direct', session, secret, port: config.directPort };
       send(conn, { ...info, viewer: target.id });
       send(target, info);
     },
@@ -503,7 +510,8 @@ export function createApp(config = loadConfig()) {
     close() {
       closing = true; // connections closing now must not start a room's grace timer
       clearInterval(heartbeat);
-      relay?.close();
+      relay.close();
+      for (const ws of directWss.clients) ws.terminate();
       for (const room of rooms.values()) clearTimeout(room.awayTimer);
       for (const ws of wss.clients) ws.terminate();
       wss.close();
