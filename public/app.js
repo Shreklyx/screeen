@@ -1892,6 +1892,13 @@ async function onHostSignal(data) {
     await onDirectOffer(data);
     return;
   }
+  if (data.type === 'unsupported') {
+    // the sharer's native app speaks only direct mode (no WebRTC)
+    setOverlay(data.why === 'server'
+      ? 'A megosztó alkalmazása közvetlen módot használ, de a szerver még nem ismeri – a szervert frissíteni kell.'
+      : 'A megosztó alkalmazása csak közvetlen módban küld képet, ezt ez a böngésző nem tudja. Nyisd meg friss Chrome-ban vagy Edge-ben, vagy az alkalmazásban.', { spinner: false });
+    return;
+  }
   if (data.type === 'offer' && typeof data.sdp === 'string') {
     closeDirectView(); // the sharer chose WebRTC for this viewer
     noteWhyWebrtc(typeof data.why === 'string' ? data.why : null);

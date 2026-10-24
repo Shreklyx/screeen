@@ -36,7 +36,7 @@ const APP_ORIGIN = 'app://screenshare'; // the desktop app (desktop/main.js)
 const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 const CODE_RE = /^[a-z0-9]{4,12}$/;
 const CODECS = ['AV1', 'VP9', 'H264', 'VP8'];
-const HOST_SIGNALS = new Set(['offer', 'candidate', 'stats', 'direct-offer']);
+const HOST_SIGNALS = new Set(['offer', 'candidate', 'stats', 'direct-offer', 'unsupported']);
 const VIEWER_SIGNALS = new Set(['answer', 'candidate', 'recall', 'stats', 'direct-answer', 'direct-fail']);
 
 const LIMITS = {
