@@ -1,6 +1,8 @@
 # Builds the iOS app (ios/, Swift + a ReplayKit broadcast extension), runs its plain
 # checks, and publishes an unsigned-for-distribution IPA to the "desktop-latest"
 # release. It is signed on install with the user's own Apple ID (Sideloadly, AltStore).
+# With an Apple Developer account (secrets APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID,
+# ASC_KEY_P8 – see README) every build also goes to TestFlight.
 name: iOS app
 
 on:
@@ -51,6 +53,7 @@ jobs:
           otool -L "$EXT/Broadcast" | grep -q '@rpath/WebRTC.framework/WebRTC'
           otool -l "$EXT/Broadcast" | grep -A2 LC_RPATH | grep -q '@executable_path/../../Frameworks'
           test -f "$APP/Frameworks/WebRTC.framework/WebRTC"
+          test -f "$APP/PrivacyInfo.xcprivacy" && test -f "$EXT/PrivacyInfo.xcprivacy"
           find "$APP" -name "*.framework" -maxdepth 3 -print
           find "$APP" -name "*.framework" -print0 | xargs -0 -I{} codesign --force --sign - {}
           codesign --force --sign - --entitlements Broadcast/Broadcast.entitlements "$EXT"
@@ -83,3 +86,76 @@ jobs:
         with:
           tag_name: desktop-latest
           files: out/ScreenShare-iOS.ipa
+
+  # TestFlight: only when the Apple Developer account's App Store Connect API key is set up
+  testflight-setup:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+          KEY: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          if [ -n "$TEAM" ] && [ -n "$KEY_ID" ] && [ -n "$ISSUER" ] && [ -n "$KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "No App Store Connect key in the secrets – TestFlight upload skipped."
+          fi
+
+  testflight:
+    needs: [build, testflight-setup]
+    if: needs.testflight-setup.outputs.enabled == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      # Xcode signs through the API key (cloud-managed certificate, App IDs and the
+      # App Group are registered on the first run) – no certificate files to manage.
+      - name: Archive
+        working-directory: ios
+        run: |
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+          xcodebuild -quiet -project ScreenShare.xcodeproj -scheme ScreenShare -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/ScreenShare.xcarchive" \
+            -allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" archive
+
+      - name: Upload to TestFlight
+        working-directory: ios
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/ScreenShare.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"

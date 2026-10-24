@@ -135,6 +135,22 @@ Megosztáskor a telefon képernyője (H.264 hardveres kódolás, max. 1080p 30 F
 Leállítás: a piros jelzés a képernyő tetején, vagy a Vezérlőközpont. Egyes alkalmazások (pl. Netflix) a
 képernyőfelvételnél fekete képet adnak – ez az Apple / az alkalmazás korlátja.
 
+**TestFlight (számítógép nélküli telepítés, 1 évig érvényes):** fizetős Apple fejlesztői fiókkal (99 USD/év)
+a GitHub minden változásnál magától feltölti az appot a TestFlightba, az iPhone-on pedig a TestFlight alkalmazásból
+egy koppintással telepíthető és frissül. Beállítás egyszer:
+
+1. <https://developer.apple.com/programs/> – csatlakozz az Apple Developer Programhoz.
+2. A *Team ID*: developer.apple.com → Account → **Membership details**.
+3. App Store Connect → **Users and Access → Integrations → App Store Connect API** → új kulcs **Admin**
+   szereppel; töltsd le a `.p8` fájlt, és jegyezd fel a *Key ID*-t és az *Issuer ID*-t.
+4. GitHub → a repó → **Settings → Secrets and variables → Actions → New repository secret**:
+   `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (a `.p8` fájl teljes tartalma).
+5. Futtasd az *iOS app* workflow-t (Actions → iOS app → Run workflow): ez regisztrálja az azonosítókat. Utána
+   App Store Connect → **Apps → + → New App**: iOS, a `hu.mozizas.screenshare` csomagazonosítóval (a név legyen
+   egyedi, pl. „Screen Share HU”), majd futtasd újra a workflow-t.
+6. App Store Connect → az app → **TestFlight** → add hozzá magad (és akit szeretnél) belső tesztelőnek; az iPhone-on
+   a **TestFlight** alkalmazásból telepíthető.
+
 Fordítás: a GitHub Actions (`.github/workflows/ios.yml`) macOS gépen építi minden változásnál; kézzel Macen:
 `brew install xcodegen`, `cd ios && xcodegen generate`, majd Xcode-ban megnyitható.
 
