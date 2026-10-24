@@ -38,6 +38,8 @@ class VideoPlayer {
   /** Forgets the stream (a new connection starts with a keyframe). */
   void reset();
   Stats stats() const;
+  /** A picture is on the screen (the window can be shown). */
+  bool hasPicture() const;
 
  private:
   struct Impl;

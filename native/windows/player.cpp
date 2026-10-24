@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -33,6 +34,7 @@ const IID kCodecApi = {0x901db4c7, 0x31ce, 0x41a2, {0x85, 0xdc, 0x8f, 0xa0, 0xbf
 // NV12 → RGB (BT.709, video range), drawn over a letterboxed rectangle
 const char* kShader =
     "cbuffer Quad : register(b0) { float4 rect; };\n"
+    "cbuffer Fade : register(b1) { float4 fade; };\n"
     "Texture2D<float> lum : register(t0);\n"
     "Texture2D<float2> chroma : register(t1);\n"
     "SamplerState smp : register(s0);\n"
@@ -47,7 +49,7 @@ const char* kShader =
     "float4 ps(V i) : SV_TARGET {\n"
     "  float y = (lum.Sample(smp, i.uv) - 0.0627451) * 1.164383;\n"
     "  float2 uv = chroma.Sample(smp, i.uv) - 0.5;\n"
-    "  return float4(saturate(float3(y + 1.792741 * uv.y, y - 0.213249 * uv.x - 0.532909 * uv.y, y + 2.112402 * uv.x)), 1);\n"
+    "  return float4(saturate(float3(y + 1.792741 * uv.y, y - 0.213249 * uv.x - 0.532909 * uv.y, y + 2.112402 * uv.x)) * fade.x, 1);\n"
     "}\n";
 
 struct Frame {
@@ -95,6 +97,10 @@ struct VideoPlayer::Impl {
   bool needKey = true;
   LONGLONG sampleTime = 0;
   std::deque<double> captures; // capture times of the frames inside the decoder, in order
+
+  ComPtr<ID3D11Buffer> fadeBuf;
+  double firstAt = 0, lastDraw = 0;
+  std::atomic<bool> pictured{false};
 
   // statistics
   mutable std::mutex statsMu;
@@ -149,6 +155,7 @@ struct VideoPlayer::Impl {
     bd.Usage = D3D11_USAGE_DEFAULT;
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     dev->CreateBuffer(&bd, nullptr, &quad);
+    dev->CreateBuffer(&bd, nullptr, &fadeBuf);
     D3D11_SAMPLER_DESC smp = {};
     smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -311,7 +318,15 @@ struct VideoPlayer::Impl {
       if (!captures.empty()) captures.pop_front();
       if (upload(sample.Get())) got = true;
     }
-    if (got) {
+    // a newer frame already waiting (the decoder fell behind): only that one is shown
+    bool newer;
+    {
+      std::lock_guard<std::mutex> l(mu);
+      newer = !queue.empty() && !resize && !resetPending;
+    }
+    // (but a decoder that stays behind still shows a picture at least every 40 ms)
+    if (got && (!newer || nowMs() - lastDraw > 40)) {
+      lastDraw = nowMs();
       draw();
       measure(capture);
     }
@@ -396,6 +411,12 @@ struct VideoPlayer::Impl {
       ctx->IASetInputLayout(nullptr);
       ctx->VSSetShader(vs.Get(), nullptr, 0);
       ctx->VSSetConstantBuffers(0, 1, quad.GetAddressOf());
+      // the first picture comes up from black (~0.2 s) instead of popping in
+      if (firstAt == 0) firstAt = nowMs();
+      float k = float(std::min(1.0, (nowMs() - firstAt) / 220.0));
+      float fade[4] = {1 - (1 - k) * (1 - k), 0, 0, 0};
+      ctx->UpdateSubresource(fadeBuf.Get(), 0, nullptr, fade, 0, 0);
+      ctx->PSSetConstantBuffers(1, 1, fadeBuf.GetAddressOf());
       ctx->PSSetShader(ps.Get(), nullptr, 0);
       ID3D11ShaderResourceView* srvs[2] = {lumSrv.Get(), chromaSrv.Get()};
       ctx->PSSetShaderResources(0, 2, srvs);
@@ -407,7 +428,10 @@ struct VideoPlayer::Impl {
       ctx->PSSetShaderResources(0, 2, none);
     }
     swap->Present(0, tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (lumSrv && frameW) pictured = true;
   }
+
+  bool fading() const { return firstAt > 0 && nowMs() - firstAt < 240; }
 
   void measure(double capture) {
     double now = nowMs();
@@ -440,7 +464,17 @@ struct VideoPlayer::Impl {
       Frame f;
       {
         std::unique_lock<std::mutex> l(mu);
-        cv.wait(l, [&] { return quit || resize || resetPending || !queue.empty(); });
+        auto ready = [&] { return quit || resize || resetPending || !queue.empty(); };
+        if (fading()) {
+          // the fade-in goes on even if the picture stands still
+          if (!cv.wait_for(l, std::chrono::milliseconds(15), ready)) {
+            l.unlock();
+            draw();
+            continue;
+          }
+        } else {
+          cv.wait(l, ready);
+        }
         if (quit) break;
         if (resize) {
           resize = false;
@@ -507,6 +541,8 @@ void VideoPlayer::reset() {
   }
   impl_->cv.notify_all();
 }
+
+bool VideoPlayer::hasPicture() const { return impl_->pictured; }
 
 VideoPlayer::Stats VideoPlayer::stats() const {
   std::lock_guard<std::mutex> l(impl_->statsMu);
