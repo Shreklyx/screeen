@@ -184,52 +184,42 @@ Fordítás: a GitHub Actions (`.github/workflows/ios.yml`) macOS gépen építi 
 ## Asztali alkalmazás (Windows, Mac)
 
 Letöltés: a weboldal főoldalán, vagy <https://github.com/Shreklyx/screeen/releases/tag/desktop-latest>
-(**ScreenShare-Setup.exe** Windowsra, **ScreenShare-mac.dmg** Macre – Intel és Apple Silicon is).
+(**ScreenShare-Setup.exe** Windowsra – 64 bites, **ScreenShare-mac.dmg** Macre – Apple Silicon és Intel, macOS 12.3+).
 
-**Saját alkalmazás:** a felülete be van építve (nem a weboldalt nyitja meg), a szervert (alap: `https://mozizas.hu`)
-csak a kapcsolódáshoz, a relékhez és a nézőknek küldött linkhez használja. A böngészős oldalhoz képest nincs benne
-bemutató, letöltés, böngészős tipp – rögtön a **Megosztok** / **Nézek** választás jön.
+**Natív alkalmazás, Electron és Chromium nélkül** (`native/`): Windowson egyetlen ~1,5 MB-os program (Win32,
+Direct3D 11, Media Foundation, WASAPI), Macen egy ~2 MB-os alkalmazás (AppKit, ScreenCaptureKit, VideoToolbox, Core
+Audio). A két alkalmazás közös C++ magja (`native/core`) végzi a kapcsolódást a szerverhez és a közvetlen mód
+átvitelét (lásd lent). A szervert (alap: `https://mozizas.hu`) csak a kapcsolódáshoz, a relékhez és a nézőknek
+küldött linkhez használja.
 
-**Frissítés az alkalmazásban:** induláskor és háromóránként megnézi, van-e új verzió (minden változásnál új build készül).
-Windowson a háttérben letölti, a fejlécben megjelenik: *Új verzió kész – **Újraindítás és frissítés***; ha nem
-kattintasz, a következő kilépéskor települ. Macen (az alkalmazás nincs Apple-lel aláírva, így nem cserélheti le
-magát) a fejlécben *Új verzió – **Letöltés***: a DMG-ből húzd át az új verziót az Alkalmazások mappába.
-Kézzel: *Fájl → Frissítések keresése…*. (Az első, ilyen frissítést tudó verziót még kézzel kell letölteni.)
-
-Ami a böngészőhöz képest még több:
-
-- **saját képernyő-/ablakválasztó**, a **rendszerhang magától megy** Windowson és Macen is (nem kell pipát keresni,
-  Macen semmit nem kell mellé telepíteni),
-- **5.1 / 7.1 térhang** Windowson (lásd fent) – egy kis beépített segédprogram (`desktop/native/ss-audio.cpp`) a
-  Windows hangmotorjából (WASAPI loopback, „Pro Audio” prioritással) minden csatornát felvesz; sztereó hangszórónál
-  a megszokott sztereó megy,
-- **két videókártyás laptopon az erősebbet használja** (NVIDIA → NVENC hardveres kódolás), és engedi a **H.265**
-  hardveres kódolást, ha a túloldal is támogatja,
-- a megosztás **nem lassul le**, ha az ablak kicsinyítve vagy takarásban van, és megosztás közben a kódoló
-  folyamatok **magasabb prioritást** kapnak (egy mellette futó játék nem fojtja el),
-- megosztás közben **nem alszik el** a gép,
-- **közvetlen mód** (alapból be van kapcsolva): az alkalmazásos nézők WebRTC nélkül kapják a képet – lásd lent.
+- **Megosztás:** jelszó (Windowson DPAPI-val, Macen a Kulcskarikában megjegyezve), képernyő, minőség (4K 60 FPS-ig,
+  1080p 120 FPS), a gép hangja. A szobakód és a link után a nézőlista: ki milyen úton (helyi hálózat / internet /
+  szerveren át), hány FPS-sel, mekkora bitrátával, RTT-vel és mért késéssel néz.
+- **Windows:** a DXGI Desktop Duplication abban a pillanatban adja a képet, amikor a Windows összeállította (az
+  egérmutató berajzolva, a méretezés a GPU-n); **NVIDIA kártyán NVENC** kódolja közvetlenül ezt a textúrát (P1,
+  „ultra low latency”, CBR, B-kocka nélkül, kulcskocka csak kérésre), **Intel / AMD kártyán** a videókártya saját
+  Media Foundation kódolója (BGRA → NV12 a GPU-n, BT.709), ha egyik sincs, a Windows szoftveres kódolója (1080p 30).
+  A gép teljes hangja WASAPI loopbackkel – **5.1 / 7.1 térhangban** is, ha a hangszóró-beállítás az.
+- **Mac:** a ScreenCaptureKit a kirajzolás pillanatában adja a képet (már a küldött méretre méretezve, YUV-ban),
+  a **VideoToolbox** a hardveres kódolón kódolja (alacsony késleltetésű sebességszabályozás); a gép hangja
+  macOS 13-tól, semmit nem kell mellé telepíteni.
+- **Nézés:** kód vagy link; a képkockákat a videókártya dekódolja (Windowson Media Foundation alacsony késleltetésű
+  módban + flip-model swap chain, ami minden képet azonnal kirak; Macen VideoToolbox → IOSurface közvetlenül a
+  rétegre), a hang Opus → 5–100 ms-os, magától igazodó puffer. **F** / dupla kattintás: teljes képernyő, **S**:
+  statisztika, **M**: némítás.
+- **Frissítés:** induláskor megnézi (`native-latest.json`), van-e új verzió; Windowson letölti és csendben telepíti,
+  majd újraindul; Macen letölti, kicseréli magát és újraindul. A korábbi (Electron) alkalmazás is erre frissül:
+  Windowson magától (a telepítő eltávolítja az Electron-os változatot), Macen a *Letöltés* gombbal a DMG-t kapod –
+  húzd az Alkalmazások mappába.
 
 ### Közvetlen mód (WebRTC nélkül – alkalmazásban és böngészőben)
 
 A kép a saját átvitelünkkel megy, nem WebRTC-vel. Ha a megosztó és a néző is az asztali alkalmazást használja, a
 lehető legrövidebb úton:
 
-- a megosztó gép **egyszer** kódol (H.264, a videókártyán – WebCodecs, „realtime” mód) minden alkalmazásos nézőnek,
-  és ha a kódoló épp dolgozik, a következő képkockát kihagyja ahelyett, hogy sorba állna (a sor csak késés);
-- **Windowson, NVIDIA kártyával, teljes képernyő megosztásakor natív kód** dolgozik (`desktop/native/ss-capture.cpp`):
-  a DXGI Desktop Duplication abban a pillanatban adja át az új képet, amikor a Windows összeállította (nem fix
-  ütemben kérdez, mint a böngésző), a kép a videókártyán marad (az egérmutató berajzolva, a méretezés egyetlen
-  GPU-rajzolás), az **NVENC közvetlenül ezt a textúrát kódolja** (P1, „ultra low latency”, B-kocka és előretekintés
-  nélkül, CBR kétképkockás pufferrel, kulcskocka csak kérésre), és a kódolt képkockák a megosztó alkalmazásból
-  egyenesen az UDP-re mennek – az oldalt nem is érintik. A nézőlistában: *H.264 · NVENC (natív)*. Ablak megosztásánál,
-  ha a képernyő nem az NVIDIA kártyán van (pl. laptop belső kijelzője Intel-lel), régi illesztőprogramnál vagy bármilyen
-  hibánál magától a WebCodecs kódoló veszi át;
-- **Macen ugyanígy natív kód** (`desktop/native/ss-capture-mac.swift`, macOS 12.3+): a **ScreenCaptureKit** a
-  kirajzolás pillanatában adja a képet, már a küldött méretre méretezve és YUV-ra alakítva a GPU-n, a **VideoToolbox**
-  ezt a felületet közvetlenül kódolja a hardveres kódolón (alacsony késleltetésű sebességszabályozás, B-kocka nélkül,
-  kulcskocka csak kérésre). A nézőlistában: *H.264 · VideoToolbox (natív)*. Ablak megosztásánál vagy hibánál itt is a
-  WebCodecs kódoló dolgozik;
+- a megosztó gép **egyszer** kódol (H.264, a videókártyán – lásd fent) minden nézőnek, és ha a kódoló épp dolgozik,
+  a következő képkockát kihagyja ahelyett, hogy sorba állna (a sor csak késés); a kódolt képkockák a rögzítés után
+  egyenesen az UDP-re mennek;
 - a képkockák ~1,1 KB-os UDP-csomagokban mennek, AES-GCM titkosítással (a kulcsot a két alkalmazás X25519-cel
   egyezteti, a szerver sem látja a képet), a küldés gyors és csak enyhén tagolt (a célbitráta 3-szorosával);
 - a néző **puffer nélkül** dolgozik: minden teljes képkockát azonnal dekódol, és egy alacsony késleltetésű
@@ -279,15 +269,18 @@ nézőlistában pedig, ki kapja térhangban. A néző statisztikájában (**S**)
 beépített oldaláról kapcsolódik (`app://screenshare`) – ehhez a szerveren is az új verzió kell
 (`sudo bash deploy/install.sh`).
 
-A `desktop/` mappában van (Electron). Az installereket a GitHub Actions (`.github/workflows/desktop.yml`)
-Windows és Mac gépen építi és teszteli minden változásnál; kézzel: `npm ci --prefix desktop`, majd
-`npm run dist:win --prefix desktop` (Windowson, előtte a két segédprogram – 7.1 hang és natív képrögzítés/NVENC:
-`desktop/native/build.sh` MinGW-vel, vagy Visual Studio parancssorban
-`cl /std:c++17 /O2 /EHsc /MT /Fe:desktop\native\ss-audio.exe desktop\native\ss-audio.cpp ole32.lib avrt.lib winmm.lib` és
-`cl /std:c++17 /O2 /EHsc /MT /Fe:desktop\native\ss-capture.exe desktop\native\ss-capture.cpp d3d11.lib dxgi.lib avrt.lib user32.lib`) vagy
-`npm run dist:mac --prefix desktop` (Macen, előtte a natív képrögzítő architektúránként:
-`cd desktop/native && xcrun swiftc -O -target arm64-apple-macos12.3 -o ss-capture-mac-arm64 ss-capture-mac.swift`, és
-ugyanez `x86_64-apple-macos12.3` / `ss-capture-mac-x64` – az univerzális alkalmazás mindkettőt egybefűzi).
+A `native/` mappában van. A GitHub Actions (`.github/workflows/native.yml`) minden változásnál lefordítja (Windows:
+MSVC, Mac: arm64 + x86_64 egy alkalmazásba fűzve), és a CI gépeken valódi megosztással és nézéssel teszteli (az
+alkalmazás megoszt egy natív nézőnek, és néz egy natív megosztót), majd feltölti a `desktop-latest` kiadásba. Kézzel:
+
+```bash
+cmake -S native -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build   # Windows (MSVC) / Mac / Linux (csak a mag + tesztek)
+build/sscore_test                                                            # a mag tesztjei
+```
+
+Macen egy architektúra: `-DCMAKE_OSX_ARCHITECTURES=arm64` (vagy `x86_64`) `-DCMAKE_OSX_DEPLOYMENT_TARGET=12.3`.
+A `build/ss-cli` parancssoros megosztó / néző (teszteléshez: `ss-cli host --server … --password … --h264 fájl`,
+`ss-cli view --server … --code …`). A korábbi Electron alkalmazás (`desktop/`) már nem készül.
 
 ## Fejlesztés
 
@@ -308,13 +301,15 @@ A képernyőmegosztás csak HTTPS-en vagy `localhost`-on működik. TURN relé n
   a minőséget `RTCRtpSender.setParameters()` (bitráta, FPS, felbontás-skálázás, degradáció, prioritás),
   `setCodecPreferences()` és az SDP hangolása (Opus sztereó/510k, kezdő bitráta) állítja. Forrásváltáskor
   `replaceTrack()`, kodekváltáskor újratárgyalás ugyanazon a kapcsolaton, megszakadáskor ICE restart.
-- Közvetlen mód: `desktop/direct.js` (az alkalmazás UDP-átvitele: titkosítás, darabolás, NACK, kulcskocka-kérés,
-  óra-egyeztetés, lyukasztás a NAT-on, szerveres relé), `server/direct-relay.js` (a szerver 3479/udp portja:
-  címfelderítés és relé, csak a munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része
-  (WebCodecs kódolás/dekódolás, kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet),
-  `public/direct-web.js` (ugyanez a böngészőben: WebCrypto + WebSocket a szerveren át),
-  `desktop/native/ss-capture-mac.swift` (macOS: ScreenCaptureKit + VideoToolbox),
-  `desktop/native/ss-capture.cpp` (Windows: DXGI képrögzítés + NVENC; az NVIDIA Video Codec SDK 11.1 API-fejléce a
-  `third_party/` mappában, MIT licenc – a futáshoz csak az NVIDIA illesztőprogram kell).
+- Közvetlen mód: `native/core` (a natív alkalmazások közös C++ magja: X25519 + AES-GCM titkosítás – BearSSL –,
+  darabolás, NACK, kulcskocka-kérés, óra-egyeztetés, lyukasztás a NAT-on, szerveres / TURN relé, WebSocket-tartalék,
+  a megosztó és a néző logikája), `server/direct-relay.js` (a szerver 3479/udp portja: címfelderítés és relé, csak a
+  munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része (WebCodecs kódolás/dekódolás,
+  kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet), `public/direct-web.js` (ugyanez a
+  böngészőben: WebCrypto + WebSocket a szerveren át), `desktop/direct.js` (ugyanez Node-ban – a korábbi Electron
+  alkalmazásé, a tesztek használják).
+- `native/windows` (Win32 + Direct3D 11: DXGI képrögzítés, NVENC – az NVIDIA Video Codec SDK API-fejléce a
+  `native/third_party/nvenc` mappában, MIT licenc –, Media Foundation kódolás / dekódolás, WASAPI hang, NSIS
+  telepítő), `native/mac` (AppKit, ScreenCaptureKit, VideoToolbox, Core Audio), `native/common` (a nézők hangpuffere).
 - `docker-compose.yml` – `app` (Node), `caddy` (HTTPS, beállítás: `deploy/caddy/Caddyfile`), `turn` (coturn, host
   hálózaton; a belső/foglalt címek felé tiltott relézéssel).

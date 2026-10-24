@@ -87,11 +87,11 @@
       <section id="downloads" class="downloads" hidden aria-labelledby="dl-title">
         <div>
           <h2 id="dl-title">Asztali alkalmazás</h2>
-          <p class="hint">A gép teljes hangját magától megosztja Windowson és Macen is (semmit nem kell mellé telepíteni), 5.1 / 7.1 hangszórókról térhangban (Windows). Laptopon az erősebb videókártyát használja (NVIDIA), és a háttérben sem lassul le a megosztás. A legkisebb késést is ez adja: alkalmazások között a kép közvetlenül, UDP-n megy (NVIDIA kártyán natív NVENC kódolással), böngészős nézőknek a szerveren át – mindkettő puffer nélkül, WebRTC nélkül.</p>
+          <p class="hint">Natív alkalmazás, böngésző nélkül (Windowson ~1 MB, Macen ~2 MB). A képet a videókártya kódolja (NVIDIA NVENC, Intel, AMD, Apple), a gép teljes hangját magától megosztja – Windowson 5.1 / 7.1 térhangban is, Macen macOS 13-tól –, semmit nem kell mellé telepíteni. Ez adja a legkisebb késést: alkalmazások között a kép közvetlenül, UDP-n megy, böngészős nézőknek a szerveren át – puffer nélkül, saját titkosított átvitellel. Magát frissíti.</p>
         </div>
         <div class="dl-buttons">
-          <a id="dlWin" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-Setup.exe">Windows</a>
-          <a id="dlMac" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-mac.dmg">Mac</a>
+          <a id="dlWin" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-Setup.exe">Windows (64 bites)</a>
+          <a id="dlMac" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-mac.dmg">Mac (macOS 12.3+)</a>
         </div>
       </section>
 

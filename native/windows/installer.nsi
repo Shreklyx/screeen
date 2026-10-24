@@ -2,6 +2,8 @@
 ; into %LOCALAPPDATA%\Programs\ScreenShare, with Start menu and desktop shortcuts.
 ;   makensis /DVERSION=2.0.123 /DEXE=path\ScreenShare.exe /DOUT=ScreenShare-Setup.exe installer.nsi
 ; Silent: ScreenShare-Setup.exe /S  (the in-app update adds /run: the app starts when done)
+; It also replaces the earlier Screen Share (Electron): that app's own updater runs this installer
+; (--updated /S --force-run), and its per-user install is removed before this one goes in.
 
 Unicode true
 !include "MUI2.nsh"
@@ -24,6 +26,9 @@ VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 
 !define UNINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\ScreenShareNative"
+; the Electron app (electron-builder, per user): its key is a UUID v5 of its app id
+!define ELECTRON_KEY "Software\f099d69f-07c3-529a-ae81-aacc543a1020"
+!define ELECTRON_UNINSTALLER "Uninstall Screen Share.exe"
 !define MUI_ICON "app.ico"
 !define MUI_UNICON "app.ico"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\ScreenShare.exe"
@@ -36,6 +41,16 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 !insertmacro MUI_LANGUAGE "Hungarian"
 
 Section "Screen Share"
+  ; the Electron app first (its uninstaller would take the shortcuts made below): silently, in
+  ; place (_?=), so that it has finished before this goes on
+  ReadRegStr $9 HKCU "${ELECTRON_KEY}" "InstallLocation"
+  StrCmp $9 "" 0 +2
+    StrCpy $9 "$LOCALAPPDATA\Programs\screenshare-desktop"
+  IfFileExists "$9\${ELECTRON_UNINSTALLER}" 0 noElectron
+    ExecWait '"$9\${ELECTRON_UNINSTALLER}" /S /currentuser _?=$9'
+    Delete "$9\${ELECTRON_UNINSTALLER}"
+    RMDir /r "$9"
+  noElectron:
   SetOutPath "$INSTDIR"
   ; the app that started this update closes itself: wait until its file is free
   StrCpy $0 0
@@ -62,11 +77,15 @@ Section "Screen Share"
   WriteRegDWORD HKCU "${UNINST}" "NoRepair" 1
   ${GetSize} "$INSTDIR" "/S=0K" $1 $2 $3
   WriteRegDWORD HKCU "${UNINST}" "EstimatedSize" $1
-  ; an in-app update: start the new version
+  ; an in-app update (/run) or the Electron app's (--force-run): start the new version
   ${GetParameters} $R0
   ${GetOptions} $R0 "/run" $R1
-  IfErrors +2 0
+  IfErrors 0 run
+  ${GetOptions} $R0 "--force-run" $R1
+  IfErrors done
+  run:
     Exec '"$INSTDIR\ScreenShare.exe"'
+  done:
 SectionEnd
 
 Section "Uninstall"

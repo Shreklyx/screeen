@@ -199,22 +199,38 @@ jobs:
             }
             if (problems.length) { console.error(problems.join('\n')); process.exit(1); }
           "
+      # the zip for the in-app update, the disk image for people (drag to Applications)
       - name: Package
         run: |
           cd dist
           ditto -c -k --keepParent "Screen Share.app" ../ScreenShare-Native-Mac.zip
           cd ..
-          ls -la ScreenShare-Native-Mac.zip
+          mkdir dmg
+          cp -R "dist/Screen Share.app" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "Screen Share" -srcfolder dmg -ov -format UDZO ScreenShare-mac.dmg
+          ls -la ScreenShare-Native-Mac.zip ScreenShare-mac.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: screenshare-native-mac
-          path: ScreenShare-Native-Mac.zip
+          path: |
+            ScreenShare-Native-Mac.zip
+            ScreenShare-mac.dmg
           if-no-files-found: error
 
+  # The "desktop-latest" release – what the website links to and every installed app updates from:
+  #   ScreenShare-Setup.exe / ScreenShare-mac.dmg   the native apps under the names the site always used
+  #   native-latest.json                            the native apps' own update check
+  #   latest.yml / latest-mac.yml                   for the earlier Electron apps: their updaters see a
+  #                                                 newer version and install (Windows) or download (Mac)
+  #                                                 the native app in their place
   publish:
     needs: [core, windows, mac]
     if: github.ref == 'refs/heads/claude/elegant-gauss-mi4rl5' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    concurrency:
+      group: native-publish
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -226,9 +242,43 @@ jobs:
         with:
           name: screenshare-native-mac
           path: out
-      - name: Upload to the "desktop-latest" release (next to the Electron app)
+      - name: Publish to the "desktop-latest" release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: 2.0.${{ github.run_number }}
         run: |
-          printf '{"version":"2.0.%s","windows":"ScreenShare-Native-Setup.exe","mac":"ScreenShare-Native-Mac.zip"}\n' "${{ github.run_number }}" > out/native-latest.json
-          gh release upload desktop-latest out/ScreenShare-Native-Setup.exe out/ScreenShare-Native-Mac.zip out/native-latest.json --clobber --repo ${{ github.repository }}
+          set -e
+          cd out
+          cp ScreenShare-Native-Setup.exe ScreenShare-Setup.exe
+          sha=$(openssl dgst -sha512 -binary ScreenShare-Setup.exe | base64 -w0)
+          size=$(stat -c %s ScreenShare-Setup.exe)
+          date=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          printf 'version: %s\nfiles:\n  - url: ScreenShare-Setup.exe\n    sha512: %s\n    size: %s\npath: ScreenShare-Setup.exe\nsha512: %s\nreleaseDate: '"'"'%s'"'"'\n' \
+            "$VERSION" "$sha" "$size" "$sha" "$date" > latest.yml
+          printf 'version: %s\nfiles:\n  - url: ScreenShare-mac.dmg\npath: ScreenShare-mac.dmg\nreleaseDate: '"'"'%s'"'"'\n' "$VERSION" "$date" > latest-mac.yml
+          printf '{"version":"%s","windows":"ScreenShare-Setup.exe","mac":"ScreenShare-Native-Mac.zip"}\n' "$VERSION" > native-latest.json
+          cat latest.yml latest-mac.yml native-latest.json
+          # the files first, the version files after them: no updater sees a version before its file
+          gh release upload desktop-latest ScreenShare-Setup.exe ScreenShare-Native-Setup.exe ScreenShare-mac.dmg ScreenShare-Native-Mac.zip --clobber
+          gh release upload desktop-latest latest.yml latest-mac.yml native-latest.json --clobber
+          # what only the Electron app used
+          for old in ScreenShare-mac.zip ss-audio.exe ScreenShare-Setup.exe.blockmap ScreenShare-mac.dmg.blockmap ScreenShare-mac.zip.blockmap; do
+            gh release delete-asset desktop-latest "$old" -y 2>/dev/null || true
+          done
+          cat > notes.md <<NOTES
+          Windows (64 bites): **ScreenShare-Setup.exe** · Mac (Apple Silicon és Intel, macOS 12.3+): **ScreenShare-mac.dmg** · iPhone / iPad: **ScreenShare-iOS.ipa**
+
+          Natív alkalmazás – Electron és Chromium nélkül (Windowson ~1 MB, Macen ~2 MB):
+          - Windows: DXGI képernyőkép, NVENC / Intel / AMD hardveres kódolás (vagy a Windows szoftveres kódolója), a gép teljes hangja (5.1 / 7.1 is), Direct3D 11 megjelenítés.
+          - Mac: ScreenCaptureKit + VideoToolbox, a gép hangja macOS 13-tól (semmit nem kell mellé telepíteni).
+          - Saját, titkosított átvitel (UDP, ha kell a szerveren át), puffer nélkül – a lehető legkisebb késés.
+          - Magát frissíti. A korábbi (Electron) alkalmazás is erre frissül: Windowson magától, Macen letölti ezt a lemezképet (húzd az Alkalmazások mappába).
+
+          Az alkalmazás nincs Microsofttal / Apple-lel aláírva:
+          - Windows: „A Windows megvédte a számítógépet” ablaknál → **További információ → Futtatás mindenképp**.
+          - Mac: az első indításnál jobb klikk az alkalmazáson → **Megnyitás**, vagy Rendszerbeállítások → Adatvédelem és biztonság → **Megnyitás mindenképp**. Megosztáshoz engedélyezd a képernyőfelvételt (Képernyő- és rendszerhangfelvétel).
+
+          Verzió: $VERSION · készült: ${{ github.sha }}
+          NOTES
+          gh release edit desktop-latest --title "Screen Share – natív alkalmazás" --notes-file notes.md

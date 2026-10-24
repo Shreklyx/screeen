@@ -1,13 +1,10 @@
-# Builds the Windows and macOS desktop app with its native helpers (Windows: 5.1/7.1
-# audio, DXGI + NVENC capture; macOS: ScreenCaptureKit + VideoToolbox capture),
-# tests that it starts (and that screen capture and the helpers run), and publishes
-# the installers to the "desktop-latest" release that the website links to.
-name: Desktop app
+# RETIRED – the Electron desktop app. The native apps (native.yml: native/windows, native/mac)
+# replaced it: they are published to the "desktop-latest" release under the same names, and the
+# installed Electron apps update to them. This build is kept for reference only: it runs by hand
+# and publishes nothing.
+name: Desktop app (Electron, retired)
 
 on:
-  push:
-    branches: [claude/elegant-gauss-mi4rl5, main]
-    paths: ['desktop/**', 'public/**', 'server/**', '.github/workflows/desktop.yml']
   workflow_dispatch:
 
 concurrency:
@@ -108,36 +105,3 @@ jobs:
             desktop/dist/latest.yml
             desktop/dist/latest-mac.yml
           if-no-files-found: error
-
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: screenshare-*
-          path: out
-          merge-multiple: true
-      - name: Publish to the "desktop-latest" release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: desktop-latest
-          target_commitish: ${{ github.sha }}
-          name: Screen Share – asztali alkalmazás
-          body: |
-            Windows: **ScreenShare-Setup.exe** · Mac (Intel és Apple Silicon): **ScreenShare-mac.dmg**
-
-            - A gép teljes hangját magától megosztja – Macen is, semmit nem kell mellé telepíteni (macOS 13 vagy újabb; első megosztáskor engedélyezd a rendszerhang-felvételt).
-            - Windowson 5.1 / 7.1 hangszóró (vagy 7.1-es fejhallgató) esetén minden csatornát átküld: a térhangos nézők térhangot kapnak.
-            - Közvetlen mód: ha a néző is az alkalmazással néz, a kép WebRTC nélkül, puffer nélkül megy – a legkisebb késés.
-            - Saját alkalmazás: a felülete be van építve (a szervert csak a kapcsolódáshoz használja), és magát frissíti: Windowson letölti az új verziót („Újraindítás és frissítés”), Macen felajánlja a letöltését.
-
-            Az alkalmazás nincs Microsofttal / Apple-lel aláírva:
-            - Windows: „A Windows megvédte a számítógépet” ablaknál → **További információ → Futtatás mindenképp**.
-            - Mac: az első indításnál jobb klikk az alkalmazáson → **Megnyitás**, vagy Rendszerbeállítások → Adatvédelem és biztonság → **Megnyitás mindenképp**.
-
-            Verzió: 1.1.${{ github.run_number }} · készült: ${{ github.sha }}
-          files: out/*
-          make_latest: true

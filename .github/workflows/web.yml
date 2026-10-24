@@ -1,0 +1,22 @@
+# The server and the website: the tests (signaling, direct mode's protocol in every implementation,
+# the audio buffer) on every change. (The Electron build used to run them; it is retired.)
+name: Server and website
+
+on:
+  push:
+    branches: [claude/elegant-gauss-mi4rl5, main]
+    paths: ['server/**', 'public/**', 'desktop/direct.js', 'test/**', 'package.json', 'package-lock.json', '.github/workflows/web.yml']
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
