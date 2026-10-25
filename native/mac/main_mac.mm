@@ -1612,6 +1612,7 @@ static int smoke(NSArray<NSString*>* args) {
   EngineConfig cfg;
   cfg.server = server;
   cfg.webSocket = openMacWebSocket;
+  cfg.forceTcp = getenv("SS_FORCE_TCP") != nullptr; // (CI: the WebSocket path, as to a browser)
   EngineCallbacks cb;
   cb.event = [&](const Json& e) {
     if (e["type"].str() == "hosted") line("CODE " + e["code"].str());

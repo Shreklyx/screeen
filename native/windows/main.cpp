@@ -1719,6 +1719,7 @@ int smoke(int argc, wchar_t** argv) {
   EngineConfig cfg;
   cfg.server = server;
   cfg.webSocket = openWinHttpWebSocket;
+  cfg.forceTcp = GetEnvironmentVariableA("SS_FORCE_TCP", nullptr, 0) > 0; // (CI: the WebSocket path, as to a browser)
   EngineCallbacks cb;
   cb.event = [&](const Json& e) {
     if (e["type"].str() == "hosted") line("CODE " + e["code"].str());

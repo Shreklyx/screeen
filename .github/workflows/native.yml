@@ -83,6 +83,13 @@ jobs:
           "$cli" view --server http://127.0.0.1:8090 --code "$code" --seconds 8 --out from-app.h264 | tee view.log | grep -E 'RESULT' || true
           wait $appPid || true
           tail -8 host.log || true
+          # the same over the server's WebSocket (the way to a browser, and where UDP is blocked)
+          SS_FORCE_TCP=1 "$app" --smoke-host http://127.0.0.1:8090 ci 16 host-tcp.log &
+          appPid=$!
+          for i in $(seq 1 80); do grep -q '^CODE' host-tcp.log 2>/dev/null && break; sleep 0.25; done
+          code=$(grep '^CODE' host-tcp.log 2>/dev/null | awk '{print $2}' | tr -d '\r' || true)
+          "$cli" view --server http://127.0.0.1:8090 --code "$code" --seconds 8 --tcp | tee view-tcp.log | grep -E 'RESULT' || true
+          wait $appPid || true
           "$cli" host --server http://127.0.0.1:8090 --password ci --h264 native/tests/data/test.h264 --seconds 25 > cli-host.log &
           cliPid=$!
           for i in $(seq 1 80); do grep -q '^CODE' cli-host.log 2>/dev/null && break; sleep 0.25; done
@@ -93,9 +100,10 @@ jobs:
           node -e "
             const fs = require('fs');
             const res = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8').split(/\r?\n/).find((l) => l.startsWith('RESULT ')).slice(7)); } catch { return {}; } };
-            const host = res('host.log'), got = res('view.log'), view = res('view-app.log');
+            const host = res('host.log'), got = res('view.log'), view = res('view-app.log'), tcp = res('view-tcp.log');
             console.log('app as sharer:', JSON.stringify(host));
             console.log('native viewer got:', JSON.stringify(got));
+            console.log('native viewer got, over the WebSocket:', JSON.stringify(tcp));
             console.log('app as viewer:', JSON.stringify(view));
             const problems = [];
             if (!host.width) problems.push('the app captured nothing: ' + host.error);
@@ -259,13 +267,21 @@ jobs:
           "$cli" view --server http://127.0.0.1:8090 --code "$code" --seconds 8 --out from-app.h264 | tee view.log | grep -E 'RESULT' || true
           wait $appPid || true
           grep -E 'RESULT|error' host.log || true
+          # the same over the server's WebSocket (the way to a browser, and where UDP is blocked)
+          SS_FORCE_TCP=1 "$app" --smoke-host http://127.0.0.1:8090 ci 16 host-tcp.log &
+          appPid=$!
+          for i in $(seq 1 80); do grep -q '^CODE' host-tcp.log 2>/dev/null && break; sleep 0.25; done
+          code=$(grep '^CODE' host-tcp.log | awk '{print $2}')
+          "$cli" view --server http://127.0.0.1:8090 --code "$code" --seconds 8 --tcp | tee view-tcp.log | grep -E 'RESULT' || true
+          wait $appPid || true
           node -e "
             const fs = require('fs');
             const res = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8').split(/\r?\n/).find((l) => l.startsWith('RESULT ')).slice(7)); } catch { return {}; } };
-            const view = res('view-app.log'), host = res('host.log'), got = res('view.log');
+            const view = res('view-app.log'), host = res('host.log'), got = res('view.log'), tcp = res('view-tcp.log');
             console.log('app as viewer:', JSON.stringify(view));
             console.log('app as sharer:', JSON.stringify(host));
             console.log('native viewer got:', JSON.stringify(got));
+            console.log('native viewer got, over the WebSocket:', JSON.stringify(tcp));
             const problems = [];
             if (!(view.received > 100)) problems.push('the app received too few frames');
             if (!(view.shownFps > 10)) problems.push('the app did not decode / show the picture');
