@@ -31,10 +31,13 @@ namespace {
 // IID_ICodecAPI (not linked in every toolchain)
 const IID kCodecApi = {0x901db4c7, 0x31ce, 0x41a2, {0x85, 0xdc, 0x8f, 0xa0, 0xbf, 0x41, 0xb8, 0xda}};
 
-// NV12 → RGB (BT.709, video range), drawn over a letterboxed rectangle
+// NV12 → RGB (BT.709, video range), drawn over a letterboxed rectangle. Scaled with care: smaller on
+// the screen, each screen pixel is the average of the picture's pixels under it (not one bilinear
+// sample, which shimmers and makes text ragged); larger, the brightness is bicubic (Catmull-Rom,
+// sharper than bilinear); at 1:1 each pixel is the picture's own.
 const char* kShader =
     "cbuffer Quad : register(b0) { float4 rect; };\n"
-    "cbuffer Fade : register(b1) { float4 fade; };\n"
+    "cbuffer Look : register(b1) { float4 fade; float4 scale; };\n" // scale: the picture's edge in uv (xy), its pixels per screen pixel (zw)
     "Texture2D<float> lum : register(t0);\n"
     "Texture2D<float2> chroma : register(t1);\n"
     "SamplerState smp : register(s0);\n"
@@ -43,12 +46,44 @@ const char* kShader =
     "  float2 c = float2(id & 1, id >> 1);\n"
     "  V o;\n"
     "  o.pos = float4(lerp(rect.x, rect.z, c.x) * 2 - 1, 1 - lerp(rect.y, rect.w, c.y) * 2, 0, 1);\n"
-    "  o.uv = c;\n"
+    "  o.uv = c * scale.xy;\n"
     "  return o;\n"
     "}\n"
+    "float L(float2 p) { return lum.SampleLevel(smp, p, 0); }\n"
+    "float bicubic(float2 uv, float2 size) {\n" // Catmull-Rom from 9 bilinear taps
+    "  float2 p = uv * size, t1 = floor(p - 0.5) + 0.5, f = p - t1;\n"
+    "  float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
+    "  float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f), w12 = w1 + w2;\n"
+    "  float2 a = (t1 - 1) / size, b = (t1 + w2 / w12) / size, c = (t1 + 2) / size;\n"
+    "  return (L(float2(a.x, a.y)) * w0.x + L(float2(b.x, a.y)) * w12.x + L(float2(c.x, a.y)) * w3.x) * w0.y +\n"
+    "         (L(float2(a.x, b.y)) * w0.x + L(float2(b.x, b.y)) * w12.x + L(float2(c.x, b.y)) * w3.x) * w12.y +\n"
+    "         (L(float2(a.x, c.y)) * w0.x + L(float2(b.x, c.y)) * w12.x + L(float2(c.x, c.y)) * w3.x) * w3.y;\n"
+    "}\n"
     "float4 ps(V i) : SV_TARGET {\n"
-    "  float y = (lum.Sample(smp, i.uv) - 0.0627451) * 1.164383;\n"
-    "  float2 uv = chroma.Sample(smp, i.uv) - 0.5;\n"
+    "  uint tw, th;\n"
+    "  lum.GetDimensions(tw, th);\n"
+    "  float2 size = float2(tw, th), r = scale.zw, edge = scale.xy - 0.5 / size;\n"
+    "  float y = 0;\n"
+    "  float2 uv = 0;\n"
+    "  if (max(r.x, r.y) > 1.01) {\n"
+    "    int2 n = (int2)clamp(ceil(r - 0.01), 1.0, 4.0);\n"
+    "    float2 gap = r / (float2(n) * size), start = i.uv - gap * (float2(n) - 1) * 0.5;\n"
+    "    [loop] for (int b = 0; b < n.y; b++) {\n"
+    "      [loop] for (int a = 0; a < n.x; a++) {\n"
+    "        float2 q = min(start + gap * float2(a, b), edge);\n"
+    "        y += L(q);\n"
+    "        uv += chroma.SampleLevel(smp, q, 0);\n"
+    "      }\n"
+    "    }\n"
+    "    y /= n.x * n.y;\n"
+    "    uv /= n.x * n.y;\n"
+    "  } else {\n"
+    "    float2 q = min(i.uv, edge);\n"
+    "    y = min(r.x, r.y) < 0.99 ? bicubic(q, size) : L(q);\n"
+    "    uv = chroma.SampleLevel(smp, q, 0);\n"
+    "  }\n"
+    "  y = (y - 0.0627451) * 1.164383;\n"
+    "  uv -= 0.5;\n"
     "  return float4(saturate(float3(y + 1.792741 * uv.y, y - 0.213249 * uv.x - 0.532909 * uv.y, y + 2.112402 * uv.x)) * fade.x, 1);\n"
     "}\n";
 
@@ -93,6 +128,7 @@ struct VideoPlayer::Impl {
   bool providesSamples = false;
   DWORD outSize = 0;
   UINT32 frameW = 0, frameH = 0, stride = 0;
+  UINT32 showW = 0, showH = 0; // what is shown of it (a 1080-line picture is decoded as 1088 lines)
   bool needKey = true;
   LONGLONG sampleTime = 0;
   std::deque<double> captures; // capture times of the frames inside the decoder, in order
@@ -151,6 +187,7 @@ struct VideoPlayer::Impl {
     bd.Usage = D3D11_USAGE_DEFAULT;
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     dev->CreateBuffer(&bd, nullptr, &quad);
+    bd.ByteWidth = 32; // the fade, and how the picture maps to the screen
     dev->CreateBuffer(&bd, nullptr, &fadeBuf);
     D3D11_SAMPLER_DESC smp = {};
     smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -232,6 +269,13 @@ struct VideoPlayer::Impl {
       GUID sub;
       if (SUCCEEDED(t->GetGUID(MF_MT_SUBTYPE, &sub)) && sub == MFVideoFormat_NV12 && SUCCEEDED(decoder->SetOutputType(0, t.Get(), 0))) {
         MFGetAttributeSize(t.Get(), MF_MT_FRAME_SIZE, &frameW, &frameH);
+        showW = frameW;
+        showH = frameH;
+        MFVideoArea area = {};
+        if (SUCCEEDED(t->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, reinterpret_cast<UINT8*>(&area), sizeof area, nullptr)) && area.Area.cx > 0 && area.Area.cy > 0) {
+          showW = std::min(frameW, UINT32(area.Area.cx));
+          showH = std::min(frameH, UINT32(area.Area.cy));
+        }
         UINT32 s = 0;
         stride = SUCCEEDED(t->GetUINT32(MF_MT_DEFAULT_STRIDE, &s)) ? s : frameW;
         MFT_OUTPUT_STREAM_INFO info = {};
@@ -393,11 +437,12 @@ struct VideoPlayer::Impl {
     // compositor shows it at the next refresh – one still waiting for that refresh is replaced
     const float black[4] = {0, 0, 0, 1};
     ctx->ClearRenderTargetView(rtv.Get(), black);
-    if (lumSrv && chromaSrv && frameW && frameH) {
-      // letterbox: the whole picture, its aspect kept
-      double sx = double(winW) / frameW, sy = double(winH) / frameH, s = std::min(sx, sy);
-      float w = float(frameW * s / winW), h = float(frameH * s / winH);
-      float rect[4] = {(1 - w) / 2, (1 - h) / 2, (1 + w) / 2, (1 + h) / 2};
+    if (lumSrv && chromaSrv && showW && showH && texW && texH) {
+      // letterbox: the whole picture, its aspect kept, on whole pixels (at 1:1 each pixel its own)
+      double s = std::min(double(winW) / showW, double(winH) / showH);
+      UINT dw = std::max<UINT>(1, UINT(std::lround(showW * s))), dh = std::max<UINT>(1, UINT(std::lround(showH * s)));
+      UINT x0 = (winW - std::min(dw, winW)) / 2, y0 = (winH - std::min(dh, winH)) / 2;
+      float rect[4] = {float(x0) / winW, float(y0) / winH, float(x0 + dw) / winW, float(y0 + dh) / winH};
       ctx->UpdateSubresource(quad.Get(), 0, nullptr, rect, 0, 0);
       ID3D11RenderTargetView* target = rtv.Get();
       ctx->OMSetRenderTargets(1, &target, nullptr);
@@ -410,8 +455,8 @@ struct VideoPlayer::Impl {
       // the first picture comes up from black (~0.2 s) instead of popping in
       if (firstAt == 0) firstAt = nowMs();
       float k = float(std::min(1.0, (nowMs() - firstAt) / 220.0));
-      float fade[4] = {1 - (1 - k) * (1 - k), 0, 0, 0};
-      ctx->UpdateSubresource(fadeBuf.Get(), 0, nullptr, fade, 0, 0);
+      float look[8] = {1 - (1 - k) * (1 - k), 0, 0, 0, float(showW) / texW, float(showH) / texH, float(showW) / dw, float(showH) / dh};
+      ctx->UpdateSubresource(fadeBuf.Get(), 0, nullptr, look, 0, 0);
       ctx->PSSetConstantBuffers(1, 1, fadeBuf.GetAddressOf());
       ctx->PSSetShader(ps.Get(), nullptr, 0);
       ID3D11ShaderResourceView* srvs[2] = {lumSrv.Get(), chromaSrv.Get()};
@@ -424,7 +469,7 @@ struct VideoPlayer::Impl {
       ctx->PSSetShaderResources(0, 2, none);
     }
     swap->Present(0, tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
-    if (lumSrv && frameW) pictured = true;
+    if (lumSrv && showW) pictured = true;
   }
 
   bool fading() const { return firstAt > 0 && nowMs() - firstAt < 240; }
@@ -436,8 +481,8 @@ struct VideoPlayer::Impl {
     shown++;
     if (now - statsAt >= 1000) {
       std::lock_guard<std::mutex> l(statsMu);
-      stats.width = int(frameW);
-      stats.height = int(frameH);
+      stats.width = int(showW);
+      stats.height = int(showH);
       stats.fps = statsAt ? shown * 1000.0 / (now - statsAt) : 0;
       stats.hardware = hardware;
       if (!lat.empty()) {

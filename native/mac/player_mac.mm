@@ -23,10 +23,14 @@ namespace ss {
 /* ------------------------------------------------ picture */
 
 namespace {
-// the decoded frame (BGRA) letterboxed into the drawable; fades in from black at the start
+// the decoded frame (BGRA) letterboxed into the drawable; fades in from black at the start. Scaled
+// with care: smaller on the screen, each screen pixel is the average of the picture's pixels under it
+// (one bilinear sample shimmers and makes text ragged); larger, bicubic (Catmull-Rom, sharper than
+// bilinear); at 1:1 each pixel is the picture's own. look: the fade (x), picture pixels per screen pixel (zw)
 NSString* const kShader = @"#include <metal_stdlib>\n"
                            "using namespace metal;\n"
                            "struct V { float4 pos [[position]]; float2 uv; };\n"
+                           "constexpr sampler smp(filter::linear, address::clamp_to_edge);\n"
                            "vertex V vs(uint id [[vertex_id]], constant float4& rect [[buffer(0)]]) {\n"
                            "  float2 c = float2(float(id & 1), float(id >> 1));\n"
                            "  V o;\n"
@@ -34,9 +38,30 @@ NSString* const kShader = @"#include <metal_stdlib>\n"
                            "  o.uv = c;\n"
                            "  return o;\n"
                            "}\n"
-                           "fragment float4 fs(V i [[stage_in]], texture2d<float> tex [[texture(0)]], constant float& fade [[buffer(0)]]) {\n"
-                           "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
-                           "  return float4(tex.sample(s, i.uv).rgb * fade, 1);\n"
+                           "float3 bicubic(texture2d<float> t, float2 uv, float2 size) {\n"
+                           "  float2 p = uv * size, t1 = floor(p - 0.5) + 0.5, f = p - t1;\n"
+                           "  float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
+                           "  float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f), w12 = w1 + w2;\n"
+                           "  float2 a = (t1 - 1) / size, b = (t1 + w2 / w12) / size, c = (t1 + 2) / size;\n"
+                           "  return (t.sample(smp, float2(a.x, a.y)).rgb * w0.x + t.sample(smp, float2(b.x, a.y)).rgb * w12.x + t.sample(smp, float2(c.x, a.y)).rgb * w3.x) * w0.y +\n"
+                           "         (t.sample(smp, float2(a.x, b.y)).rgb * w0.x + t.sample(smp, float2(b.x, b.y)).rgb * w12.x + t.sample(smp, float2(c.x, b.y)).rgb * w3.x) * w12.y +\n"
+                           "         (t.sample(smp, float2(a.x, c.y)).rgb * w0.x + t.sample(smp, float2(b.x, c.y)).rgb * w12.x + t.sample(smp, float2(c.x, c.y)).rgb * w3.x) * w3.y;\n"
+                           "}\n"
+                           "fragment float4 fs(V i [[stage_in]], texture2d<float> tex [[texture(0)]], constant float4& look [[buffer(0)]]) {\n"
+                           "  float2 size = float2(float(tex.get_width()), float(tex.get_height())), r = look.zw;\n"
+                           "  float3 c = float3(0);\n"
+                           "  if (max(r.x, r.y) > 1.01) {\n"
+                           "    int2 n = int2(clamp(ceil(r - 0.01), float2(1), float2(4)));\n"
+                           "    float2 gap = r / (float2(n) * size), start = i.uv - gap * (float2(n) - 1) * 0.5;\n"
+                           "    for (int b = 0; b < n.y; b++)\n"
+                           "      for (int a = 0; a < n.x; a++) c += tex.sample(smp, start + gap * float2(float(a), float(b))).rgb;\n"
+                           "    c /= float(n.x * n.y);\n"
+                           "  } else if (min(r.x, r.y) < 0.99) {\n"
+                           "    c = bicubic(tex, i.uv, size);\n"
+                           "  } else {\n"
+                           "    c = tex.sample(smp, i.uv).rgb;\n"
+                           "  }\n"
+                           "  return float4(saturate(c) * look.x, 1);\n"
                            "}\n";
 }  // namespace
 
@@ -127,16 +152,18 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLCommandBuffer> cb = [commands commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+    // letterbox on whole pixels (at 1:1 each pixel the picture's own)
     double k = std::min(px.width / double(w), px.height / double(h));
-    float rw = float(w * k / px.width), rh = float(h * k / px.height);
-    float rect[4] = {(1 - rw) / 2, (1 - rh) / 2, (1 + rw) / 2, (1 + rh) / 2};
+    double dw = std::max(1.0, std::round(w * k)), dh = std::max(1.0, std::round(h * k));
+    double x0 = std::floor((px.width - dw) / 2), y0 = std::floor((px.height - dh) / 2);
+    float rect[4] = {float(x0 / px.width), float(y0 / px.height), float((x0 + dw) / px.width), float((y0 + dh) / px.height)};
     if (firstAt == 0) firstAt = nowMs();
     float t = float(std::min(1.0, (nowMs() - firstAt) / 220.0));
-    float fade = 1 - (1 - t) * (1 - t);
+    float look[4] = {1 - (1 - t) * (1 - t), 0, float(w / dw), float(h / dh)};
     [enc setRenderPipelineState:pipeline];
     [enc setVertexBytes:rect length:sizeof rect atIndex:0];
     [enc setFragmentTexture:tex atIndex:0];
-    [enc setFragmentBytes:&fade length:sizeof fade atIndex:0];
+    [enc setFragmentBytes:look length:sizeof look atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     [enc endEncoding];
     [cb presentDrawable:drawable];
@@ -327,6 +354,7 @@ MacPlayer::Stats MacPlayer::stats() const {
   }
   double off = clockOffset ? clockOffset() : NAN;
   if (!std::isnan(raw) && !std::isnan(off)) st.latencyMs = raw + off;
+  st.metal = impl_->pipeline != nil;
   return st;
 }
 

@@ -1590,6 +1590,7 @@ static int smoke(NSArray<NSString*>* args) {
     }
     player.detach();
     result.set("received", frames.load()).set("audioPackets", sounds.load()).set("shownFps", best).set("width", st.width).set("height", st.height).set("latencyMs", st.latencyMs);
+    result.set("metal", st.metal);
   }
   line("RESULT " + result.dump());
   fclose(log);

@@ -22,6 +22,7 @@ class MacPlayer {
     double fps = 0;
     double latencyMs = -1;
     bool hardware = true;
+    bool metal = false; // drawn with Metal (its shader compiled), not handed to Core Animation
   };
   explicit MacPlayer(CALayer* layer);
   ~MacPlayer();

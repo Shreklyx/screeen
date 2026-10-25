@@ -218,6 +218,7 @@ jobs:
             const problems = [];
             if (!(view.received > 100)) problems.push('the app received too few frames');
             if (!(view.shownFps > 10)) problems.push('the app did not decode / show the picture');
+            if (view.metal !== true) problems.push('the Metal shader did not compile (the picture went the slower way)');
             if (host.error === 'permission' || host.error === 'no-screen-access') console.log('::warning::this runner may not record the screen (' + host.error + ') – sharing not checked');
             else {
               if (!host.width) problems.push('the app captured nothing: ' + host.error);
