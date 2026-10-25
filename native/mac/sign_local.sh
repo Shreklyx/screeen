@@ -61,7 +61,17 @@ EOF
 sign() {
   identity || { log "no signing identity"; return 1; }
   xattr -cr "$1" 2>/dev/null
-  codesign --force --deep --keychain "$KC" --sign "$NAME" "$1" && codesign --verify --deep "$1"
+  local hash list r
+  hash=$(security find-identity -p codesigning "$KC" | awk -v n="\"$NAME\"" 'index($0, n) { print $2; exit }')
+  [ -n "$hash" ] || { log "the identity is not in its keychain"; security find-identity -p codesigning "$KC"; return 1; }
+  # codesign finds identities on the keychain search list only: ours is on it while it signs
+  list=$(security list-keychains -d user | tr '\n' ' ')
+  eval "security list-keychains -d user -s \"\$KC\" $list"
+  codesign --force --deep --keychain "$KC" --sign "$hash" "$1" && codesign --verify --deep "$1"
+  r=$?
+  [ -n "$list" ] && eval "security list-keychains -d user -s $list"
+  [ $r = 0 ] || { log "signing failed"; security find-identity -p codesigning "$KC"; }
+  return $r
 }
 
 case "${1:-}" in
