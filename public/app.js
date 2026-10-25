@@ -1,70 +1,36 @@
 'use strict';
 
 /* =====================================================================
- * Screen Share – low-latency 4K screen sharing with system audio.
+ * Screen Share – the website: share a screen with its sound, or watch one, with the least delay.
  *
- * Signaling: a WebSocket to this site's own server (/ws). Media: WebRTC,
- * directly between the browsers (or through the server's TURN relay when a
- * direct path is impossible). The host keeps one RTCPeerConnection per
- * viewer and always makes the offers; viewers only answer. Between two
- * desktop apps the picture can go without WebRTC (see DIRECT MODE).
+ * No WebRTC. The picture and the sound go with our own protocol – the one the Windows and Mac
+ * apps speak (native/core): H.264 and Opus from WebCodecs, encrypted end to end (X25519, AES-GCM),
+ * every frame passed on the moment it is ready, through the server's WebSocket (direct-web.js).
+ * What a browser lacks comes from our C/C++ code as WebAssembly (ss-web.js): the X25519 key
+ * exchange, an Opus decoder. Signaling: a WebSocket to this site's server (/ws).
  * ===================================================================== */
 
 const RES_TARGETS = { native: null, 2160: [3840, 2160], 1440: [2560, 1440], 1080: [1920, 1080], 720: [1280, 720] };
+const RES_LABEL = { native: 'natív', 2160: '4K', 1440: '1440p', 1080: '1080p', 720: '720p' };
 const CONTENT_HINT = { motion: 'motion', detail: 'detail', balanced: '' };
-const DEGRADATION = { motion: 'maintain-framerate', detail: 'maintain-resolution', balanced: 'balanced' };
-const CODECS = ['AV1', 'H265', 'VP9', 'H264', 'VP8']; // best compression first
-const CODEC_LABEL = { AV1: 'AV1', H265: 'H.265', VP9: 'VP9', H264: 'H.264', VP8: 'VP8' };
-const OPUS_PARAMS = {
-  stereo: 1, 'sprop-stereo': 1, maxaveragebitrate: 510000, maxplaybackrate: 48000,
-  'sprop-maxcapturerate': 48000, useinbandfec: 1, usedtx: 0, cbr: 0,
-};
-const AUDIO_MAX_BPS = 510000;
-// 5.1/7.1 audio: multi-channel Opus ("multiopus" – Chromium: Chrome, Edge, the app).
-// Channel order L R C LFE BL BR SL SR (as on Windows and in Chromium); the pairs
-// L/R, BL/BR and SL/SR are coded as stereo streams, the centre and LFE as mono.
-const MULTIOPUS = {
-  channels: 8,
-  fmtp: 'channel_mapping=0,1,6,7,2,3,4,5;coupled_streams=3;num_streams=5;minptime=10;useinbandfec=1;maxaveragebitrate=510000',
-};
-const MAX_KBPS = 300000; // SDP ceiling, above the highest selectable rate (250 Mbit/s)
-const START_KBPS_CAP = 12000;
-// "auto" = chosen per viewer from what this machine can do (see autoTarget)
-const DEFAULT_SETTINGS = { res: 'auto', fps: 'auto', kbps: 'auto', mode: 'motion', codec: 'auto', audio: true, audioSource: 'display' };
-const SETTINGS_VERSION = 2; // older saved settings are dropped so everyone starts from the best defaults
+const DEFAULT_SETTINGS = { res: 'auto', fps: 'auto', kbps: 'auto', mode: 'motion', audio: true, audioSource: 'display' };
+const SETTINGS_VERSION = 3; // older saved settings are dropped so everyone starts from the best defaults
 const NUMERIC_SETTINGS = new Set(['fps', 'kbps']);
-// GPU encoding: the maximum (4K cap – a 5K/6K Retina screen at full size only adds load and delay)
-const HW_TARGET = { res: '2160', fps: 60, kbps: 150000 };
-// CPU encoding: what a processor can encode without falling behind (falling behind = delay)
-const SW_TIERS = [
-  { res: '720', fps: 30, kbps: 10000 },
-  { res: '1080', fps: 30, kbps: 20000 },
-  { res: '1080', fps: 60, kbps: 35000 },
-  { res: '1440', fps: 60, kbps: 50000 },
-];
+// "auto": a GPU encoder up to 4K 60 – the processor what it manages without falling behind
+const HW_TARGET = { res: '2160', fps: 60, kbps: 120000 };
+const SW_TARGET = { res: '1080', fps: 30, kbps: 20000 };
+const DIRECT_CODEC = 'avc1.640034'; // H.264 High 5.2 (up to 4K 60): every GPU decodes it
+const DIRECT_MIN_KBPS = 3000;
 // iPhone / iPad – iPadOS Safari presents itself as a Mac, the touch screen gives it away
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
 const IS_MAC = !IS_IOS && /Macintosh/.test(navigator.userAgent);
+const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
 // started from the home-screen icon (iOS / Android web app)
 const STANDALONE = Boolean(window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone);
-// The Windows/Mac desktop app (desktop/preload.js) exposes a small API; null in a plain browser.
-const APP = window.screenshareApp || null;
-const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
-// The server this page talks to: the site itself in a browser; in the desktop app, whose pages
-// are built in, the server chosen there (default https://mozizas.hu).
-const SERVER_ORIGIN = (() => {
-  try {
-    return new URL(APP?.serverUrl || location.href).origin;
-  } catch {
-    return location.origin;
-  }
-})();
-// what viewers open: the website (also from the app)
-const SITE_URL = APP?.serverUrl ? `${SERVER_ORIGIN}/` : `${location.origin}${location.pathname}`;
-if (APP) document.documentElement.classList.add('in-app'); // an app, not a website: before the first paint
 // the website inside the iOS app (ios/App/WatchView.swift); sharing is its own tab there
 const IN_IOS_APP = /ScreenShareApp\//.test(navigator.userAgent);
 const IOS_APP_URL = 'https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-iOS.ipa';
+const SITE_URL = `${location.origin}${location.pathname}`;
 
 const ERROR_TEXT = {
   auth: 'Hibás jelszó.',
@@ -76,14 +42,25 @@ const ERROR_TEXT = {
 };
 const errorText = (err) => ERROR_TEXT[err?.code] || err?.message || 'Ismeretlen hiba.';
 
-// Troubleshooting aid: ?relay=1 forces all media through the TURN relay.
-const FORCE_RELAY = new URLSearchParams(location.search).has('relay');
-const rtcConfig = (iceServers) => ({ iceServers, bundlePolicy: 'max-bundle', iceTransportPolicy: FORCE_RELAY ? 'relay' : 'all' });
+const PATH_LABEL = { lan: 'helyi hálózat', internet: 'interneten át', relay: 'a szerveren át', turn: 'TURN relén át', tcp: 'a szerveren át' };
+// why a viewer gets no picture (yet) – shown to both sides
+const WHY_TEXT = {
+  'viewer-browser': 'a néző böngészője túl régi (friss Chrome, Edge, Firefox vagy Safari kell)',
+  server: 'a szerver még nem ismeri – futtasd rajta újra: sudo bash deploy/install.sh',
+  encoder: 'nincs használható H.264 kódoló',
+  udp: 'a két gép nem érte el egymást',
+  'udp-blocked': 'semmilyen úton nem jött létre kapcsolat – tűzfal?',
+  timeout: 'a kapcsolat nem jött létre időben',
+  unavailable: 'az átvitel nem indult el',
+  failed: 'a kapcsolat megszakadt',
+};
 
 /* ---------------------------- helpers ---------------------------- */
 
 const $ = (sel) => document.querySelector(sel);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const clockNow = () => performance.timeOrigin + performance.now();
+const evenPx = (x) => Math.max(2, Math.round(x / 2) * 2);
 
 // Storage can be missing or throw (private mode, blocked site data) – never let it break the page.
 const store = {
@@ -129,6 +106,12 @@ function fmtKbps(kbps) {
 }
 const fmtMs = (ms) => (ms == null || !isFinite(ms) ? '–' : `${Math.round(ms)} ms`);
 
+function median(list) {
+  if (!list.length) return null;
+  const sorted = [...list].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
 let audioCtx = null;
 function ensureAudioCtx() {
   if (!audioCtx) {
@@ -155,7 +138,7 @@ function createSignal({ onMessage, onOpen, onClose }) {
   const openWaiters = new Set();
 
   function connect() {
-    const socket = new WebSocket(`${SERVER_ORIGIN.replace(/^http/, 'ws')}/ws`);
+    const socket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/ws`);
     ws = socket;
     socket.onopen = () => {
       attempt = 0;
@@ -225,252 +208,26 @@ function createSignal({ onMessage, onOpen, onClose }) {
   return api;
 }
 
-/* --------------------------- codecs / SDP --------------------------- */
+/* ------------------------ the transport ------------------------ */
 
-const isAvailable = (caps, codec) => (caps?.[codec]?.supported ?? true);
+let DIRECT = null; // direct-web.js, once this browser is known to manage it
+let canDirect = { ok: false }; // what it can do (direct-web.js supported())
+let directReady = Promise.resolve();
 
-async function codecSupport(direction) {
-  const Api = direction === 'encode' ? window.RTCRtpSender : window.RTCRtpReceiver;
-  const list = Api?.getCapabilities?.('video')?.codecs?.map((c) => c.mimeType.toLowerCase()) ?? null;
-  const result = {};
-  await Promise.all(CODECS.map(async (codec) => {
-    const supported = list ? list.includes(`video/${codec.toLowerCase()}`) : true;
-    let hw = false;
-    if (supported && navigator.mediaCapabilities) {
-      const cfg = { type: 'webrtc', video: { contentType: `video/${codec}`, width: 3840, height: 2160, bitrate: 30e6, framerate: 60 } };
-      try {
-        const info = direction === 'encode'
-          ? await navigator.mediaCapabilities.encodingInfo(cfg)
-          : await navigator.mediaCapabilities.decodingInfo(cfg);
-        hw = Boolean(info.supported && info.powerEfficient);
-      } catch { /* 'webrtc' type not supported by this browser */ }
-    }
-    result[codec] = { supported, hw };
-  }));
-  return result;
-}
-
-// Prefer a codec that is hardware-accelerated on both ends, then one with a
-// hardware encoder (what this machine actually did beats the browser's
-// prediction), then H.264 – hardware on most PCs and Macs, fast in software.
-function pickCodec(enc, dec) {
-  const usable = CODECS.filter((c) => isAvailable(enc, c) && isAvailable(dec, c));
-  const seen = gpu.seen;
-  const encHw = (c) => seen[c] ?? enc?.[c]?.hw ?? false;
-  return usable.find((c) => encHw(c) && dec?.[c]?.hw)
-    || usable.find((c) => seen[c] === true)
-    || ['H264', 'H265', 'AV1', 'VP9'].find((c) => usable.includes(c) && encHw(c))
-    || ['H264'].find((c) => usable.includes(c) && seen[c] !== false)
-    || ['H264', 'VP8', 'VP9', 'AV1', 'H265'].find((c) => usable.includes(c))
-    || 'VP8';
-}
-
-/* ---- graphics card / hardware encoder ---- */
-
-function detectGpu() {
+/** Sharing: the screen, an H.264 encoder and the transport. null when it works, else why not. */
+async function shareProblem() {
+  if (!navigator.mediaDevices?.getDisplayMedia) return 'display';
+  if (typeof VideoEncoder !== 'function' || typeof VideoFrame !== 'function') return 'encoder';
+  await directReady;
+  if (!canDirect.ok) return 'encoder';
   try {
-    const gl = document.createElement('canvas').getContext('webgl');
-    if (!gl) return '';
-    const ext = gl.getExtension('WEBGL_debug_renderer_info');
-    const name = String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || '');
-    gl.getExtension('WEBGL_lose_context')?.loseContext();
-    return name;
+    const c = { codec: DIRECT_CODEC, width: 1920, height: 1080, bitrate: 8e6, framerate: 30, avc: { format: 'annexb' } };
+    if ((await VideoEncoder.isConfigSupported(c)).supported !== true) return 'encoder';
   } catch {
-    return '';
+    return 'encoder';
   }
-}
-
-// "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 (0x00002484) Direct3D11 …)" → "NVIDIA GeForce RTX 3070"
-function prettyGpu(raw) {
-  const m = /^ANGLE \([^,]+, (.+?)(?: \(0x[0-9a-f]+\))?(?: Direct3D| OpenGL| Vulkan|, |\)$)/i.exec(raw);
-  return (m ? m[1] : raw).replace(/^ANGLE Metal Renderer: /, '').trim();
-}
-
-function gpuVendor(name) {
-  if (/nvidia|geforce|quadro/i.test(name)) return 'nvidia';
-  if (/\bamd\b|radeon/i.test(name)) return 'amd';
-  if (/intel/i.test(name)) return 'intel';
-  if (/apple/i.test(name)) return 'apple';
-  return '';
-}
-
-const HW_ENCODER = { nvidia: 'NVIDIA NVENC', amd: 'AMD VCN', intel: 'Intel Quick Sync', apple: 'Apple VideoToolbox' };
-
-const gpu = {
-  raw: '',
-  name: '',
-  vendor: '',
-  key: '',
-  seen: {}, // codec → true (hardware) / false (software), learned from real encoding
-  init() {
-    if (this.key) return;
-    this.raw = detectGpu();
-    this.name = prettyGpu(this.raw);
-    this.vendor = IS_MAC ? 'apple' : gpuVendor(this.raw);
-    const browser = /(?:Chrome|Firefox|Version)\/(\d+)/.exec(navigator.userAgent)?.[1] || '';
-    this.key = `${this.raw}|${browser}`;
-    this.seen = store.get('ss-hw', {})[this.key] || {};
-  },
-  note(codec, isHw) {
-    if (typeof isHw !== 'boolean' || this.seen[codec] === isHw) return;
-    this.seen[codec] = isHw;
-    const all = store.get('ss-hw', {});
-    all[this.key] = this.seen;
-    store.set('ss-hw', all);
-  },
-  get encoderName() { return HW_ENCODER[this.vendor] || 'hardveres kódoló'; },
-};
-
-function encoderIsHw(out) {
-  if (typeof out.powerEfficientEncoder === 'boolean') return out.powerEfficientEncoder;
-  const impl = out.encoderImplementation || '';
-  if (/MediaFoundation|VideoToolbox|Vaapi|NVENC|V4L2|D3D12|EncodeAccelerator/i.test(impl)) return true;
-  if (/libvpx|OpenH264|libaom|SVT|rav1e/i.test(impl)) return false;
   return null;
 }
-
-function mergeFmtp(line, params) {
-  const space = line.indexOf(' ');
-  const head = line.slice(0, space);
-  const map = new Map();
-  for (const kv of line.slice(space + 1).split(';')) {
-    const [k, v] = kv.split('=');
-    if (k && k.trim()) map.set(k.trim(), v);
-  }
-  for (const [k, v] of Object.entries(params)) map.set(k, String(v));
-  return `${head} ${[...map].map(([k, v]) => (v == null ? k : `${k}=${v}`)).join(';')}`;
-}
-
-/**
- * Tunes the viewer's answer before the host applies it:
- *  - Opus: stereo, 510 kbit/s, 10 ms frames, no DTX, in-band FEC.
- *  - video: `preferCodec` first, high start bitrate, and libwebrtc's 2.5 Mbit/s
- *    default ceiling lifted (the real cap is set with setParameters()).
- */
-function mungeSdp(sdp, { preferCodec, startKbps } = {}) {
-  const sections = sdp.split(/\r\n(?=m=)/);
-  return sections.map((section) => {
-    if (!section.startsWith('m=')) return section;
-    const kind = section.slice(2, section.indexOf(' '));
-    const lines = section.split('\r\n');
-    const names = {};
-    for (const l of lines) {
-      const m = /^a=rtpmap:(\d+) ([^/\s]+)\//.exec(l);
-      if (m) names[m[1]] = m[2].toUpperCase();
-    }
-    const setParams = (pt, params) => {
-      const i = lines.findIndex((l) => l.startsWith(`a=fmtp:${pt} `));
-      if (i >= 0) {
-        lines[i] = mergeFmtp(lines[i], params);
-      } else {
-        const r = lines.findIndex((l) => l.startsWith(`a=rtpmap:${pt} `));
-        lines.splice(r + 1, 0, mergeFmtp(`a=fmtp:${pt} `, params));
-      }
-    };
-
-    if (kind === 'audio') {
-      for (const [pt, name] of Object.entries(names)) if (name === 'OPUS') setParams(pt, OPUS_PARAMS);
-      // 10 ms Opus frames instead of 20 ms: less audio delay
-      const ptime = lines.findIndex((l) => l.startsWith('a=ptime:'));
-      if (ptime >= 0) lines[ptime] = 'a=ptime:10';
-      else if (Object.values(names).includes('OPUS')) lines.splice(lines.findIndex((l) => /^a=rtpmap:\d+ opus\//i.test(l)) + 1, 0, 'a=ptime:10');
-    } else if (kind === 'video') {
-      if (startKbps) {
-        for (const [pt, name] of Object.entries(names)) {
-          if (CODECS.includes(name)) setParams(pt, { 'x-google-start-bitrate': startKbps, 'x-google-max-bitrate': MAX_KBPS });
-        }
-      }
-      if (preferCodec) {
-        const parts = lines[0].split(' ');
-        const pts = parts.slice(3);
-        const first = pts.filter((pt) => names[pt] === preferCodec);
-        if (first.length) lines[0] = [...parts.slice(0, 3), ...first, ...pts.filter((pt) => !first.includes(pt))].join(' ');
-      }
-    }
-    return lines.join('\r\n');
-  }).join('\r\n');
-}
-
-// Adds a codec to the audio section and makes it the preferred one.
-function insertAudioCodec(sdp, pt, rtpmap, fmtp) {
-  return sdp.split(/\r\n(?=m=)/).map((section) => {
-    if (!section.startsWith('m=audio')) return section;
-    const lines = section.split('\r\n');
-    const parts = lines[0].split(' ');
-    lines[0] = [...parts.slice(0, 3), String(pt), ...parts.slice(3).filter((p) => p !== String(pt))].join(' ');
-    const at = lines.findIndex((l) => l.startsWith('a=rtpmap:'));
-    lines.splice(at < 0 ? lines.length : at, 0, `a=rtpmap:${pt} ${rtpmap}`, `a=fmtp:${pt} ${fmtp}`);
-    return lines.join('\r\n');
-  }).join('\r\n');
-}
-
-// Host: offer 5.1/7.1 Opus first (Chromium supports it but never offers it by itself).
-function offerMultiopus(sdp) {
-  if (/ multiopus\//i.test(sdp)) return sdp;
-  const used = new Set([...sdp.matchAll(/^a=rtpmap:(\d+) /gm)].map((m) => Number(m[1])));
-  const pt = Array.from({ length: 32 }, (_, i) => 96 + i).find((p) => !used.has(p));
-  return pt ? insertAudioCodec(sdp, pt, `multiopus/48000/${MULTIOPUS.channels}`, MULTIOPUS.fmtp) : sdp;
-}
-
-// Host: no 5.1/7.1 (any more) – Chromium keeps offering a codec that was negotiated before.
-function withoutMultiopus(sdp) {
-  const pts = [...sdp.matchAll(/^a=rtpmap:(\d+) multiopus\//gim)].map((m) => m[1]);
-  if (!pts.length) return sdp;
-  const owned = new RegExp(`^a=(rtpmap|fmtp|rtcp-fb):(${pts.join('|')}) `);
-  return sdp.split('\r\n')
-    .filter((l) => !owned.test(l))
-    .map((l) => (l.startsWith('m=audio') ? l.split(' ').filter((p, i) => i < 3 || !pts.includes(p)).join(' ') : l))
-    .join('\r\n');
-}
-
-// Viewer: take the offered 5.1/7.1 Opus into the answer (Chromium leaves it out by itself).
-function acceptMultiopus(answer, offer) {
-  const m = /^a=rtpmap:(\d+) (multiopus\/48000\/\d+)/im.exec(offer);
-  if (!m || / multiopus\//i.test(answer)) return answer;
-  const fmtp = new RegExp(`^a=fmtp:${m[1]} (.*)$`, 'm').exec(offer);
-  return insertAudioCodec(answer, m[1], m[2], fmtp ? fmtp[1] : MULTIOPUS.fmtp);
-}
-
-/*
- * Viewer, "Minimális késés": every frame is shown the moment it is decoded.
- *  - The app as host sends a zero playout delay with each frame (RTP extension, see
- *    desktop/main.js); "Simább"/"Stabil" leave the extension out so their buffer applies.
- *  - The audio gets its own stream id, so the picture is not held back to wait for the
- *    audio's (longer) jitter buffer; the sound may trail by a few tens of ms.
- */
-const PLAYOUT_DELAY_EXT = /^a=extmap:\d+(\/\w+)? http:\/\/www\.webrtc\.org\/experiments\/rtp-hdrext\/playout-delay\r?$/;
-const withoutPlayoutDelay = (sdp) => sdp.split('\r\n').filter((l) => !PLAYOUT_DELAY_EXT.test(l)).join('\r\n');
-
-function ownAudioStream(sdp) {
-  return sdp.split(/\r\n(?=m=)/)
-    .map((section) => (section.startsWith('m=audio') ? section.replace(/^(a=(?:ssrc:\d+ )?msid:)(\S+) /gm, '$1$2-audio ') : section))
-    .join('\r\n');
-}
-
-/* ----------------------------- stats ----------------------------- */
-
-function selectedPair(report) {
-  let pair = null;
-  report.forEach((s) => {
-    if (s.type === 'transport' && s.selectedCandidatePairId) pair = report.get(s.selectedCandidatePairId);
-  });
-  if (!pair) report.forEach((s) => { if (!pair && s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s; });
-  return pair;
-}
-
-function isRelayed(report, pair) {
-  if (!pair) return null;
-  const local = report.get(pair.localCandidateId);
-  const remote = report.get(pair.remoteCandidateId);
-  return local?.candidateType === 'relay' || remote?.candidateType === 'relay';
-}
-
-const rate = (cur, prev, key) => (prev && cur[key] != null && prev[key] != null ? cur[key] - prev[key] : null);
-const kbpsBetween = (cur, prev, key) => {
-  const bytes = cur ? rate(cur, prev, key) : null;
-  const ms = cur && prev ? cur.timestamp - prev.timestamp : 0;
-  return bytes != null && ms > 0 ? (bytes * 8) / ms : null;
-};
 
 /* ============================== HOST ============================== */
 
@@ -483,16 +240,12 @@ const host = {
   code: null,
   token: null,
   iceServers: [],
-  msid: null, // groups audio + video into one stream on the viewer side (lip sync)
+  serverDirect: false,
   video: null,
-  audio: null, // stereo – what every viewer gets unless it plays 5.1/7.1
-  audio8: null, // 7.1 track when the computer's output is 5.1/7.1 (Windows app)
-  stopSurround: null,
-  surroundLabel: '',
+  audio: null,
   audioDenied: false, // macOS refused system audio recording
   viewers: new Map(),
   seq: 0,
-  encCaps: null,
   statsTimer: null,
   meter: null,
   dims: '',
@@ -502,7 +255,8 @@ const host = {
 };
 
 const isLive = () => Boolean(host.video && host.video.readyState === 'live');
-
+const hwEncoding = () => direct.hw !== false; // until it is known: the GPU (VideoEncoder tells)
+const autoTarget = () => (hwEncoding() ? HW_TARGET : SW_TARGET);
 const captureFps = () => (settings.fps === 'auto' ? HW_TARGET.fps : settings.fps);
 
 const RAW_AUDIO = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 }, sampleRate: { ideal: 48000 } };
@@ -521,144 +275,6 @@ async function captureDeviceAudio() {
   }
 }
 
-/* ---- 5.1 / 7.1 system audio (Windows app) ----
- * Chromium records the system sound in stereo only. When the computer's output is
- * 5.1/7.1, the app's helper (desktop/native/ss-audio.cpp) delivers every channel.
- * It becomes two tracks: 7.1 for viewers with surround speakers (multi-channel
- * Opus) and a stereo downmix – dialogue from the centre included – for the rest.
- */
-
-// Windows channel-mask bits → our 7.1 channels (L R C LFE BL BR SL SR) with a gain.
-const SPEAKERS = [
-  [[0, 1]], [[1, 1]], [[2, 1]], [[3, 1]], [[4, 1]], [[5, 1]], // FL FR FC LFE BL BR
-  [[0, 0.707], [2, 0.707]], [[1, 0.707], [2, 0.707]], // FLC FRC
-  [[4, 0.707], [5, 0.707]], [[6, 1]], [[7, 1]], // BC SL SR
-  [[2, 0.707]], [[0, 0.707]], [[2, 0.707]], [[1, 0.707]], // TC TFL TFC TFR
-  [[4, 0.707]], [[4, 0.5], [5, 0.5]], [[5, 0.707]], // TBL TBC TBR
-];
-
-function speakerMap({ channels, mask }) {
-  const map = [];
-  for (let bit = 0, c = 0; c < channels; c++, bit++) {
-    while (bit < SPEAKERS.length && !(mask & (1 << bit))) bit++;
-    map.push((SPEAKERS[bit] || []).map(([dst, gain]) => [dst, gain]));
-  }
-  // 5.1 with "back" surrounds: on 7.1 speakers those are the side ones
-  if ((mask & 0x630) === 0x30) for (const targets of map) for (const t of targets) if (t[0] === 4 || t[0] === 5) t[0] += 2;
-  return map;
-}
-
-// Keeps the stereo downmix out of hard clipping when every channel is loud.
-const softClip = (x) => (Math.abs(x) <= 0.9 ? x : Math.sign(x) * (0.9 + 0.1 * Math.tanh((Math.abs(x) - 0.9) / 0.1)));
-
-const surroundName = (channels) => (channels >= 8 ? '7.1' : channels >= 6 ? '5.1' : `${channels} csatornás`);
-
-// Chromium treats AudioData timestamps as capture times (lip sync is built on them), on its
-// own clock: µs to add to performance.now() × 1000. Read from a Web Audio track, which
-// delivers even in silence (a system-audio track may not), else from `fallback`.
-async function audioClockOffset(fallback) {
-  if (!window.MediaStreamTrackProcessor) return 0;
-  const ctx = ensureAudioCtx();
-  let silence = null;
-  let track = fallback?.clone();
-  if (ctx?.state === 'running') {
-    const dest = ctx.createMediaStreamDestination();
-    silence = ctx.createConstantSource(); // a destination with no input delivers nothing
-    silence.offset.value = 0;
-    silence.connect(dest);
-    silence.start();
-    track?.stop();
-    track = dest.stream.getAudioTracks()[0];
-  }
-  if (!track) return 0;
-  const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
-  try {
-    const data = (await Promise.race([reader.read(), sleep(1000).then(() => null)]))?.value;
-    if (!data) return 0;
-    const offset = data.timestamp + data.duration - performance.now() * 1000;
-    data.close();
-    return offset;
-  } catch {
-    return 0;
-  } finally {
-    reader.cancel().catch(() => {});
-    track.stop();
-    silence?.stop();
-    silence?.disconnect();
-  }
-}
-
-/**
- * { surround, stereo, label, setClock, stop } when the output device has more than two
- * channels, else null. Nothing is sent before setClock() (see audioClockOffset).
- */
-async function startSurroundAudio() {
-  const api = APP?.systemAudio;
-  if (!api || !window.MediaStreamTrackGenerator || !window.AudioData) return null;
-  let fmt = await api.start().catch(() => null);
-  if (!fmt || fmt.error || fmt.channels <= 2 || fmt.rate > 96000) {
-    if (fmt?.id) api.stop(fmt.id);
-    return null;
-  }
-  const id = fmt.id;
-  const surround = new MediaStreamTrackGenerator({ kind: 'audio' });
-  const stereo = new MediaStreamTrackGenerator({ kind: 'audio' });
-  surround.contentHint = 'music';
-  stereo.contentHint = 'music';
-  const writers = [surround.writable.getWriter(), stereo.writable.getWriter()];
-  let map = speakerMap(fmt);
-  let clock = null; // µs, see audioClockOffset
-  let next = null; // capture time of the next sample, µs
-  api.onFormat((f) => {
-    if (f.id !== id) return;
-    fmt = f;
-    map = speakerMap(f);
-  });
-  api.onData((buffer) => {
-    const { channels, rate } = fmt;
-    const src = new Float32Array(buffer);
-    const n = Math.floor(src.length / channels);
-    if (!n || rate > 96000 || clock == null) return;
-    // sample-accurate timeline, re-anchored to the arrival time after a gap or drift
-    const duration = (n / rate) * 1e6;
-    const arrived = performance.now() * 1000 + clock - duration;
-    if (next == null || Math.abs(next - arrived) > 20000) next = arrived;
-    const timestamp = Math.round(next);
-    next += duration;
-    const s8 = new Float32Array(n * 8); // planar
-    for (let c = 0; c < channels; c++) {
-      for (const [dst, gain] of map[c]) {
-        const o = dst * n;
-        for (let i = 0, j = c; i < n; i++, j += channels) s8[o + i] += src[j] * gain;
-      }
-    }
-    // ITU downmix: centre and surrounds at -3 dB, LFE left out
-    const s2 = new Float32Array(n * 2);
-    for (let i = 0; i < n; i++) {
-      const centre = 0.707 * s8[2 * n + i];
-      s2[i] = softClip(s8[i] + centre + 0.707 * (s8[4 * n + i] + s8[6 * n + i]));
-      s2[n + i] = softClip(s8[n + i] + centre + 0.707 * (s8[5 * n + i] + s8[7 * n + i]));
-    }
-    [[s8, 8], [s2, 2]].forEach(([data, numberOfChannels], k) => {
-      writers[k].write(new AudioData({ format: 'f32-planar', sampleRate: rate, numberOfFrames: n, numberOfChannels, timestamp, data })).catch(() => {});
-    });
-  });
-  return {
-    surround,
-    stereo,
-    label: surroundName(fmt.channels),
-    async setClock(fallback) {
-      clock = await audioClockOffset(fallback);
-    },
-    stop() {
-      api.stop(id);
-      for (const w of writers) w.close().catch(() => {});
-      surround.stop();
-      stereo.stop();
-    },
-  };
-}
-
 async function captureScreen() {
   const fps = captureFps();
   const video = { frameRate: { ideal: fps, max: fps }, cursor: 'always' };
@@ -671,20 +287,13 @@ async function captureScreen() {
     surfaceSwitching: 'include',
     monitorTypeSurfaces: 'include',
   };
-  // runs while the picker is open
-  const surround = audio && APP?.systemAudio ? startSurroundAudio().catch(() => null) : Promise.resolve(null);
   let stream;
   try {
-    try {
-      stream = await navigator.mediaDevices.getDisplayMedia({ video, audio, ...extras });
-    } catch (err) {
-      // Browsers without display-audio support may reject the audio constraints.
-      if (!audio || (err.name !== 'TypeError' && err.name !== 'NotSupportedError')) throw err;
-      stream = await navigator.mediaDevices.getDisplayMedia({ video, ...extras });
-    }
+    stream = await navigator.mediaDevices.getDisplayMedia({ video, audio, ...extras });
   } catch (err) {
-    surround.then((s) => s?.stop());
-    throw err;
+    // Browsers without display-audio support may reject the audio constraints.
+    if (!audio || (err.name !== 'TypeError' && err.name !== 'NotSupportedError')) throw err;
+    stream = await navigator.mediaDevices.getDisplayMedia({ video, ...extras });
   }
   const videoTrack = stream.getVideoTracks()[0];
   let audioTrack = stream.getAudioTracks()[0] || null;
@@ -694,15 +303,6 @@ async function captureScreen() {
   if (audioDenied) audioTrack = null;
   if (audioTrack) audioTrack.contentHint = 'music';
   const result = { video: videoTrack, audio: audioTrack, audioDenied };
-  const sur = await surround;
-  if (sur && audioTrack) {
-    // system sound switched on in the picker and the output is 5.1/7.1: all channels from the helper
-    await sur.setClock(audioTrack);
-    audioTrack.stop();
-    Object.assign(result, { audio: sur.stereo, audio8: sur.surround, stopSurround: sur.stop, surroundLabel: sur.label });
-  } else {
-    sur?.stop();
-  }
   if (useDeviceAudio()) result.audio = await captureDeviceAudio();
   return result;
 }
@@ -710,12 +310,7 @@ async function captureScreen() {
 // Swap only the audio (another source picked while sharing).
 function setHostAudio(track) {
   const old = host.audio;
-  const hadSurround = dropSurround();
   host.audio = track;
-  for (const v of host.viewers.values()) {
-    v.audioTx?.sender.replaceTrack(track).catch((err) => console.warn('replaceTrack failed', err));
-    if (hadSurround && v.pc && v.caps?.surround) negotiate(v); // back to stereo Opus
-  }
   if (old && old !== track) old.stop();
   updateDirectPipelines();
   startMeter(track);
@@ -725,7 +320,7 @@ function setHostAudio(track) {
 async function populateAudioSources() {
   const select = $('#setAudioSource');
   if (!navigator.mediaDevices?.enumerateDevices) return;
-  let inputs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput' && d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
+  const inputs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'audioinput' && d.deviceId && d.deviceId !== 'default' && d.deviceId !== 'communications');
   const options = [new Option('Képernyő / rendszerhang', 'display')];
   inputs.forEach((d, i) => options.push(new Option(d.label || `Hangbemenet ${i + 1}`, d.deviceId)));
   if (!inputs.some((d) => d.label)) options.push(new Option('Eszközök listázása…', 'list'));
@@ -757,7 +352,7 @@ function hostSignal() {
     host.signal = createSignal({
       onMessage: onHostMessage,
       onOpen: () => { if (host.code && host.active) reclaimRoom(); },
-      onClose: () => { if (host.code) setSignalStatus('Megszakadt a kapcsolat a szerverrel, újracsatlakozás… (a nézők látnak tovább)', 'warn'); },
+      onClose: () => { if (host.code) setSignalStatus('Megszakadt a kapcsolat a szerverrel, újracsatlakozás…', 'warn'); },
     });
   }
   return host.signal;
@@ -788,13 +383,12 @@ function applyHosted(res) {
   host.code = res.code;
   host.token = res.token;
   host.iceServers = res.iceServers || [];
-  host.serverDirect = res.direct === true; // an older server: WebRTC only
+  host.serverDirect = res.direct === true;
   store.set('ss-host-room', { code: res.code, token: res.token }, 'session');
-  const link = `${SITE_URL}#${res.code}`;
   $('#roomCode').textContent = res.code;
-  $('#roomLink').value = link;
+  $('#roomLink').value = `${SITE_URL}#${res.code}`;
   $('#btnCopy').disabled = false;
-  setSignalStatus('Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.', 'ok');
+  setSignalStatus(host.serverDirect ? 'Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.' : `A nézők nem kapnak képet: ${WHY_TEXT.server}`, host.serverDirect ? 'ok' : 'warn');
   host.signal.send({ t: 'state', live: isLive() });
   const present = new Set((res.viewers || []).map((v) => v.id));
   for (const id of [...host.viewers.keys()]) if (!present.has(id)) dropViewer(id);
@@ -804,11 +398,8 @@ function applyHosted(res) {
 async function startHosting(e) {
   e?.preventDefault();
   const password = $('#hostPassword').value;
-  const errorEl = $('#shareError');
-  errorEl.hidden = true;
+  $('#shareError').hidden = true;
   ensureAudioCtx(); // must happen inside the click gesture
-  gpu.init();
-  const encCaps = host.encCaps ? Promise.resolve(host.encCaps) : codecSupport('encode');
   const capture = captureScreen(); // the screen picker needs the gesture: start it right away
   const room = openRoom(password);
 
@@ -844,8 +435,6 @@ async function startHosting(e) {
   host.active = true;
   showView('view-host');
   window.addEventListener('beforeunload', confirmLeave);
-  host.encCaps = await encCaps;
-  updateCodecOptions();
   setHostTracks(tracks);
   if (!host.statsTimer) host.statsTimer = setInterval(hostStatsTick, 1000);
 }
@@ -890,336 +479,62 @@ function onHostMessage(msg) {
   }
 }
 
-/* ---- one RTCPeerConnection per viewer ---- */
-
-// Does this viewer's video get encoded by the GPU? Measured if possible, otherwise predicted.
-function encoderHwFor(v) {
-  const codec = v?.codec || pickCodec(host.encCaps, null);
-  if (v?.stats && v.stats.hw != null && v.stats.codec === codec) return v.stats.hw;
-  if (gpu.seen[codec] != null) return gpu.seen[codec];
-  if (IS_MAC && (codec === 'H264' || codec === 'H265')) return true; // VideoToolbox on every Mac
-  return Boolean(host.encCaps?.[codec]?.hw);
-}
-
-// Best settings this machine can sustain for one viewer.
-function autoTarget(v) {
-  if (encoderHwFor(v)) return { ...HW_TARGET, hw: true };
-  const cores = navigator.hardwareConcurrency || 4;
-  let tier = cores >= 12 ? 3 : cores >= 8 ? 2 : 1;
-  // every CPU-encoded viewer is a separate encode: step down as they add up
-  const cpuViewers = [...host.viewers.values()].filter((x) => x === v || !encoderHwFor(x)).length;
-  if (cpuViewers >= 3) tier--;
-  if (cpuViewers >= 6) tier--;
-  return { ...SW_TIERS[Math.max(0, tier)], hw: false, cores };
-}
-
-function targetFor(v) {
-  const auto = autoTarget(v);
-  return {
-    res: settings.res === 'auto' ? auto.res : settings.res,
-    fps: settings.fps === 'auto' ? auto.fps : settings.fps,
-    kbps: settings.kbps === 'auto' ? auto.kbps : settings.kbps,
-    auto,
-  };
-}
-
-function videoEncoding(v) {
-  const t = targetFor(v);
-  return {
-    maxBitrate: t.kbps * 1000,
-    maxFramerate: t.fps,
-    scaleResolutionDownBy: scaleFor(host.video, t.res),
-    priority: 'high',
-    networkPriority: 'high',
-  };
-}
+/* ---- the viewers ---- */
 
 function ensureViewer(id, caps) {
   let v = host.viewers.get(id);
-  if (v && v.pc && !['failed', 'closed'].includes(v.pc.connectionState)) return;
-  if (v && v.direct && !['failed', 'lost', 'closed'].includes(v.direct.state)) return;
+  if (v?.direct && !['failed', 'lost', 'closed'].includes(v.direct.state)) return;
   if (!v) {
-    v = { id, n: ++host.seq, caps: caps || null, pc: null, stats: null, prev: null };
+    v = { id, n: ++host.seq, caps: caps || null, stats: null, direct: null, remote: null };
     host.viewers.set(id, v);
   }
-  // both ends are the desktop app: without WebRTC (falls back to it by itself)
-  if (wantsDirect(v)) startDirectViewer(v);
-  else createViewerPc(v);
+  if (!v.caps?.direct || !host.serverDirect) {
+    // an old browser (or an old server): it cannot get the picture – it is told why
+    v.directWhy = !host.serverDirect ? 'server' : 'viewer-browser';
+    host.signal.send({ t: 'signal', to: v.id, data: { type: 'unsupported', why: v.directWhy } });
+  } else {
+    startDirectViewer(v);
+  }
   renderViewers();
-}
-
-function addSendTransceiver(pc, trackOrKind, encoding) {
-  const init = { direction: 'sendonly', streams: [host.msid] };
-  try {
-    return pc.addTransceiver(trackOrKind, { ...init, sendEncodings: [encoding] });
-  } catch {
-    return pc.addTransceiver(trackOrKind, init); // browsers that reject some encoding fields
-  }
-}
-
-function createViewerPc(v) {
-  closeViewerPc(v);
-  host.msid ||= new MediaStream();
-  v.session = randomId();
-  v.createdAt = Date.now();
-  v.codecSince = Date.now();
-  v.hwTrialDone = false;
-  v.remote = null;
-  v.codec = settings.codec === 'auto' ? pickCodec(host.encCaps, v.caps) : settings.codec;
-  v.negotiating = false;
-  v.pendingNegotiation = false;
-  v.pendingRestart = false;
-  v.remoteCandidates = [];
-  v.restarts = 0;
-  v.prev = null;
-  v.stats = null;
-  v.surroundActive = false;
-
-  const pc = new RTCPeerConnection(rtcConfig(host.iceServers));
-  v.pc = pc;
-  v.videoTx = addSendTransceiver(pc, host.video || 'video', videoEncoding(v));
-  v.audioTx = addSendTransceiver(pc, audioTrackFor(v) || 'audio', { maxBitrate: AUDIO_MAX_BPS, priority: 'high', networkPriority: 'high' });
-  applyCodecPreference(v);
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate && v.pc === pc) {
-      host.signal.send({ t: 'signal', to: v.id, data: { type: 'candidate', session: v.session, candidate: e.candidate.toJSON() } });
-    }
-  };
-  pc.onconnectionstatechange = () => onViewerPcState(v, pc);
-  negotiate(v);
-}
-
-function closeViewerPc(v) {
-  clearTimeout(v.answerTimer);
-  clearTimeout(v.discTimer);
-  if (v.pc) {
-    v.pc.onicecandidate = null;
-    v.pc.onconnectionstatechange = null;
-    v.pc.close();
-    v.pc = null;
-  }
 }
 
 function dropViewer(id) {
   const v = host.viewers.get(id);
   if (!v) return;
   clearTimeout(v.retryTimer);
-  closeViewerPc(v);
   host.viewers.delete(id);
   stopDirectViewer(v);
+  updateDirectPipelines();
   renderViewers();
 }
 
-// Put the chosen codec first; the answer is reordered too (see mungeSdp), so
-// this is only a bonus where setCodecPreferences works for send-only transceivers.
-function applyCodecPreference(v) {
-  const tx = v.videoTx;
-  if (!tx?.setCodecPreferences) return;
-  const mime = `video/${v.codec}`.toLowerCase();
-  for (const Api of [window.RTCRtpReceiver, window.RTCRtpSender]) {
-    const codecs = Api?.getCapabilities?.('video')?.codecs;
-    if (!codecs?.some((c) => c.mimeType.toLowerCase() === mime)) continue;
-    const ordered = [...codecs.filter((c) => c.mimeType.toLowerCase() === mime), ...codecs.filter((c) => c.mimeType.toLowerCase() !== mime)];
-    try { tx.setCodecPreferences(ordered); return; } catch { /* try the other capability list */ }
-  }
-}
-
-async function negotiate(v, { iceRestart = false } = {}) {
-  const pc = v.pc;
-  if (!pc) return;
-  if (v.negotiating) {
-    v.pendingNegotiation = true;
-    v.pendingRestart ||= iceRestart;
-    return;
-  }
-  v.negotiating = true;
-  try {
-    const offer = await pc.createOffer({ iceRestart });
-    if (v.pc !== pc) return;
-    // 5.1/7.1 for viewers with surround speakers, while the host has surround sound
-    const sdp = host.audio8 && v.caps?.surround ? offerMultiopus(offer.sdp) : withoutMultiopus(offer.sdp);
-    try {
-      await pc.setLocalDescription({ type: 'offer', sdp });
-    } catch (err) {
-      if (sdp === offer.sdp) throw err;
-      await pc.setLocalDescription(offer);
-    }
-    host.signal.send({ t: 'signal', to: v.id, data: { type: 'offer', session: v.session, sdp: pc.localDescription.sdp, why: directWhy(v) } });
-    clearTimeout(v.answerTimer);
-    // No answer (lost message, viewer stuck): start over with a fresh connection.
-    v.answerTimer = setTimeout(() => {
-      if (v.pc === pc && pc.signalingState === 'have-local-offer' && host.viewers.get(v.id) === v) createViewerPc(v);
-    }, 15000);
-  } catch (err) {
-    console.warn('offer failed', err);
-    v.negotiating = false;
-  }
-}
-
-async function onViewerSignal(id, data) {
+function onViewerSignal(id, data) {
   const v = host.viewers.get(id);
   if (!v || !data || typeof data !== 'object') return;
-  if (v.direct || data.type === 'direct-answer' || data.type === 'direct-fail') {
-    onDirectViewerSignal(v, data);
-    return;
-  }
-  if (!v.pc) return;
   if (data.type === 'recall') {
-    // the viewer went back to "Minimális": direct mode again, if both are the app
-    if (data.direct === true && v.noDirect) {
-      v.noDirect = false;
-      if (wantsDirect(v)) {
-        startDirectViewer(v);
-        renderViewers();
-        return;
-      }
-    }
-    if (Date.now() - (v.createdAt || 0) > 5000) createViewerPc(v);
+    if (Date.now() - (v.createdAt || 0) > 3000) startDirectViewer(v);
     return;
   }
   if (data.session !== v.session) return;
-  const pc = v.pc;
-  if (data.type === 'stats') {
+  if (data.type === 'direct-answer' && v.direct?.state === 'connecting') {
+    DIRECT.connect(v.id, { pub: data.pub, cands: data.cands, tcp: data.tcp === true });
+  } else if (data.type === 'direct-fail') {
+    directFailed(v, typeof data.why === 'string' && WHY_TEXT[data.why] ? data.why : 'failed');
+  } else if (data.type === 'stats') {
     const num = (x) => (Number.isFinite(x) && x >= 0 && x < 1e6 ? x : null);
-    v.remote = { lat: num(data.lat), fps: num(data.fps), loss: num(data.loss) };
-    return;
+    v.remote = { lat: num(data.lat), fps: num(data.fps), loss: num(data.loss), measured: data.measured === true };
   }
-  if (data.type === 'answer' && typeof data.sdp === 'string') {
-    if (pc.signalingState !== 'have-local-offer') return;
-    clearTimeout(v.answerTimer);
-    try {
-      await pc.setRemoteDescription({ type: 'answer', sdp: mungeSdp(data.sdp, { preferCodec: v.codec, startKbps: Math.min(targetFor(v).kbps, START_KBPS_CAP) }) });
-    } catch (err) {
-      console.warn('answer rejected', err);
-      if (v.pc === pc) createViewerPc(v);
-      return;
-    }
-    if (v.pc !== pc) return;
-    for (const c of v.remoteCandidates.splice(0)) pc.addIceCandidate(c).catch(() => {});
-    v.negotiating = false;
-    updateSurround(v);
-    if (pc.connectionState === 'connected') applySenderParams(v);
-    if (v.pendingNegotiation) {
-      const iceRestart = v.pendingRestart;
-      v.pendingNegotiation = false;
-      v.pendingRestart = false;
-      negotiate(v, { iceRestart });
-    }
-  } else if (data.type === 'candidate' && data.candidate) {
-    if (pc.remoteDescription) pc.addIceCandidate(data.candidate).catch(() => {});
-    else v.remoteCandidates.push(data.candidate);
-  }
-}
-
-// The 7.1 track goes to viewers whose connection agreed on multi-channel Opus.
-const audioTrackFor = (v) => (host.audio8 && v.surroundActive ? host.audio8 : host.audio);
-
-function updateSurround(v) {
-  const sender = v.audioTx?.sender;
-  if (!sender) return;
-  const codec = sender.getParameters().codecs?.[0]?.mimeType?.toLowerCase();
-  v.surroundActive = codec === 'audio/multiopus';
-  const track = audioTrackFor(v);
-  if (sender.track !== track) sender.replaceTrack(track).catch((err) => console.warn('replaceTrack failed', err));
-}
-
-// Stops the 5.1/7.1 capture; true if there was one.
-function dropSurround() {
-  if (!host.audio8) return false;
-  host.audio8.stop();
-  host.stopSurround?.();
-  host.audio8 = null;
-  host.stopSurround = null;
-  return true;
-}
-
-function onViewerPcState(v, pc) {
-  if (v.pc !== pc) return;
-  const state = pc.connectionState;
-  clearTimeout(v.discTimer);
-  if (state === 'connected') {
-    v.restarts = 0;
-    applySenderParams(v);
-  } else if (state === 'disconnected') {
-    v.discTimer = setTimeout(() => { if (v.pc === pc && pc.connectionState === 'disconnected') restartIce(v); }, 4000);
-  } else if (state === 'failed') {
-    restartIce(v);
-  }
-  renderViewers();
-}
-
-function restartIce(v) {
-  if (v.restarts++ >= 2) createViewerPc(v);
-  else negotiate(v, { iceRestart: true });
-}
-
-function scaleFor(track, res) {
-  const target = RES_TARGETS[res];
-  const s = track?.getSettings?.() || {};
-  if (!target || !s.width || !s.height) return 1;
-  const [tw, th] = s.width >= s.height ? target : [target[1], target[0]];
-  return Math.max(1, s.width / tw, s.height / th);
-}
-
-async function applySenderParams(v) {
-  if (!v.pc) return;
-  for (const [tx, kind] of [[v.videoTx, 'video'], [v.audioTx, 'audio']]) {
-    const sender = tx?.sender;
-    if (!sender) continue;
-    const p = sender.getParameters();
-    if (!p.encodings?.length) continue; // not negotiated yet
-    const enc = p.encodings[0];
-    if (kind === 'video') {
-      const target = videoEncoding(v);
-      Object.assign(enc, target);
-      v.appliedTarget = JSON.stringify(target);
-      p.degradationPreference = DEGRADATION[settings.mode];
-    } else {
-      Object.assign(enc, { maxBitrate: AUDIO_MAX_BPS, priority: 'high', networkPriority: 'high' });
-    }
-    try {
-      await sender.setParameters(p);
-    } catch {
-      // retry with fresh parameters and only the essential fields
-      const q = sender.getParameters();
-      if (!q.encodings?.length) continue;
-      const e = q.encodings[0];
-      e.maxBitrate = enc.maxBitrate;
-      if (kind === 'video') {
-        e.maxFramerate = enc.maxFramerate;
-        e.scaleResolutionDownBy = enc.scaleResolutionDownBy;
-      }
-      try { await sender.setParameters(q); } catch (err) { console.warn('setParameters failed', err); }
-    }
-  }
-}
-
-function applyAllSenders() {
-  for (const v of host.viewers.values()) applySenderParams(v);
 }
 
 /* ---- capture lifecycle ---- */
 
-function setHostTracks({ video, audio, audio8 = null, stopSurround = null, surroundLabel = '', audioDenied = false }) {
-  const old = [host.video, host.audio, host.audio8];
-  const oldStopSurround = host.stopSurround;
-  const surroundChanged = Boolean(host.audio8) !== Boolean(audio8);
-  Object.assign(host, { video, audio, audio8, stopSurround, surroundLabel, audioDenied });
+function setHostTracks({ video, audio, audioDenied = false }) {
+  const old = [host.video, host.audio];
+  Object.assign(host, { video, audio, audioDenied });
   video.addEventListener('ended', () => { if (host.video === video) pauseSharing(); });
-
-  for (const v of host.viewers.values()) {
-    if (!v.pc) continue;
-    v.videoTx?.sender.replaceTrack(video).catch((err) => console.warn('replaceTrack failed', err));
-    v.audioTx?.sender.replaceTrack(audioTrackFor(v)).catch((err) => console.warn('replaceTrack failed', err));
-    applySenderParams(v);
-    if (surroundChanged && v.caps?.surround) negotiate(v); // offer or drop 5.1/7.1
-  }
-  for (const t of old) if (t && t !== video && t !== audio && t !== audio8) t.stop();
-  if (oldStopSurround && oldStopSurround !== stopSurround) oldStopSurround();
+  for (const t of old) if (t && t !== video && t !== audio) t.stop();
 
   direct.forceKey = true;
-  direct.nativeOff = null; // a new share: native capture may work for it
   updateDirectPipelines();
 
   host.dims = '';
@@ -1229,7 +544,6 @@ function setHostTracks({ video, audio, audio8 = null, stopSurround = null, surro
   $('#liveBadge').textContent = 'ÉLŐ';
   $('#btnStop').hidden = false;
   host.signal?.send({ t: 'state', live: true });
-  APP?.setSharing?.(true);
   startMeter(audio);
   updateCaptureInfo();
   renderViewers();
@@ -1238,20 +552,14 @@ function setHostTracks({ video, audio, audio8 = null, stopSurround = null, surro
 function stopTracks() {
   host.video?.stop();
   host.audio?.stop();
-  dropSurround();
   host.video = null;
   host.audio = null;
   stopMeter();
-  APP?.setSharing?.(false);
 }
 
 function pauseSharing() {
   stopTracks();
   updateDirectPipelines();
-  for (const v of host.viewers.values()) {
-    v.videoTx?.sender.replaceTrack(null).catch(() => {});
-    v.audioTx?.sender.replaceTrack(null).catch(() => {});
-  }
   $('#preview').srcObject = null;
   $('#previewPaused').hidden = false;
   $('#liveBadge').classList.add('off');
@@ -1288,39 +596,31 @@ function confirmLeave(e) {
   e.returnValue = '';
 }
 
-const RES_LABEL = { native: 'natív', 2160: '4K', 1440: '1440p', 1080: '1080p', 720: '720p' };
-
 // What "Automatikus" picked for this machine, in words.
 function renderAutoProfile() {
-  const el = $('#autoProfile');
-  if (!el) return;
-  const viewers = [...host.viewers.values()];
-  const t = targetFor(viewers[0]);
-  const a = t.auto;
-  const why = a.hw
-    ? `a videókártya kódol (${gpu.encoderName})`
-    : `a processzor kódol (${a.cores} szál${viewers.length > 1 ? `, ${viewers.length} néző` : ''})`;
-  el.textContent = `Automatikus: ${RES_LABEL[t.res] || t.res} · ${t.fps} FPS · max. ${fmtKbps(t.kbps)} – ${why}.`;
+  const t = autoTarget();
+  const res = settings.res === 'auto' ? t.res : settings.res;
+  const fps = settings.fps === 'auto' ? t.fps : settings.fps;
+  const kbps = settings.kbps === 'auto' ? t.kbps : settings.kbps;
+  const why = direct.hw === false ? 'a processzor kódol' : direct.hw ? 'a videókártya kódol' : 'a videókártya kódol, ha tud';
+  $('#autoProfile').textContent = `Most: ${RES_LABEL[res] || res} · ${fps} FPS · max. ${fmtKbps(kbps)} – ${why}.`;
 }
 
 function updateCaptureInfo() {
   const s = host.video?.getSettings?.() || {};
-  const t = targetFor([...host.viewers.values()][0]);
-  const scale = scaleFor(host.video, t.res);
-  const w = s.width ? Math.round(s.width / scale) : null;
-  const h = s.height ? Math.round(s.height / scale) : null;
-  const fps = Math.min(s.frameRate ? Math.round(s.frameRate) : t.fps, t.fps);
+  const cfg = direct.video?.config;
+  const w = cfg?.width || s.width;
+  const h = cfg?.height || s.height;
+  const fps = Math.round(cfg?.framerate || s.frameRate || captureFps());
   $('#captureInfo').textContent = w && h ? `${w}×${h} · ${fps} FPS` : '';
   renderAutoProfile();
-  // only the apps can tell viewers to show frames without a jitter buffer
-  $('#latencyTip').hidden = !host.video || Boolean(APP);
 
   const el = $('#audioStatus');
   if (!host.video) {
     el.textContent = '';
-  } else if (host.audio8) {
-    el.textContent = `Hang megosztva: ${host.surroundLabel} térhang. A térhangos hangszórójú nézők (Chrome, Edge, alkalmazás) ${host.surroundLabel}-et kapnak, a többiek sztereó keveréket. A csík mutatja, hogy jön-e hang.`;
-    el.className = 'hint ok';
+  } else if (host.audio && !direct.canEncodeAudio) {
+    el.textContent = 'Ez a böngésző nem tud hangot kódolni (Opus): a nézők hang nélkül kapják a képet. Hanghoz oszd meg Chrome-ból, Edge-ből vagy az asztali alkalmazásból.';
+    el.className = 'hint warn';
   } else if (host.audio) {
     el.textContent = 'Hang megosztva (sztereó). A csík mutatja, hogy jön-e hang.';
     el.className = 'hint ok';
@@ -1330,12 +630,8 @@ function updateCaptureInfo() {
   } else {
     if (useDeviceAudio()) {
       el.textContent = 'A kiválasztott hangforrás nem érhető el – válassz másikat a Hangforrás listában.';
-    } else if (APP && !IS_MAC) {
-      el.textContent = 'Nincs hang: a választóban hagyd bekapcsolva a „Rendszerhang megosztása” opciót (Forrás váltása).';
-    } else if (APP && IS_MAC) {
-      el.textContent = host.audioDenied
-        ? 'A macOS nem engedi a rendszerhangot: Rendszerbeállítások → Adatvédelem és biztonság → Képernyő- és rendszerhangfelvétel → a rendszerhang-felvételnél kapcsold be a Screen Share-t, majd indítsd újra az alkalmazást.'
-        : 'Nincs hang: a választóban hagyd bekapcsolva a „Rendszerhang megosztása” opciót (Forrás váltása). macOS 13 vagy újabb kell hozzá.';
+    } else if (host.audioDenied) {
+      el.textContent = 'A macOS nem engedi a rendszerhangot: Rendszerbeállítások → Adatvédelem és biztonság → Képernyő- és rendszerhangfelvétel → kapcsold be a böngészőt, majd indítsd újra.';
     } else if (IS_SAFARI) {
       el.textContent = 'A Safari a gép hangját nem tudja megosztani. Hanghoz válassz egy hangbemenetet a Hangforrás listában, vagy oszd meg Chrome-ból / a Mac alkalmazásból (az a teljes rendszerhangot viszi).';
     } else if (IS_MAC) {
@@ -1387,164 +683,49 @@ function updateSetting(key, value) {
     host.video.applyConstraints({ frameRate: { ideal: fps, max: fps } }).catch(() => {});
   }
   if (key === 'mode' && host.video) host.video.contentHint = CONTENT_HINT[value];
-  if (key === 'codec') {
-    for (const v of host.viewers.values()) {
-      if (!v.pc) continue;
-      v.hwTrialDone = false;
-      switchCodec(v, value === 'auto' ? pickCodec(host.encCaps, v.caps) : value);
-    }
-    renderViewers();
-    return;
-  }
-  if (key === 'audio') {
-    updateDirectPipelines();
-    updateCaptureInfo();
-    return;
-  }
   if (key === 'kbps' && direct.kbps) direct.kbps = Math.min(direct.kbps, directTargetKbps());
-  if ((key === 'res' || key === 'fps') && direct.native) updateDirectPipelines(); // the native encoder starts again at the new size
-  applyAllSenders();
+  if (key === 'audio') updateDirectPipelines();
   updateCaptureInfo();
 }
 
-function switchCodec(v, codec) {
-  v.codec = codec;
-  v.codecSince = Date.now();
-  applyCodecPreference(v);
-  negotiate(v);
-}
-
-/**
- * The browser's hardware prediction can be wrong. Once a viewer has received a
- * few seconds of video, check whether the GPU (NVENC, VideoToolbox, Quick Sync,
- * VCN) really encodes; if not, move to the next candidate and remember the result.
- */
-function checkHardware(v, out, codec) {
-  const isHw = encoderIsHw(out);
-  if (isHw == null || codec !== v.codec || Date.now() - v.codecSince < 3000 || !(out.framesEncoded > 30)) return;
-  // Software while another viewer gets the same codec in hardware: the GPU's encoder
-  // sessions are used up (GeForce: ~8) – not a property of the codec, so don't learn it.
-  if (!isHw && [...host.viewers.values()].some((o) => o !== v && o.stats?.hw === true && o.stats?.codec === codec)) {
-    v.hwTrialDone = true;
-    return;
-  }
-  gpu.note(v.codec, isHw);
-  if (isHw || settings.codec !== 'auto' || v.hwTrialDone) return;
-  const next = pickCodec(host.encCaps, v.caps);
-  if (next !== v.codec && gpu.seen[next] !== false) switchCodec(v, next);
-  else v.hwTrialDone = true;
-}
-
-function updateCodecOptions() {
-  for (const opt of $('#setCodec').options) {
-    if (opt.value === 'auto') continue;
-    const c = host.encCaps?.[opt.value];
-    opt.disabled = c ? !c.supported : false;
-    const hw = gpu.seen[opt.value] ?? c?.hw;
-    opt.textContent = `${CODEC_LABEL[opt.value]}${hw ? ' – hardveres' : ''}${c && !c.supported ? ' (nem támogatott)' : ''}`;
-  }
-}
-
-async function hostStatsTick() {
+function hostStatsTick() {
   const s = host.video?.getSettings?.() || {};
   const dims = `${s.width}x${s.height}`;
   if (isLive() && dims !== host.dims) {
     host.dims = dims;
-    applyAllSenders();
     updateCaptureInfo();
   }
-
   for (const v of host.viewers.values()) {
-    if (v.direct) {
-      v.stats = directStats(v);
-      if (v.stats && host.tick % 2 === 0) {
-        const { encodeMs, hw, encoder } = v.stats;
-        host.signal?.send({ t: 'signal', to: v.id, data: { type: 'stats', session: v.session, encodeMs, hw, encoder: hw ? encoder || gpu.encoderName : null, codec: 'H264' } });
-      }
-      continue;
-    }
-    const pc = v.pc;
-    if (!pc || pc.connectionState !== 'connected') { v.stats = null; continue; }
-    let report;
-    try { report = await pc.getStats(); } catch { continue; }
-    let out = null;
-    let remoteIn = null;
-    report.forEach((x) => {
-      if (x.type === 'outbound-rtp' && x.kind === 'video') out = x;
-      if (x.type === 'remote-inbound-rtp' && x.kind === 'video') remoteIn = x;
-    });
-    if (!out) continue;
-    const pair = selectedPair(report);
-    const codec = report.get(out.codecId)?.mimeType?.split('/')[1]?.toUpperCase() || null;
-    const dFrames = rate(out, v.prev, 'framesEncoded');
-    v.stats = {
-      w: out.frameWidth,
-      h: out.frameHeight,
-      fps: out.framesPerSecond,
-      kbps: kbpsBetween(out, v.prev, 'bytesSent'),
-      codec,
-      hw: encoderIsHw(out),
-      impl: out.encoderImplementation,
-      encodeMs: dFrames ? (rate(out, v.prev, 'totalEncodeTime') / dFrames) * 1000 : v.stats?.encodeMs ?? null,
-      limit: out.qualityLimitationReason,
-      rtt: pair?.currentRoundTripTime != null ? pair.currentRoundTripTime * 1000 : (remoteIn?.roundTripTime ?? NaN) * 1000,
-      relay: isRelayed(report, pair),
-    };
-    v.prev = out;
-    checkHardware(v, out, codec);
-    if (v.appliedTarget && v.appliedTarget !== JSON.stringify(videoEncoding(v))) applySenderParams(v);
-    if (host.tick % 2 === 0) {
+    v.stats = v.direct ? directStats(v) : null;
+    if (v.stats && host.tick % 2 === 0) {
       const { encodeMs, hw } = v.stats;
-      host.signal?.send({ t: 'signal', to: v.id, data: { type: 'stats', session: v.session, encodeMs, hw, encoder: hw ? gpu.encoderName : null, codec } });
+      host.signal?.send({ t: 'signal', to: v.id, data: { type: 'stats', session: v.session, encodeMs, hw, encoder: hw ? 'videókártya (WebCodecs)' : null, codec: 'H264' } });
     }
   }
   host.tick++;
   renderViewers();
   renderEncoderStatus();
-  renderAutoProfile();
-}
-
-function hwTip() {
-  if (IS_MAC) return 'Macen a H.264-et a gép hardveresen kódolja – a Kodek legyen „Automatikus” vagy „H.264”.';
-  const driver = gpu.vendor === 'nvidia' ? 'az NVIDIA illesztőprogramot' : 'a videókártya illesztőprogramját';
-  return `Chrome/Edge → Beállítások → Rendszer → „Grafikus gyorsítás használata” legyen bekapcsolva, és frissítsd ${driver}.`;
+  updateCaptureInfo();
 }
 
 function renderEncoderStatus() {
-  $('#gpuName').textContent = `Videókártya: ${gpu.name || 'ismeretlen'}`;
   const el = $('#encoderStatus');
-  const sending = [...host.viewers.values()].map((v) => v.stats).filter(Boolean);
-  const active = sending.filter((x) => x.hw != null);
-  if (!isLive() || !sending.length) {
-    el.textContent = 'Az első néző csatlakozásakor kiderül, hogy a videókártya kódol-e.';
-    el.className = 'hint';
+  const pipe = direct.video;
+  if (!isLive() || !pipe?.config) {
+    el.textContent = direct.failed ? `A kép nem kódolható: ${direct.failed}` : 'Az első néző csatlakozásakor indul a kódolás (H.264).';
+    el.className = direct.failed ? 'hint warn' : 'hint';
     return;
   }
-  if (!active.length) {
-    const x = sending[0];
-    const ms = x.encodeMs != null ? ` · ${nf1.format(x.encodeMs)} ms/kép` : '';
-    el.textContent = `Kódolás: ${CODEC_LABEL[x.codec] || x.codec || '?'}${ms} – ez a böngésző nem árulja el, hogy a videókártya kódol-e.`;
-    el.className = 'hint';
-    return;
-  }
-  const hw = active.filter((x) => x.hw);
-  const sample = hw[0] || active[0];
-  const codec = CODEC_LABEL[sample.codec] || sample.codec || '';
-  const ms = sample.encodeMs != null ? ` · ${nf1.format(sample.encodeMs)} ms/kép` : '';
-  if (hw.length === active.length) {
-    el.textContent = `Hardveres kódolás: ${gpu.encoderName} · ${codec}${ms}`;
+  const ms = pipe.encodeMs != null ? ` · ${nf1.format(pipe.encodeMs)} ms/kép` : '';
+  const size = `${pipe.config.width}×${pipe.config.height}`;
+  if (direct.hw) {
+    el.textContent = `Hardveres kódolás (videókártya) · H.264 · ${size}${ms}`;
     el.className = 'hint ok';
-  } else if (hw.length) {
-    const limit = gpu.vendor === 'nvidia' ? ' (a GeForce kártyák egyszerre kb. 8 hardveres kódolást bírnak)' : '';
-    el.textContent = `${hw.length}/${active.length} néző hardveresen kódolva (${gpu.encoderName}), a többinél a processzor kódol${limit}.`;
-    el.className = 'hint warn';
   } else {
-    el.textContent = `Szoftveres kódolás (${codec}${ms}): a processzor kódol, ez lassabb és több késést okoz. ${hwTip()}`;
+    el.textContent = `Szoftveres kódolás (processzor) · H.264 · ${size}${ms}. Ez lassabb: kapcsold be a böngészőben a grafikus gyorsítást, vagy oszd meg az asztali alkalmazásból.`;
     el.className = 'hint warn';
   }
 }
-
-const LIMIT_LABEL = { cpu: 'CPU', bandwidth: 'sávszélesség', other: 'egyéb' };
 
 function renderViewers() {
   const rows = [];
@@ -1555,47 +736,34 @@ function renderViewers() {
     const name = document.createElement('span');
     name.textContent = `Néző #${v.n}`;
     const state = document.createElement('span');
-    const cs = v.direct ? (v.direct.state === 'connected' ? 'direct' : 'connecting') : v.pc?.connectionState;
     if (!isLive()) { state.textContent = 'vár (szünet)'; state.className = 'viewer-state'; }
-    else if (cs === 'direct') { state.textContent = `közvetlen mód · ${PATH_LABEL[v.direct.path] || ''}`; state.className = 'viewer-state ok'; }
-    else if (cs === 'connected') { state.textContent = v.stats?.relay ? 'WebRTC · TURN relé' : 'WebRTC · P2P'; state.className = 'viewer-state ok'; }
-    else if (cs === 'failed' || cs === 'disconnected') { state.textContent = 'kapcsolat gond…'; state.className = 'viewer-state warn'; }
+    else if (v.direct?.state === 'connected') { state.textContent = `néz · ${PATH_LABEL[v.direct.path] || ''}`; state.className = 'viewer-state ok'; }
+    else if (!v.direct && v.directWhy && !v.caps?.direct) { state.textContent = 'nem tud nézni'; state.className = 'viewer-state warn'; }
     else { state.textContent = 'kapcsolódik…'; state.className = 'viewer-state'; }
     head.append(name, state);
     li.append(head);
-    const why = !v.direct && v.pc && v.caps?.direct ? directWhy(v) : null;
-    if (isLive() && (why || (!v.direct && !v.pc && v.directWhy))) {
+    if (isLive() && !v.direct && v.directWhy) {
       const note = document.createElement('div');
       note.className = 'viewer-stats warn';
-      note.textContent = why ? `Közvetlen mód helyett WebRTC: ${WHY_TEXT[why]}` : `Közvetlen kapcsolat újra… (${WHY_TEXT[v.directWhy] || v.directWhy})`;
+      note.textContent = v.caps?.direct ? `Kapcsolat újra… (${WHY_TEXT[v.directWhy] || v.directWhy})` : `Nem kap képet: ${WHY_TEXT[v.directWhy]}`;
       li.append(note);
     }
-
     const s = v.stats;
     if (s && isLive()) {
       const stats = document.createElement('div');
       stats.className = 'viewer-stats';
-      const codec = CODEC_LABEL[s.codec] || s.codec || CODEC_LABEL[v.codec] || '';
-      const enc = s.hw === true ? ` · ${s.encoder || gpu.encoderName}` : s.hw === false ? ' · szoftveres' : '';
       const line1 = document.createElement('div');
       line1.textContent = `${s.w || '?'}×${s.h || '?'} · ${s.fps != null ? Math.round(s.fps) : '–'} FPS · ${fmtKbps(s.kbps)}`;
       const line2 = document.createElement('div');
-      line2.textContent = `${codec}${enc} · RTT ${fmtMs(s.rtt)}${v.surroundActive && host.audio8 ? ` · ${host.surroundLabel} hang` : ''}`;
-      if (s.impl) line2.title = s.impl;
+      line2.textContent = `H.264 · ${s.hw === true ? 'videókártya' : s.hw === false ? 'szoftveres' : '…'} · RTT ${fmtMs(s.rtt)}`;
       stats.append(line1, line2);
       if (v.remote?.lat != null) {
-        // direct mode: measured end to end (capture → on the viewer's screen)
+        // measured end to end (capture → on the viewer's screen)
         const total = v.remote.measured ? v.remote.lat : v.remote.lat + (s.encodeMs || 0);
         const line = document.createElement('div');
         line.textContent = `Késés: ~${Math.round(total)} ms`;
         if (total > 150) line.className = 'warn';
         stats.append(line);
-      }
-      if (s.limit && s.limit !== 'none') {
-        const line3 = document.createElement('div');
-        line3.className = 'warn';
-        line3.textContent = `Korlátozza: ${LIMIT_LABEL[s.limit] || s.limit}`;
-        stats.append(line3);
       }
       li.append(stats);
     }
@@ -1624,8 +792,8 @@ async function copyLink() {
   toast('Link kimásolva – küldd el a nézőknek!', 'info', 2500);
 }
 
-function initHostUi() {
-  const fields = { setRes: 'res', setFps: 'fps', setKbps: 'kbps', setMode: 'mode', setCodec: 'codec' };
+async function initHostUi() {
+  const fields = { setRes: 'res', setFps: 'fps', setKbps: 'kbps', setMode: 'mode' };
   for (const [id, key] of Object.entries(fields)) {
     const el = $(`#${id}`);
     el.value = String(settings[key]);
@@ -1646,9 +814,7 @@ function initHostUi() {
   $('#setAudioSource').addEventListener('change', onAudioSourceChange);
   navigator.mediaDevices?.addEventListener?.('devicechange', populateAudioSources);
 
-  if (APP) {
-    document.documentElement.classList.add('in-app');
-  } else if (IS_IOS) {
+  if (IS_IOS) {
     $('#iosInstall').hidden = STANDALONE || IN_IOS_APP; // already installed
   } else {
     $('#downloads').hidden = false;
@@ -1664,570 +830,50 @@ function initHostUi() {
   $('#btnCopy').addEventListener('click', copyLink);
   $('#roomLink').addEventListener('focus', (e) => e.target.select());
 
-  if (!navigator.mediaDevices?.getDisplayMedia || !window.RTCPeerConnection) {
+  const problem = await shareProblem();
+  if (problem) {
     $('#btnShare').disabled = true;
-    $('#shareUnsupported').hidden = false;
+    const note = $('#shareUnsupported');
+    note.hidden = false;
     if (IN_IOS_APP) {
-      $('#shareUnsupported').textContent = 'A képernyőd megosztása: lent a „Megosztás” fülön.';
+      note.textContent = 'A képernyőd megosztása: lent a „Megosztás” fülön.';
     } else if (IS_IOS) {
       // Apple allows no screen capture in any iOS browser – the iOS app can (ReplayKit)
-      $('#shareUnsupported').replaceChildren(
+      note.replaceChildren(
         'iPhone-on és iPaden a böngésző nem oszthat meg képernyőt (Apple-korlát). Megosztani a ',
         Object.assign(document.createElement('a'), { href: IOS_APP_URL, textContent: 'Screen Share iOS alkalmazással' }),
         ' lehet (telepítés: lent).',
       );
+    } else if (problem === 'display') {
+      note.textContent = 'Ez a böngésző nem tud képernyőt megosztani. Számítógépen használj friss Chrome-ot, Edge-et, Firefoxot vagy Safarit – vagy az asztali alkalmazást.';
+    } else {
+      note.textContent = 'Ez a böngésző nem tud H.264 képet kódolni (WebCodecs), ami a megosztáshoz kell. Frissítsd, vagy használj Chrome-ot, Edge-et – vagy az asztali alkalmazást.';
     }
   } else if (IS_MAC) {
     $('#macHint').hidden = false;
   }
 }
 
-/* ============================= VIEWER ============================= */
+/* ===================== DIRECT MODE: the sharer ===================== */
+// The sharer encodes once for every viewer (WebCodecs, on the GPU if it can), the frames go over
+// our encrypted transport, and each viewer decodes and draws every frame the moment it arrives –
+// no jitter buffer, no pacing queue.
 
-const viewer = {
-  signal: null,
-  code: null,
-  id: null,
-  iceServers: [],
-  caps: null,
-  pc: null,
-  session: null,
-  pendingCandidates: [],
-  chain: Promise.resolve(),
-  closed: false,
-  live: false,
-  retryTimer: null,
-  failTimer: null,
-  prev: null,
-  prevAudio: null,
-  statsTimer: null,
-  bufferMs: store.get('ss-buffer', 0),
-  muted: false,
-  wakeLock: null,
-  idleTimer: null,
-  hostStats: null, // the sender's encoder info (codec, hardware, encode time)
-  direct: null, // direct mode (app → app without WebRTC), see DIRECT MODE
-  frameDelays: [], // receive → display time of recent frames (ms)
-  frameTimer: null,
-  tick: 0,
+const direct = {
+  video: null, // the encoding pipelines
+  audio: null,
+  forceKey: false,
+  wantKey: false,
+  lastKey: 0,
+  kbps: 0,
+  lastCut: 0,
+  lastRaise: 0,
+  hw: null, // the encoder runs on the GPU (null: not known yet)
+  failed: null, // why the picture cannot be encoded at all
+  canEncodeAudio: typeof AudioEncoder === 'function',
 };
 
-const video = () => $('#remoteVideo');
-
-// Per-frame receive → display delay (jitter buffer + decode + render), measured by the browser.
-function startFrameTiming() {
-  const el = video();
-  if (viewer.frameTimer != null || !el.requestVideoFrameCallback) return;
-  const onFrame = (_now, md) => {
-    if (md.receiveTime != null && md.expectedDisplayTime != null) {
-      viewer.frameDelays.push(md.expectedDisplayTime - md.receiveTime);
-      if (viewer.frameDelays.length > 60) viewer.frameDelays.shift();
-    }
-    viewer.frameTimer = el.requestVideoFrameCallback(onFrame);
-  };
-  viewer.frameTimer = el.requestVideoFrameCallback(onFrame);
-}
-
-function median(list) {
-  if (!list.length) return null;
-  const sorted = [...list].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)];
-}
-
-// 5.1/7.1 speakers in a Chromium browser (Chrome, Edge, the app): multi-channel
-// Opus plays there as real surround (Chromium opens the output with all channels).
-function surroundSpeakers() {
-  if (!navigator.userAgentData?.brands?.some((b) => /Chromium/i.test(b.brand))) return false;
-  try {
-    const ctx = new AudioContext();
-    const channels = ctx.destination.maxChannelCount;
-    ctx.close().catch(() => {});
-    return channels >= 6;
-  } catch {
-    return false;
-  }
-}
-
-async function startViewing(code) {
-  showView('view-viewer');
-  $('#viewerRoom').textContent = code;
-  if (location.hash.slice(1) !== code) history.replaceState(null, '', `#${code}`);
-  if (!window.RTCPeerConnection) {
-    setOverlay('Ez a böngésző nem támogatja a WebRTC-t. Használj friss Chrome-ot, Edge-et, Firefoxot vagy Safarit.', { spinner: false });
-    return;
-  }
-  viewer.code = code;
-  setOverlay('Csatlakozás a szobához…');
-  [viewer.caps] = await Promise.all([Promise.race([codecSupport('decode'), sleep(1500).then(() => null)]), directReady]);
-  if (surroundSpeakers()) viewer.caps = { ...viewer.caps, surround: true };
-  if (DIRECT) viewer.caps = { ...viewer.caps, direct: true }; // can receive without WebRTC
-  viewer.signal = createSignal({
-    onMessage: onViewerMessage,
-    onOpen: joinRoom,
-    onClose: () => {
-      if (!viewer.closed && !hasPicture()) setOverlay('Megszakadt a kapcsolat a szerverrel, újracsatlakozás…');
-    },
-  });
-  viewer.statsTimer = setInterval(viewerStatsTick, 1000);
-  window.addEventListener('pagehide', () => viewer.signal?.send({ t: 'leave' }));
-}
-
-async function joinRoom() {
-  clearTimeout(viewer.retryTimer);
-  if (viewer.closed) return;
-  try {
-    const res = await viewer.signal.request({ t: 'join', code: viewer.code, caps: viewer.caps }, ['joined']);
-    viewer.id = res.id;
-    viewer.iceServers = res.iceServers || [];
-    viewer.live = Boolean(res.live);
-    if (!res.hostPresent) setOverlay('A megosztó épp nincs bent. Várakozás…');
-    else if (!viewer.live) setOverlay('A megosztás szünetel. Amint folytatódik, itt lesz a kép.');
-    else if (!hasPicture()) setOverlay('Csatlakozva. Kép betöltése…');
-  } catch (err) {
-    if (err.code === 'offline') return; // reconnect will call joinRoom again
-    const delay = err.code === 'rate' ? 30000 : 5000;
-    setOverlay(`${errorText(err)} Újrapróbálom…`, { actions: [{ label: 'Vissza a főoldalra', onClick: goHome }] });
-    viewer.retryTimer = setTimeout(joinRoom, delay);
-  }
-}
-
-function onViewerMessage(msg) {
-  switch (msg.t) {
-    case 'signal':
-      if (msg.from === 'host' && msg.data && typeof msg.data === 'object') {
-        viewer.chain = viewer.chain.then(() => onHostSignal(msg.data)).catch((err) => console.warn('signal handling failed', err));
-      }
-      break;
-    case 'state':
-    case 'host-back':
-      viewer.live = Boolean(msg.live);
-      if (!viewer.live) setOverlay('A megosztás szünetel. Amint folytatódik, itt lesz a kép.');
-      else if (hasPicture()) { hideOverlay(); setLive(true); }
-      else setOverlay('Kép betöltése…');
-      if (!viewer.live) setLive(false);
-      break;
-    case 'host-away':
-      // Media may still flow peer-to-peer; only cover the picture if it stopped.
-      if (!hasPicture() || (viewer.direct ? viewer.direct.state !== 'connected' : viewer.pc?.connectionState !== 'connected')) setOverlay('A megosztó kapcsolata megszakadt. Várakozás…');
-      break;
-    case 'direct':
-      onViewerDirectSession(msg);
-      break;
-    case 'count':
-      $('#viewerCountText').textContent = `${msg.n} néző`;
-      break;
-    case 'closed':
-      viewer.closed = true;
-      clearTimeout(viewer.retryTimer);
-      closeViewerConnection();
-      closeDirectView();
-      setLive(false);
-      setOverlay(msg.reason === 'timeout' ? 'A megosztó nem tért vissza, a szoba bezárult.' : 'A megosztó befejezte a megosztást. Köszi, hogy néztél!', {
-        spinner: false,
-        actions: [{ label: 'Vissza a főoldalra', onClick: goHome, primary: true }],
-      });
-      viewer.signal?.close();
-      break;
-    default: break;
-  }
-}
-
-function sendToHost(data) {
-  viewer.signal?.send({ t: 'signal', to: 'host', data: { ...data, session: viewer.session } });
-}
-
-function newViewerPc(session) {
-  closeViewerConnection();
-  viewer.session = session;
-  viewer.pendingCandidates = [];
-  viewer.prev = null;
-  viewer.prevAudio = null;
-  viewer.hostStats = null;
-  viewer.frameDelays = [];
-  const pc = new RTCPeerConnection(rtcConfig(viewer.iceServers));
-  viewer.pc = pc;
-  pc.ontrack = (e) => {
-    if (viewer.pc !== pc) return;
-    tuneReceiver(e.receiver);
-    // one stream for the player, whatever stream ids the tracks came with
-    const stream = (viewer.stream ||= new MediaStream());
-    for (const t of stream.getTracks()) if (t.kind === e.track.kind && t !== e.track) stream.removeTrack(t);
-    if (!stream.getTracks().includes(e.track)) stream.addTrack(e.track);
-    attachStream(stream);
-  };
-  pc.onicecandidate = (e) => {
-    if (e.candidate && viewer.pc === pc) sendToHost({ type: 'candidate', candidate: e.candidate.toJSON() });
-  };
-  pc.onconnectionstatechange = () => {
-    if (viewer.pc !== pc) return;
-    clearTimeout(viewer.failTimer);
-    if (pc.connectionState === 'failed') {
-      setOverlay('A videókapcsolat megszakadt. Újrapróbálom…');
-      // The host restarts ICE on its own; ask for a brand new connection if that does not help.
-      viewer.failTimer = setTimeout(() => {
-        if (viewer.pc === pc && pc.connectionState === 'failed') sendToHost({ type: 'recall' });
-      }, 8000);
-    } else if (pc.connectionState === 'connected') {
-      if (!viewer.live) setOverlay('A megosztás szünetel. Amint folytatódik, itt lesz a kép.');
-      else if (hasPicture()) hideOverlay();
-    }
-  };
-  return pc;
-}
-
-function closeViewerConnection() {
-  clearTimeout(viewer.failTimer);
-  if (viewer.pc) {
-    viewer.pc.ontrack = null;
-    viewer.pc.onicecandidate = null;
-    viewer.pc.onconnectionstatechange = null;
-    viewer.pc.close();
-    viewer.pc = null;
-  }
-  viewer.stream = null;
-}
-
-async function onHostSignal(data) {
-  if (data.type === 'direct-offer') {
-    await onDirectOffer(data);
-    return;
-  }
-  if (data.type === 'unsupported') {
-    // the sharer's native app speaks only direct mode (no WebRTC)
-    setOverlay(data.why === 'server'
-      ? 'A megosztó alkalmazása közvetlen módot használ, de a szerver még nem ismeri – a szervert frissíteni kell.'
-      : 'A megosztó alkalmazása csak közvetlen módban küld képet, ezt ez a böngésző nem tudja. Nyisd meg friss Chrome-ban vagy Edge-ben, vagy az alkalmazásban.', { spinner: false });
-    return;
-  }
-  if (data.type === 'offer' && typeof data.sdp === 'string') {
-    closeDirectView(); // the sharer chose WebRTC for this viewer
-    noteWhyWebrtc(typeof data.why === 'string' ? data.why : null);
-    if (!viewer.pc || viewer.session !== data.session || viewer.pc.signalingState === 'closed') newViewerPc(data.session);
-    const pc = viewer.pc;
-    const lowLatency = viewer.bufferMs === 0;
-    viewer.lowLatency = lowLatency;
-    await pc.setRemoteDescription({ type: 'offer', sdp: lowLatency ? ownAudioStream(data.sdp) : data.sdp });
-    for (const c of viewer.pendingCandidates.splice(0)) await pc.addIceCandidate(c).catch(() => {});
-    const answer = await pc.createAnswer();
-    const base = lowLatency ? answer.sdp : withoutPlayoutDelay(answer.sdp);
-    const tuned = mungeSdp(base);
-    const surround = viewer.caps?.surround ? mungeSdp(acceptMultiopus(base, data.sdp)) : tuned;
-    let applied = false;
-    for (const sdp of new Set([surround, tuned])) {
-      try {
-        await pc.setLocalDescription({ type: 'answer', sdp });
-        applied = true;
-        break;
-      } catch { /* try the next, simpler answer */ }
-    }
-    if (!applied) await pc.setLocalDescription(answer); // a browser that refuses the tuned SDP still gets audio
-    if (viewer.pc === pc) sendToHost({ type: 'answer', sdp: pc.localDescription.sdp });
-  } else if (data.type === 'stats') {
-    if (data.session === viewer.session) viewer.hostStats = data;
-  } else if (data.type === 'candidate' && data.candidate) {
-    if (data.session !== viewer.session || !viewer.pc) return;
-    if (viewer.pc.remoteDescription) await viewer.pc.addIceCandidate(data.candidate).catch(() => {});
-    else viewer.pendingCandidates.push(data.candidate);
-  }
-}
-
-function tuneReceiver(receiver) {
-  // Smallest possible jitter buffer for "Minimal latency", or a fixed extra
-  // buffer for smoother playback on unstable networks.
-  if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = viewer.bufferMs;
-  else if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = viewer.bufferMs / 1000;
-}
-
-async function attachStream(stream) {
-  const el = video();
-  if (el.srcObject !== stream) el.srcObject = stream;
-  for (const r of viewer.pc?.getReceivers() || []) tuneReceiver(r);
-  startFrameTiming();
-  await playVideo();
-}
-
-async function playVideo() {
-  const el = video();
-  el.muted = viewer.muted;
-  try {
-    await el.play();
-    $('#btnUnmute').hidden = true;
-  } catch {
-    // Autoplay with sound blocked: start muted and ask for one click.
-    el.muted = true;
-    try { await el.play(); } catch { /* will retry on user gesture */ }
-    if (!viewer.muted) $('#btnUnmute').hidden = false;
-  }
-  syncMuteUi();
-}
-
-const hasPicture = () => (video().readyState >= 2 && video().videoWidth > 0) || Boolean(viewer.direct?.drawn);
-
-function onVideoPlaying() {
-  if (viewer.live) { hideOverlay(); setLive(true); }
-  requestWakeLock();
-}
-
-function setLive(on) {
-  const badge = $('#viewerLive');
-  badge.hidden = false;
-  badge.classList.toggle('off', !on);
-  badge.textContent = on ? 'ÉLŐ' : 'NINCS KÉP';
-}
-
-function setOverlay(text, { spinner = true, actions = [] } = {}) {
-  $('#overlay').hidden = false;
-  $('#spinner').hidden = !spinner;
-  $('#overlayText').textContent = text;
-  $('#overlayActions').replaceChildren(...actions.map((a) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = `btn ${a.primary ? 'btn-primary' : ''}`;
-    b.textContent = a.label;
-    b.addEventListener('click', a.onClick);
-    return b;
-  }));
-  showControls();
-}
-
-function hideOverlay() { $('#overlay').hidden = true; }
-function goHome() { location.href = location.pathname; }
-
-async function requestWakeLock() {
-  try {
-    if ('wakeLock' in navigator && !viewer.wakeLock && document.visibilityState === 'visible') {
-      viewer.wakeLock = await navigator.wakeLock.request('screen');
-      viewer.wakeLock.addEventListener('release', () => { viewer.wakeLock = null; });
-    }
-  } catch { /* not allowed – fine */ }
-}
-
-async function viewerStatsTick() {
-  if (viewer.direct) {
-    directStatsTick();
-    return;
-  }
-  const pc = viewer.pc;
-  if (!pc || pc.connectionState === 'closed') { $('#viewerInfo').textContent = ''; return; }
-  let report;
-  try { report = await pc.getStats(); } catch { return; }
-  let v = null;
-  let a = null;
-  report.forEach((s) => {
-    if (s.type === 'inbound-rtp' && s.kind === 'video') v = s;
-    if (s.type === 'inbound-rtp' && s.kind === 'audio') a = s;
-  });
-  if (!v) return;
-  const p = viewer.prev;
-  const pair = selectedPair(report);
-  const rtt = pair?.currentRoundTripTime != null ? pair.currentRoundTripTime * 1000 : null;
-  const dEmitted = rate(v, p, 'jitterBufferEmittedCount');
-  const jb = dEmitted ? (rate(v, p, 'jitterBufferDelay') / dEmitted) * 1000 : null;
-  const dDecoded = rate(v, p, 'framesDecoded');
-  const decode = dDecoded ? (rate(v, p, 'totalDecodeTime') / dDecoded) * 1000 : null;
-  const dLost = rate(v, p, 'packetsLost') ?? 0;
-  const dRecv = rate(v, p, 'packetsReceived') ?? 0;
-  const loss = dRecv + dLost > 0 ? (dLost / (dRecv + dLost)) * 100 : 0;
-  // network (RTT/2) + receive→display as measured per frame (fallback: jitter buffer + decode)
-  const toDisplay = median(viewer.frameDelays) ?? (jb != null ? jb + (decode || 0) : null);
-  const netLatency = rtt != null && toDisplay != null ? rtt / 2 + toDisplay : null;
-  const encodeMs = Number.isFinite(viewer.hostStats?.encodeMs) ? viewer.hostStats.encodeMs : 0;
-  const latency = netLatency != null ? netLatency + encodeMs : null;
-  const codec = report.get(v.codecId)?.mimeType?.split('/')[1]?.toUpperCase();
-  const fps = v.framesPerSecond;
-  const kbps = kbpsBetween(v, p, 'bytesReceived');
-  const audioKbps = kbpsBetween(a, viewer.prevAudio, 'bytesReceived');
-  const audioCodec = a ? report.get(a.codecId) : null;
-  const audioKind = /multiopus/i.test(audioCodec?.mimeType || '') ? `${surroundName(audioCodec.channels || 0)} térhang` : 'sztereó';
-  const relay = isRelayed(report, pair);
-  viewer.prev = v;
-  viewer.prevAudio = a;
-  if (viewer.tick++ % 2 === 0 && netLatency != null) {
-    sendToHost({ type: 'stats', lat: Math.round(netLatency), fps: fps != null ? Math.round(fps) : null, loss: Math.round(loss * 10) / 10 });
-  }
-
-  const res = v.frameWidth && v.frameHeight ? `${v.frameWidth}×${v.frameHeight}` : '–';
-  $('#viewerInfo').textContent = hasPicture()
-    ? `${res} · ${fps != null ? Math.round(fps) : '–'} FPS${latency != null ? ` · ~${Math.round(latency)} ms` : ''}`
-    : '';
-
-  if ($('#stats').hidden) return;
-  const hw = v.powerEfficientDecoder === true ? ' (HW)' : v.powerEfficientDecoder === false ? ' (SW)' : '';
-  const rows = [
-    ['Mód', viewer.whyWebrtc ? `WebRTC – ${WHY_TEXT[viewer.whyWebrtc]}` : 'WebRTC', Boolean(DIRECT && viewer.whyWebrtc)],
-    ['Felbontás', res],
-    ['FPS', fps != null ? String(Math.round(fps)) : '–'],
-    ['Bitráta', fmtKbps(kbps)],
-    ['Kodek', codec ? `${CODEC_LABEL[codec] || codec}${hw}` : '–'],
-    ['Küldő kódolója', senderEncoderText(viewer.hostStats), viewer.hostStats?.hw === false],
-    ['Becsült késés', latency != null ? `~${Math.round(latency)} ms` : '–', latency > 150],
-    ['RTT', fmtMs(rtt)],
-    ['Fogadás → kép', fmtMs(toDisplay)],
-    ['Jitter puffer', fmtMs(jb)],
-    ['Dekódolás', decode != null ? `${nf1.format(decode)} ms` : '–'],
-    ['Csomagvesztés', `${nf1.format(loss)} %`, loss > 2],
-    ['Eldobott képk.', String(v.framesDropped ?? 0)],
-    ['Kapcsolat', relay == null ? '–' : relay ? 'TURN relé' : 'Közvetlen P2P'],
-    ['Hang', a && audioKbps ? `${fmtKbps(audioKbps)} · ${audioKind}` : 'nincs'],
-  ];
-  const dl = document.createElement('dl');
-  for (const [k, val, warn] of rows) {
-    const dt = document.createElement('dt');
-    dt.textContent = k;
-    const dd = document.createElement('dd');
-    dd.textContent = val;
-    if (warn) dd.className = 'warn';
-    dl.append(dt, dd);
-  }
-  $('#stats').replaceChildren(dl);
-}
-
-function senderEncoderText(st) {
-  if (!st) return '–';
-  const name = st.hw === true ? st.encoder || 'hardveres' : st.hw === false ? 'szoftveres' : 'ismeretlen';
-  return `${name}${Number.isFinite(st.encodeMs) ? ` · ${nf1.format(st.encodeMs)} ms` : ''}`;
-}
-
-function syncMuteUi() {
-  const el = video();
-  $('#btnMute').classList.toggle('muted', el.muted || el.volume === 0);
-  $('#volume').value = String(el.muted ? 0 : el.volume);
-}
-
-function toggleMute() {
-  const el = video();
-  viewer.muted = !el.muted;
-  if (!viewer.muted && el.volume === 0) el.volume = 1;
-  el.muted = viewer.muted;
-  $('#btnUnmute').hidden = true;
-  if (el.paused) playVideo(); else syncMuteUi();
-}
-
-function toggleFullscreen() {
-  const player = $('#player');
-  const el = video();
-  if (document.fullscreenElement || document.webkitFullscreenElement) {
-    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
-  } else if (player.requestFullscreen) {
-    player.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
-  } else if (player.webkitRequestFullscreen) {
-    player.webkitRequestFullscreen();
-  } else if (el.webkitEnterFullscreen) {
-    el.webkitEnterFullscreen(); // iOS
-  }
-}
-
-function toggleStats() {
-  const box = $('#stats');
-  box.hidden = !box.hidden;
-  $('#btnStats').setAttribute('aria-pressed', String(!box.hidden));
-  if (!box.hidden) viewerStatsTick();
-}
-
-function showControls() {
-  const player = $('#player');
-  player.classList.add('ui-visible');
-  player.classList.remove('idle');
-  clearTimeout(viewer.idleTimer);
-  viewer.idleTimer = setTimeout(() => {
-    if (!$('#overlay').hidden || !$('#btnUnmute').hidden) return;
-    player.classList.remove('ui-visible');
-    player.classList.add('idle');
-  }, 2500);
-}
-
-function initViewerUi() {
-  const el = video();
-  const player = $('#player');
-  el.addEventListener('playing', onVideoPlaying);
-  el.addEventListener('resize', () => { if (viewer.live && hasPicture()) { hideOverlay(); setLive(true); } });
-  el.addEventListener('volumechange', syncMuteUi);
-  el.addEventListener('volumechange', syncDirectVolume);
-  el.addEventListener('dblclick', toggleFullscreen);
-  $('#directCanvas').addEventListener('dblclick', toggleFullscreen);
-  player.addEventListener('pointermove', showControls);
-  player.addEventListener('pointerdown', showControls);
-
-  const vol = $('#volume');
-  vol.value = String(store.get('ss-volume', 1));
-  el.volume = Number(vol.value);
-  vol.addEventListener('input', () => {
-    el.volume = Number(vol.value);
-    el.muted = viewer.muted = el.volume === 0;
-    store.set('ss-volume', el.volume);
-    if (!el.muted) $('#btnUnmute').hidden = true;
-  });
-
-  const lat = $('#latency');
-  lat.value = String(viewer.bufferMs);
-  if (lat.value !== String(viewer.bufferMs)) { viewer.bufferMs = 0; lat.value = '0'; }
-  lat.addEventListener('change', () => {
-    viewer.bufferMs = Number(lat.value);
-    store.set('ss-buffer', viewer.bufferMs);
-    for (const r of viewer.pc?.getReceivers() || []) tuneReceiver(r);
-    if (viewer.pc && viewer.lowLatency !== (viewer.bufferMs === 0)) {
-      // to or from "Minimális": the connection is set up differently (see ownAudioStream), or direct mode
-      sendToHost({ type: 'recall', direct: viewer.bufferMs === 0 && Boolean(DIRECT) });
-    }
-  });
-
-  $('#btnMute').addEventListener('click', toggleMute);
-  $('#btnFullscreen').addEventListener('click', toggleFullscreen);
-  $('#btnStats').addEventListener('click', toggleStats);
-  $('#btnUnmute').addEventListener('click', () => {
-    viewer.muted = false;
-    el.muted = false;
-    if (el.volume === 0) el.volume = 1;
-    $('#btnUnmute').hidden = true;
-    el.play().catch(() => {});
-    viewer.direct?.audio?.ctx.resume().catch(() => {});
-    syncDirectVolume();
-    syncMuteUi();
-  });
-
-  document.addEventListener('keydown', (e) => {
-    if ($('#view-viewer').hidden || e.ctrlKey || e.metaKey || e.altKey) return;
-    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
-    const k = e.key.toLowerCase();
-    if (k === 'f') toggleFullscreen();
-    else if (k === 'm') toggleMute();
-    else if (k === 's') toggleStats();
-    else return;
-    e.preventDefault();
-  });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && !el.paused) requestWakeLock(); });
-}
-
-/* ============================== boot ============================== */
-
-/* ======================= DIRECT MODE (no WebRTC) ======================= */
-// The picture skips WebRTC: the sharer encodes once for every such viewer (WebCodecs, on the
-// GPU – or the app's native NVENC), the frames go over our own encrypted transport, and the
-// viewer decodes and draws every frame the moment it arrives – no jitter buffer, no pacing
-// queue, no waiting for the compositor (low-latency canvas). The app sends over UDP
-// (desktop/direct.js); a browser over a WebSocket through the server (public/direct-web.js),
-// as it cannot send UDP. WebRTC is left for browsers without WebCodecs / X25519 (and iPhones).
-
-let DIRECT = APP?.direct || null;
-// a browser: the WebSocket transport, once it is known to work here
-let directReady = Promise.resolve();
-const DIRECT_CODEC = 'avc1.640034'; // H.264 High 5.2 (up to 4K 60): every GPU decodes it
-const DIRECT_MIN_KBPS = 3000;
-const PATH_LABEL = { lan: 'helyi hálózat', internet: 'interneten át', relay: 'a szerveren át', turn: 'TURN relén át', tcp: 'a szerveren át (HTTPS)' };
-// why an app viewer gets WebRTC (or why a direct attempt is repeated) – shown to both sides
-const WHY_TEXT = {
-  'host-browser': 'a megosztó böngészője nem tud közvetlen módban küldeni (Chrome / Edge, vagy az alkalmazás kell)',
-  'viewer-browser': 'a néző böngészője nem tud közvetlen módban fogadni (régebbi böngésző vagy iPhone)',
-  server: 'a szerver még nem ismeri – futtasd rajta újra: sudo bash deploy/install.sh',
-  encoder: 'nincs használható H.264 kódoló',
-  udp: 'a két gép nem érte el egymást',
-  'udp-blocked': 'sem UDP-n, sem a szerveren át nem jött létre kapcsolat – tűzfal?',
-  timeout: 'a közvetlen kapcsolat nem jött létre időben',
-  unavailable: 'a közvetlen átvitel nem indult el',
-  failed: 'a közvetlen kapcsolat megszakadt',
-};
-
-/** The TURN server (from the page's ICE servers) for direct mode's last-resort relay. */
+/** The TURN server (from the room's ICE servers) – the apps' last-resort relay. */
 function turnInfo(iceServers) {
   for (const s of iceServers || []) {
     if (!s.username || !s.credential) continue;
@@ -2239,49 +885,16 @@ function turnInfo(iceServers) {
   return null;
 }
 
-/** Why this viewer gets WebRTC (null: it gets direct mode). */
-function directWhy(v) {
-  if (!directOn()) return 'host-browser';
-  if (!v.caps?.direct) return 'viewer-browser';
-  if (!host.serverDirect) return 'server';
-  if (v.noDirect) return v.noDirectWhy || 'encoder';
-  return null;
-}
-
-const direct = {
-  video: null, // the sharer's encoding pipelines
-  audio: null,
-  forceKey: false,
-  wantKey: false,
-  lastKey: 0,
-  kbps: 0,
-  lastCut: 0,
-  lastRaise: 0,
-  hw: null,
-  native: null, // the native capture + NVENC (Windows, NVIDIA) while it runs
-  nativeOff: null, // why it is not used for this share
-};
-
-// a browser sends only with a track reader and an encoder (Chrome, Edge)
-const directOn = () => Boolean(DIRECT) && (!DIRECT.web || (typeof MediaStreamTrackProcessor === 'function' && typeof VideoEncoder === 'function'));
-const wantsDirect = (v) => directOn() && host.serverDirect && Boolean(v.caps?.direct) && !v.noDirect;
-const clockNow = () => performance.timeOrigin + performance.now();
-const evenPx = (x) => Math.max(2, Math.round(x / 2) * 2);
-
-/* ---- sharer: one connection per app viewer ---- */
-
 function startDirectViewer(v) {
   clearTimeout(v.retryTimer);
-  closeViewerPc(v);
   stopDirectViewer(v);
+  if (!DIRECT) return;
   v.session = randomId();
   v.createdAt = Date.now();
   v.stats = null;
-  v.prev = null;
   v.remote = null;
   v.direct = { state: 'starting', path: null, rtt: null, report: null, minRtt: Infinity };
   host.signal?.send({ t: 'direct', to: v.id });
-  // no direct picture in time (e.g. UDP blocked): WebRTC
   v.directTimer = setTimeout(() => { if (v.direct && v.direct.state !== 'connected') directFailed(v, 'timeout'); }, 12000);
 }
 
@@ -2293,7 +906,7 @@ function stopDirectViewer(v) {
   updateDirectPipelines();
 }
 
-// No WebRTC between two apps: a failed attempt is simply made again, after a pause.
+// A failed attempt is simply made again, after a pause.
 function directFailed(v, why = 'failed') {
   if (host.viewers.get(v.id) !== v) return;
   stopDirectViewer(v);
@@ -2301,18 +914,8 @@ function directFailed(v, why = 'failed') {
   v.directRetries = (v.directRetries || 0) + 1;
   clearTimeout(v.retryTimer);
   v.retryTimer = setTimeout(() => {
-    if (host.viewers.get(v.id) === v && !v.direct && !v.pc) startDirectViewer(v);
+    if (host.viewers.get(v.id) === v && !v.direct) startDirectViewer(v);
   }, Math.min(15000, 1500 * v.directRetries));
-  renderViewers();
-}
-
-// Only when this computer cannot encode H.264 at all: WebRTC (it has other codecs).
-function directToWebrtc(v, why) {
-  if (host.viewers.get(v.id) !== v) return;
-  stopDirectViewer(v);
-  v.noDirect = true;
-  v.noDirectWhy = why;
-  createViewerPc(v);
   renderViewers();
 }
 
@@ -2328,22 +931,6 @@ async function onDirectSession(msg) {
   }
   d.state = 'connecting';
   host.signal.send({ t: 'signal', to: v.id, data: { type: 'direct-offer', session: v.session, udp: msg.session, pub: res.pub, cands: res.cands, tcp: res.tcp === true, codec: DIRECT_CODEC } });
-}
-
-function onDirectViewerSignal(v, data) {
-  if (data.type === 'recall') {
-    if (Date.now() - (v.createdAt || 0) > 3000) startDirectViewer(v);
-    return;
-  }
-  if (data.session !== v.session) return;
-  if (data.type === 'direct-answer' && v.direct?.state === 'connecting') {
-    DIRECT.connect(v.id, { pub: data.pub, cands: data.cands, tcp: data.tcp === true });
-  } else if (data.type === 'direct-fail') {
-    directFailed(v, typeof data.why === 'string' && WHY_TEXT[data.why] ? data.why : 'failed');
-  } else if (data.type === 'stats') {
-    const num = (x) => (Number.isFinite(x) && x >= 0 && x < 1e6 ? x : null);
-    v.remote = { lat: num(data.lat), fps: num(data.fps), loss: num(data.loss), measured: data.measured === true };
-  }
 }
 
 function onHostDirectEvent(name, id, info) {
@@ -2364,8 +951,7 @@ function onHostDirectEvent(name, id, info) {
     } else if (info.state === 'failed') {
       directFailed(v, info.diag && !info.diag.server && !info.diag.turn && !info.diag.tcp ? 'udp-blocked' : 'udp');
     } else if (info.state === 'lost' || info.state === 'closed') {
-      // the viewer's network changed or its app reloaded: connect again
-      directFailed(v, 'failed');
+      directFailed(v, 'failed'); // the viewer's network changed or its page reloaded: connect again
     }
     renderViewers();
   } else if (name === 'report') {
@@ -2381,10 +967,10 @@ function onHostDirectEvent(name, id, info) {
 
 const directViewers = () => [...host.viewers.values()].filter((v) => v.direct?.state === 'connected');
 // the most beautiful picture the network allows: high (GPU) / what a processor manages
-const directTargetKbps = () => (settings.kbps === 'auto' ? (direct.hw === false ? 20000 : 120000) : settings.kbps);
+const directTargetKbps = () => (settings.kbps === 'auto' ? autoTarget().kbps : settings.kbps);
 
-// No bandwidth estimate as in WebRTC: lower the bitrate when a viewer loses packets, has to
-// skip frames or its round trip grows (queues filling up), raise it slowly while all is well.
+// No bandwidth estimate: lower the bitrate when a viewer loses packets, has to skip frames or its
+// round trip grows (queues filling up), raise it slowly while all is well.
 function adaptDirectBitrate() {
   const viewers = directViewers();
   const reports = viewers.map((v) => v.direct.report).filter(Boolean);
@@ -2404,59 +990,107 @@ function adaptDirectBitrate() {
   DIRECT.bitrate(direct.kbps * 1000);
 }
 
-/** Starts/stops the encoders to match the tracks and whether any app viewer is connected. */
+/** Starts/stops the encoders to match the tracks and whether any viewer is connected. */
 function updateDirectPipelines() {
   if (!DIRECT) return;
   if (!isLive() || !directViewers().length) {
     stopDirectVideo();
-    stopNativeVideo();
     stopDirectAudio();
     return;
   }
-  if (nativeWanted()) {
-    stopDirectVideo();
-    startNativeVideo();
-  } else {
-    stopNativeVideo();
-    if (direct.video?.track !== host.video) startDirectVideo(host.video);
-  }
-  const audio = settings.audio ? host.audio8 || host.audio : null;
+  if (direct.video?.track !== host.video) startDirectVideo(host.video);
+  const audio = settings.audio && direct.canEncodeAudio ? host.audio : null;
   if ((direct.audio?.track || null) !== (audio || null)) startDirectAudio(audio);
 }
 
-/* ---- sharer: video ---- */
+/* ---- the sharer's picture ---- */
+
+/** The track's frames, one at a time: MediaStreamTrackProcessor (Chrome, Edge), else from a
+ *  video element as it shows them (Firefox, Safari). onFrame owns (closes) each frame. */
+function readFrames(track, onFrame) {
+  if (typeof MediaStreamTrackProcessor === 'function') {
+    const reader = new MediaStreamTrackProcessor({ track, maxBufferSize: 1 }).readable.getReader();
+    let stopped = false;
+    (async () => {
+      try {
+        for (;;) {
+          const { value: frame, done } = await reader.read();
+          if (done) break;
+          if (stopped) {
+            frame.close();
+            break;
+          }
+          await onFrame(frame);
+        }
+      } catch (err) {
+        if (!stopped) console.warn('frames', err);
+      }
+    })();
+    return () => {
+      stopped = true;
+      reader.cancel().catch(() => {});
+    };
+  }
+  const el = document.createElement('video');
+  el.muted = true;
+  el.playsInline = true;
+  el.srcObject = new MediaStream([track]);
+  el.play().catch(() => {});
+  let stopped = false;
+  let busy = false;
+  let timer = null;
+  let callback = null;
+  const grab = async () => {
+    if (stopped || busy || el.readyState < 2 || !el.videoWidth) return;
+    busy = true; // a frame that would wait for the encoder is only delay: skipped
+    try {
+      await onFrame(new VideoFrame(el, { timestamp: Math.round(performance.now() * 1000) }));
+    } catch (err) {
+      console.warn('frames', err);
+    } finally {
+      busy = false;
+    }
+  };
+  if (el.requestVideoFrameCallback) {
+    const next = () => {
+      if (stopped) return;
+      grab();
+      callback = el.requestVideoFrameCallback(next);
+    };
+    callback = el.requestVideoFrameCallback(next);
+  } else {
+    timer = setInterval(grab, 1000 / captureFps());
+  }
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+    if (callback != null) el.cancelVideoFrameCallback?.(callback);
+    el.pause();
+    el.srcObject = null;
+  };
+}
 
 function startDirectVideo(track) {
   stopDirectVideo();
   if (!track || track.readyState !== 'live') return;
-  let reader;
-  try {
-    reader = new MediaStreamTrackProcessor({ track, maxBufferSize: 1 }).readable.getReader();
-  } catch (err) {
-    console.warn('direct video', err);
-    return;
-  }
-  const pipe = { track, reader, encoder: null, config: null, sizeKey: '', captured: new Map(), encodeMs: null, inFlight: 0, limit: 1, lastOutput: performance.now(), scale: 1, slowSince: 0, fastSince: 0, stopped: false };
+  const pipe = { track, stop: null, encoder: null, config: null, sizeKey: '', captured: new Map(), encodeMs: null, inFlight: 0, limit: 1, lastOutput: performance.now(), scale: 1, slowSince: 0, fastSince: 0, stopped: false };
   direct.video = pipe;
   direct.forceKey = true;
-  (async () => {
+  pipe.stop = readFrames(track, async (frame) => {
+    if (pipe.stopped) {
+      frame.close();
+      return;
+    }
     try {
-      for (;;) {
-        const { value: frame, done } = await reader.read();
-        if (done) break;
-        if (pipe.stopped) {
-          frame.close();
-          break;
-        }
-        await encodeDirectFrame(pipe, frame);
-      }
+      await encodeDirectFrame(pipe, frame);
     } catch (err) {
       if (pipe.stopped) return;
       console.warn('direct video', err);
-      // no encoder at all: these viewers get WebRTC
-      for (const v of [...host.viewers.values()]) if (v.direct) directToWebrtc(v, 'encoder');
+      direct.failed = 'nincs használható H.264 kódoló ebben a böngészőben';
+      stopDirectVideo();
+      renderEncoderStatus();
     }
-  })();
+  });
 }
 
 function stopDirectVideo() {
@@ -2464,15 +1098,14 @@ function stopDirectVideo() {
   if (!pipe) return;
   direct.video = null;
   pipe.stopped = true;
-  pipe.reader.cancel().catch(() => {});
+  pipe.stop?.();
   try { pipe.encoder?.close(); } catch { /* already closed */ }
 }
 
 function directVideoConfig(pipe, frame) {
   const w = frame.displayWidth;
   const h = frame.displayHeight;
-  const hwOk = direct.hw !== false;
-  const target = RES_TARGETS[settings.res === 'auto' ? (hwOk ? HW_TARGET.res : '1080') : settings.res];
+  const target = RES_TARGETS[settings.res === 'auto' ? autoTarget().res : settings.res];
   let scale = 1;
   if (target) {
     const [tw, th] = w >= h ? target : [target[1], target[0]];
@@ -2484,7 +1117,7 @@ function directVideoConfig(pipe, frame) {
     width: evenPx(w / scale),
     height: evenPx(h / scale),
     bitrate: Math.round((direct.kbps || directTargetKbps()) * 1000),
-    framerate: settings.fps === 'auto' ? (hwOk ? HW_TARGET.fps : 30) : settings.fps,
+    framerate: settings.fps === 'auto' ? autoTarget().fps : settings.fps,
     latencyMode: 'realtime',
     bitrateMode: 'variable',
     avc: { format: 'annexb' },
@@ -2506,7 +1139,10 @@ async function configureDirectEncoder(pipe, want) {
     // no GPU encoder: the processor manages at most 1080p 30 without falling behind
     const scale = Math.sqrt(Math.max(1, (want.width * want.height) / (1920 * 1080)));
     config = { ...want, width: evenPx(want.width / scale), height: evenPx(want.height / scale), framerate: Math.min(want.framerate, 30), hardwareAcceleration: 'no-preference' };
-    if (!(await supported(config))) throw new Error('no H.264 encoder');
+    if (!(await supported(config))) {
+      delete config.contentHint; // (a browser that does not know it)
+      if (!(await supported(config))) throw new Error('no H.264 encoder');
+    }
   }
   if (pipe.stopped) return;
   if (!pipe.encoder || pipe.encoder.state === 'closed') {
@@ -2525,6 +1161,7 @@ async function configureDirectEncoder(pipe, want) {
   pipe.inFlight = 0;
   pipe.lastOutput = performance.now();
   direct.hw = hw;
+  direct.failed = null;
 }
 
 async function encodeDirectFrame(pipe, frame) {
@@ -2602,104 +1239,76 @@ function adaptDirectSize(pipe) {
   }
 }
 
-/* ---- sharer: video from native code (Windows + NVIDIA, macOS) ---- */
-// A whole screen: the app captures it itself (DXGI / ScreenCaptureKit, the moment a new image is
-// composed), the GPU encodes it (NVENC / VideoToolbox) and the app sends the frames – they never
-// pass through this page. Anything else, or an error, stays with the WebCodecs encoder above.
+/* ---- the sharer's sound (Opus, 2.5 ms packets – its least delay) ---- */
 
-const NATIVE = APP?.nativeCapture || null;
-
-const nativeWanted = () => Boolean(NATIVE) && !direct.nativeOff && host.video?.readyState === 'live'
-  && host.video.getSettings().displaySurface === 'monitor';
-
-function nativeConfig() {
-  const target = RES_TARGETS[settings.res === 'auto' ? HW_TARGET.res : settings.res]; // null: the screen's own size
-  return {
-    width: target?.[0] || 0,
-    height: target?.[1] || 0,
-    fps: settings.fps === 'auto' ? HW_TARGET.fps : settings.fps,
-    bitrate: Math.round((direct.kbps || directTargetKbps()) * 1000),
+/** The track's sound as AudioData: MediaStreamTrackProcessor, else an AudioWorklet (Firefox,
+ *  Safari). onData owns (closes) each. Returns a stop function (async: the worklet loads). */
+async function readAudio(track, onData) {
+  if (typeof MediaStreamTrackProcessor === 'function') {
+    const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    let stopped = false;
+    (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done || stopped) {
+            value?.close();
+            break;
+          }
+          onData(value);
+        }
+      } catch (err) {
+        if (!stopped) console.warn('sound', err);
+      }
+    })();
+    return () => {
+      stopped = true;
+      reader.cancel().catch(() => {});
+    };
+  }
+  const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+  await ctx.audioWorklet.addModule('/capture-audio.js');
+  const src = ctx.createMediaStreamSource(new MediaStream([track]));
+  const node = new AudioWorkletNode(ctx, 'capture-audio', { numberOfOutputs: 1 });
+  const mute = ctx.createGain();
+  mute.gain.value = 0; // (connected only so that the browser runs it)
+  src.connect(node).connect(mute).connect(ctx.destination);
+  let next = null; // the next sample's time, µs: a sample-accurate timeline
+  node.port.onmessage = ({ data: { planes } }) => {
+    const frames = planes[0]?.length || 0;
+    if (!frames) return;
+    const arrived = performance.now() * 1000 - (frames / 48000) * 1e6;
+    if (next == null || Math.abs(next - arrived) > 20000) next = arrived;
+    const data = new Float32Array(frames * planes.length);
+    planes.forEach((p, c) => data.set(p, c * frames));
+    onData(new AudioData({ format: 'f32-planar', sampleRate: 48000, numberOfFrames: frames, numberOfChannels: planes.length, timestamp: Math.round(next), data }));
+    next += (frames / 48000) * 1e6;
+  };
+  ctx.resume().catch(() => {});
+  return () => {
+    node.port.onmessage = null;
+    src.disconnect();
+    ctx.close().catch(() => {});
   };
 }
-
-async function startNativeVideo() {
-  const config = nativeConfig();
-  const key = `${config.width}x${config.height}@${config.fps}`;
-  if (direct.native && direct.native.key === key && direct.native.track === host.video) return;
-  stopNativeVideo();
-  const n = { key, track: host.video, id: null, width: null, height: null, fps: null, adapter: '', stats: null };
-  direct.native = n;
-  const res = await NATIVE.start(config).catch((err) => ({ error: err.message }));
-  if (direct.native !== n) {
-    if (res?.id) NATIVE.stop(res.id);
-    return;
-  }
-  if (!res || res.error) {
-    // not this screen / no NVIDIA / old driver: the page's encoder
-    console.info('native capture not used:', res?.error);
-    direct.native = null;
-    direct.nativeOff = res?.error || 'failed';
-    updateDirectPipelines();
-    return;
-  }
-  Object.assign(n, { id: res.id, width: res.width, height: res.height, fps: res.fps, adapter: res.adapter, encoder: res.encoder, impl: res.impl });
-  direct.hw = true;
-  renderViewers();
-}
-
-function stopNativeVideo() {
-  const n = direct.native;
-  if (!n) return;
-  direct.native = null;
-  if (n.id) NATIVE.stop(n.id);
-}
-
-function onNativeEvent(name, id, info) {
-  const n = direct.native;
-  if (!n || n.id !== id) return;
-  if (name === 'stats') {
-    n.stats = info;
-  } else if (name === 'info') {
-    Object.assign(n, { width: info.width, height: info.height });
-  } else if (name === 'ended') {
-    console.warn('native capture ended:', info);
-    direct.native = null;
-    direct.nativeOff = info || 'ended';
-    updateDirectPipelines();
-    renderViewers();
-  }
-}
-
-/* ---- sharer: audio (Opus, 2.5 ms packets – its least delay; 5.1/7.1 as channel pairs) ---- */
 
 function startDirectAudio(track) {
   stopDirectAudio();
   if (!track || track.readyState !== 'live') return;
-  let reader;
-  try {
-    reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
-  } catch (err) {
-    console.warn('direct audio', err);
-    return;
-  }
-  const pipe = { track, reader, encoders: [], channels: 0, rate: 0, stopped: false };
+  const pipe = { track, stop: null, encoders: [], channels: 0, rate: 0, stopped: false };
   direct.audio = pipe;
-  (async () => {
+  readAudio(track, (data) => {
     try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        try {
-          if (!pipe.stopped) encodeDirectAudio(pipe, value);
-        } finally {
-          value.close();
-        }
-        if (pipe.stopped) break;
-      }
+      if (!pipe.stopped) encodeDirectAudio(pipe, data);
     } catch (err) {
-      if (!pipe.stopped) console.warn('direct audio', err);
+      console.warn('direct audio', err);
+    } finally {
+      data.close();
     }
-  })();
+  }).then((stop) => {
+    pipe.stop = stop;
+    if (pipe.stopped) stop();
+  }, (err) => console.warn('direct audio', err));
 }
 
 function stopDirectAudio() {
@@ -2707,7 +1316,7 @@ function stopDirectAudio() {
   if (!pipe) return;
   direct.audio = null;
   pipe.stopped = true;
-  pipe.reader.cancel().catch(() => {});
+  pipe.stop?.();
   for (const e of pipe.encoders) {
     try { e.close(); } catch { /* already closed */ }
   }
@@ -2754,29 +1363,313 @@ function directStats(v) {
   const d = v.direct;
   if (d.state !== 'connected') return null;
   const r = d.report;
-  const n = direct.native?.id ? direct.native : null;
-  const cfg = n || direct.video?.config;
+  const cfg = direct.video?.config;
   return {
     w: cfg?.width,
     h: cfg?.height,
     fps: r?.fps ?? null,
     kbps: r?.kbps ?? null,
-    codec: 'H264',
-    hw: n ? true : direct.hw,
-    encoder: n ? `${n.encoder || 'NVENC'} (natív)` : null,
-    impl: n ? `natív: ${n.impl || 'DXGI + NVENC'} · ${n.adapter}` : 'WebCodecs',
-    encodeMs: n ? n.stats?.encodeMs ?? null : direct.video?.encodeMs ?? null,
-    limit: null,
+    hw: direct.hw,
+    encodeMs: direct.video?.encodeMs ?? null,
     rtt: r?.rtt ?? d.rtt,
-    relay: d.path === 'relay',
-    path: d.path,
   };
 }
 
-/* ---- viewer ---- */
+/* ============================= VIEWER ============================= */
+
+const viewer = {
+  signal: null,
+  code: null,
+  id: null,
+  iceServers: [],
+  caps: null,
+  session: null,
+  closed: false,
+  live: false,
+  hostPresent: false,
+  retryTimer: null,
+  offerTimer: null,
+  statsTimer: null,
+  volume: Math.min(1, Math.max(0, Number(store.get('ss-volume', 1)) || 0)),
+  muted: false,
+  wakeLock: null,
+  idleTimer: null,
+  hostStats: null, // the sender's encoder info (hardware, encode time)
+  direct: null, // the connection to the sharer, see "DIRECT MODE: the viewer"
+  tick: 0,
+};
+
+const canvas = () => $('#directCanvas');
+const hasPicture = () => Boolean(viewer.direct?.drawn);
+
+// 5.1/7.1 speakers in a Chromium browser: the sharer's surround sound plays there on every speaker.
+function surroundSpeakers() {
+  if (!navigator.userAgentData?.brands?.some((b) => /Chromium/i.test(b.brand))) return false;
+  try {
+    const ctx = new AudioContext();
+    const channels = ctx.destination.maxChannelCount;
+    ctx.close().catch(() => {});
+    return channels >= 6;
+  } catch {
+    return false;
+  }
+}
+
+async function startViewing(code) {
+  showView('view-viewer');
+  $('#viewerRoom').textContent = code;
+  if (location.hash.slice(1) !== code) history.replaceState(null, '', `#${code}`);
+  viewer.code = code;
+  setOverlay('Csatlakozás a szobához…');
+  await directReady;
+  if (!canDirect.ok) {
+    setOverlay(IS_IOS
+      ? 'Ez az iOS-verzió még nem tudja fogadni a képet (iOS 16.4 vagy újabb kell). Frissítsd az iPhone-t / iPadet.'
+      : 'Ez a böngésző túl régi a nézéshez (WebCodecs kell). Frissítsd, vagy nyisd meg friss Chrome-ban, Edge-ben, Firefoxban vagy Safariban – vagy az asztali alkalmazásban.', {
+      spinner: false,
+      actions: [{ label: 'Vissza a főoldalra', onClick: goHome }],
+    });
+    return;
+  }
+  viewer.caps = { direct: true, ...(surroundSpeakers() ? { surround: true } : {}) };
+  viewer.signal = createSignal({
+    onMessage: onViewerMessage,
+    onOpen: joinRoom,
+    onClose: () => {
+      if (!viewer.closed && !hasPicture()) setOverlay('Megszakadt a kapcsolat a szerverrel, újracsatlakozás…');
+    },
+  });
+  viewer.statsTimer = setInterval(directStatsTick, 1000);
+  window.addEventListener('pagehide', () => viewer.signal?.send({ t: 'leave' }));
+}
+
+async function joinRoom() {
+  clearTimeout(viewer.retryTimer);
+  if (viewer.closed) return;
+  try {
+    const res = await viewer.signal.request({ t: 'join', code: viewer.code, caps: viewer.caps }, ['joined']);
+    viewer.id = res.id;
+    viewer.iceServers = res.iceServers || [];
+    viewer.live = Boolean(res.live);
+    viewer.hostPresent = Boolean(res.hostPresent);
+    if (!viewer.hostPresent) setOverlay('A megosztó épp nincs bent. Várakozás…');
+    else if (!viewer.live) setOverlay('A megosztás szünetel. Amint folytatódik, itt lesz a kép.');
+    else if (!hasPicture()) setOverlay('Csatlakozva. Kép betöltése…');
+    watchForOffer();
+  } catch (err) {
+    if (err.code === 'offline') return; // reconnect will call joinRoom again
+    const delay = err.code === 'rate' ? 30000 : 5000;
+    setOverlay(`${errorText(err)} Újrapróbálom…`, { actions: [{ label: 'Vissza a főoldalra', onClick: goHome }] });
+    viewer.retryTimer = setTimeout(joinRoom, delay);
+  }
+}
+
+// A sharer that sends nothing our way (an old iPhone app speaks only WebRTC): say so.
+function watchForOffer() {
+  clearTimeout(viewer.offerTimer);
+  if (!viewer.live || !viewer.hostPresent || viewer.direct) return;
+  viewer.offerTimer = setTimeout(() => {
+    if (viewer.direct || viewer.closed || !viewer.live || !viewer.hostPresent) return;
+    setOverlay('A megosztó nem küld képet ezen a módon – ha iPhone-ról oszt meg, frissítse a Screen Share alkalmazást. Várakozás…');
+  }, 15000);
+}
+
+function onViewerMessage(msg) {
+  switch (msg.t) {
+    case 'signal':
+      if (msg.from === 'host' && msg.data && typeof msg.data === 'object') onHostSignal(msg.data).catch((err) => console.warn('signal handling failed', err));
+      break;
+    case 'state':
+    case 'host-back':
+      viewer.live = Boolean(msg.live);
+      viewer.hostPresent = true;
+      if (!viewer.live) setOverlay('A megosztás szünetel. Amint folytatódik, itt lesz a kép.');
+      else if (hasPicture()) { hideOverlay(); setLive(true); }
+      else setOverlay('Kép betöltése…');
+      if (!viewer.live) setLive(false);
+      watchForOffer();
+      break;
+    case 'host-away':
+      viewer.hostPresent = false;
+      // the picture may still come; only cover it if it stopped
+      if (!hasPicture() || viewer.direct?.state !== 'connected') setOverlay('A megosztó kapcsolata megszakadt. Várakozás…');
+      break;
+    case 'direct':
+      onViewerDirectSession(msg);
+      break;
+    case 'count':
+      $('#viewerCountText').textContent = `${msg.n} néző`;
+      break;
+    case 'closed':
+      viewer.closed = true;
+      clearTimeout(viewer.retryTimer);
+      clearTimeout(viewer.offerTimer);
+      closeDirectView();
+      setLive(false);
+      setOverlay(msg.reason === 'timeout' ? 'A megosztó nem tért vissza, a szoba bezárult.' : 'A megosztó befejezte a megosztást. Köszi, hogy néztél!', {
+        spinner: false,
+        actions: [{ label: 'Vissza a főoldalra', onClick: goHome, primary: true }],
+      });
+      viewer.signal?.close();
+      break;
+    default: break;
+  }
+}
+
+function sendToHost(data) {
+  viewer.signal?.send({ t: 'signal', to: 'host', data: { ...data, session: viewer.session } });
+}
+
+async function onHostSignal(data) {
+  if (data.type === 'direct-offer') {
+    await onDirectOffer(data);
+  } else if (data.type === 'unsupported') {
+    clearTimeout(viewer.offerTimer);
+    setOverlay(data.why === 'server'
+      ? 'A szerver még nem ismeri a saját átvitelt – a szervert frissíteni kell (sudo bash deploy/install.sh).'
+      : 'Ez a böngésző nem tudja fogadni a képet. Nyisd meg friss Chrome-ban, Edge-ben, Firefoxban vagy Safariban, vagy az alkalmazásban.', { spinner: false });
+  } else if (data.type === 'stats') {
+    if (data.session === viewer.session) viewer.hostStats = data;
+  }
+}
+
+function setLive(on) {
+  const badge = $('#viewerLive');
+  badge.hidden = false;
+  badge.classList.toggle('off', !on);
+  badge.textContent = on ? 'ÉLŐ' : 'NINCS KÉP';
+}
+
+function setOverlay(text, { spinner = true, actions = [] } = {}) {
+  $('#overlay').hidden = false;
+  $('#spinner').hidden = !spinner;
+  $('#overlayText').textContent = text;
+  $('#overlayActions').replaceChildren(...actions.map((a) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = `btn ${a.primary ? 'btn-primary' : ''}`;
+    b.textContent = a.label;
+    b.addEventListener('click', a.onClick);
+    return b;
+  }));
+  showControls();
+}
+
+function hideOverlay() { $('#overlay').hidden = true; }
+function goHome() { location.href = location.pathname; }
+
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator && !viewer.wakeLock && document.visibilityState === 'visible') {
+      viewer.wakeLock = await navigator.wakeLock.request('screen');
+      viewer.wakeLock.addEventListener('release', () => { viewer.wakeLock = null; });
+    }
+  } catch { /* not allowed – fine */ }
+}
+
+function senderEncoderText(st) {
+  if (!st) return '–';
+  const name = st.hw === true ? st.encoder || 'hardveres' : st.hw === false ? 'szoftveres' : 'ismeretlen';
+  return `${name}${Number.isFinite(st.encodeMs) ? ` · ${nf1.format(st.encodeMs)} ms` : ''}`;
+}
+
+/* ---- sound level, full screen, statistics ---- */
+
+function syncMuteUi() {
+  $('#btnMute').classList.toggle('muted', viewer.muted || viewer.volume === 0);
+  $('#volume').value = String(viewer.muted ? 0 : viewer.volume);
+  syncDirectVolume();
+}
+
+function toggleMute() {
+  viewer.muted = !viewer.muted;
+  if (!viewer.muted && viewer.volume === 0) viewer.volume = 1;
+  $('#btnUnmute').hidden = true;
+  viewer.direct?.audio?.ctx.resume().catch(() => {});
+  syncMuteUi();
+}
+
+function toggleFullscreen() {
+  const player = $('#player');
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  } else if (player.requestFullscreen) {
+    player.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+  } else if (player.webkitRequestFullscreen) {
+    player.webkitRequestFullscreen();
+  } else {
+    player.classList.toggle('pseudo-full'); // an iPhone: the whole window
+  }
+}
+
+function toggleStats() {
+  const box = $('#stats');
+  box.hidden = !box.hidden;
+  $('#btnStats').setAttribute('aria-pressed', String(!box.hidden));
+  if (!box.hidden) directStatsTick();
+}
+
+function showControls() {
+  const player = $('#player');
+  player.classList.add('ui-visible');
+  player.classList.remove('idle');
+  clearTimeout(viewer.idleTimer);
+  viewer.idleTimer = setTimeout(() => {
+    if (!$('#overlay').hidden || !$('#btnUnmute').hidden) return;
+    player.classList.remove('ui-visible');
+    player.classList.add('idle');
+  }, 2500);
+}
+
+function initViewerUi() {
+  const player = $('#player');
+  canvas().addEventListener('dblclick', toggleFullscreen);
+  player.addEventListener('pointermove', showControls);
+  player.addEventListener('pointerdown', showControls);
+
+  const vol = $('#volume');
+  vol.value = String(viewer.volume);
+  vol.addEventListener('input', () => {
+    viewer.volume = Number(vol.value);
+    viewer.muted = viewer.volume === 0;
+    store.set('ss-volume', viewer.volume);
+    if (!viewer.muted) $('#btnUnmute').hidden = true;
+    viewer.direct?.audio?.ctx.resume().catch(() => {});
+    syncMuteUi();
+  });
+
+  $('#btnMute').addEventListener('click', toggleMute);
+  $('#btnFullscreen').addEventListener('click', toggleFullscreen);
+  $('#btnStats').addEventListener('click', toggleStats);
+  $('#btnUnmute').addEventListener('click', () => {
+    viewer.muted = false;
+    if (viewer.volume === 0) viewer.volume = 1;
+    $('#btnUnmute').hidden = true;
+    viewer.direct?.audio?.ctx.resume().catch(() => {});
+    syncMuteUi();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if ($('#view-viewer').hidden || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+    const k = e.key.toLowerCase();
+    if (k === 'f') toggleFullscreen();
+    else if (k === 'm') toggleMute();
+    else if (k === 's') toggleStats();
+    else if (k === 'escape' && player.classList.contains('pseudo-full')) player.classList.remove('pseudo-full');
+    else return;
+    e.preventDefault();
+  });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && hasPicture()) requestWakeLock(); });
+}
+
+/* ===================== DIRECT MODE: the viewer ===================== */
+// Every frame is decoded and drawn the moment it arrives, on a low-latency canvas; the sound plays
+// with a buffer that grows only when the network makes it run dry (direct-audio.js).
 
 function onViewerDirectSession(msg) {
   if (!DIRECT) return;
+  clearTimeout(viewer.offerTimer);
   closeDirectView();
   viewer.direct = {
     udp: msg.session,
@@ -2810,7 +1703,6 @@ async function onDirectOffer(data) {
     sendToHost({ type: 'direct-fail', why: 'unavailable' });
     return;
   }
-  closeViewerConnection();
   const res = await d.ready;
   if (viewer.direct !== d) return;
   if (!res || res.error) {
@@ -2822,16 +1714,7 @@ async function onDirectOffer(data) {
   d.state = 'connecting';
   DIRECT.connect('host', { pub: data.pub, cands: data.cands, tcp: data.tcp === true });
   sendToHost({ type: 'direct-answer', pub: res.pub, cands: res.cands, tcp: res.tcp === true });
-  $('#latency').hidden = true; // no buffer to choose: every frame is shown at once
-  if (!hasPicture()) setOverlay('Közvetlen kapcsolat…');
-}
-
-// An app viewer that gets WebRTC is told why, once (and in the statistics).
-function noteWhyWebrtc(why) {
-  viewer.whyWebrtc = WHY_TEXT[why] ? why : null;
-  if (!DIRECT || !viewer.whyWebrtc || viewer.whyWebrtc === 'viewer-browser' || viewer.whyToldFor === why) return;
-  viewer.whyToldFor = why;
-  toast(`Közvetlen mód helyett WebRTC: ${WHY_TEXT[why]}.`, 'warn', 9000);
+  if (!hasPicture()) setOverlay('Kapcsolódás a megosztóhoz…');
 }
 
 function closeDirectView() {
@@ -2843,9 +1726,6 @@ function closeDirectView() {
   d.latest = null;
   closeDirectAudio(d);
   DIRECT?.remove('host');
-  $('#directCanvas').hidden = true;
-  $('#latency').hidden = false;
-  video().hidden = false;
 }
 
 function onViewerDirectEvent(name, id, info) {
@@ -2861,7 +1741,7 @@ function onViewerDirectEvent(name, id, info) {
     } else if (info.state === 'lost' || info.state === 'closed') {
       closeDirectView();
       if (!viewer.closed) {
-        setOverlay('A közvetlen kapcsolat megszakadt. Újracsatlakozás…');
+        setOverlay('A kapcsolat megszakadt. Újracsatlakozás…');
         sendToHost({ type: 'recall' });
       }
     }
@@ -2926,14 +1806,14 @@ function drawDirectFrame(d, frame) {
     frame.close();
     return;
   }
-  const canvas = $('#directCanvas');
+  const el = canvas();
   const w = frame.displayWidth;
   const h = frame.displayHeight;
-  if (canvas.width !== w || canvas.height !== h) {
-    canvas.width = w;
-    canvas.height = h;
+  if (el.width !== w || el.height !== h) {
+    el.width = w;
+    el.height = h;
   }
-  d.ctx ||= canvas.getContext('2d', { desynchronized: true, alpha: false });
+  d.ctx ||= el.getContext('2d', { desynchronized: true, alpha: false });
   d.ctx.drawImage(frame, 0, 0, w, h);
   const capture = d.pending.get(frame.timestamp);
   d.pending.delete(frame.timestamp);
@@ -2945,8 +1825,7 @@ function drawDirectFrame(d, frame) {
   }
   if (!d.drawn) {
     d.drawn = true;
-    canvas.hidden = false;
-    video().hidden = true;
+    el.hidden = false;
     if (viewer.live) {
       hideOverlay();
       setLive(true);
@@ -2954,6 +1833,8 @@ function drawDirectFrame(d, frame) {
     requestWakeLock();
   }
 }
+
+/* ---- the viewer's sound: Opus from WebCodecs, or our decoder (WebAssembly) ---- */
 
 async function openDirectAudio(d, channels) {
   closeDirectAudio(d);
@@ -2965,7 +1846,8 @@ async function openDirectAudio(d, channels) {
     ctx.close().catch(() => {});
     return null;
   }
-  if (viewer.direct !== d) {
+  const wasm = canDirect.audio === 'wasm' ? await globalThis.ScreenShareWasm.load().catch(() => null) : null;
+  if (viewer.direct !== d || (canDirect.audio === 'wasm' && !wasm)) {
     ctx.close().catch(() => {});
     return null;
   }
@@ -2976,7 +1858,7 @@ async function openDirectAudio(d, channels) {
   const node = new AudioWorkletNode(ctx, 'direct-audio', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [out], processorOptions: { channels } });
   const gain = ctx.createGain();
   node.connect(gain).connect(ctx.destination);
-  d.audio = { ctx, node, gain, channels, out, decoders: [] };
+  d.audio = { ctx, node, gain, channels, out, decoders: [], wasm };
   syncDirectVolume();
   ctx.resume().catch(() => {});
   // a browser opened from a link (no click yet) keeps the sound off: one click turns it on
@@ -2996,12 +1878,54 @@ function closeDirectAudio(d) {
 
 function syncDirectVolume() {
   const a = viewer.direct?.audio;
-  if (!a) return;
-  const el = video();
-  a.gain.gain.value = el.muted ? 0 : el.volume;
+  if (a) a.gain.gain.value = viewer.muted ? 0 : viewer.volume;
+}
+
+/** A decoder for one channel pair: { decode(meta, data), close() } – planes to the player. */
+function pairDecoder(a, pair, channels) {
+  const send = (ts, planes) => a.node.port.postMessage({ pair, ts, frames: planes[0].length, planes }, planes.map((p) => p.buffer));
+  if (a.wasm) {
+    const dec = a.wasm.opusDecoder(channels);
+    return {
+      state: 'configured',
+      decode(meta, data) {
+        const pcm = dec.decode(data);
+        if (!pcm) return;
+        const frames = pcm.length / channels;
+        const planes = Array.from({ length: channels }, (_, c) => {
+          const plane = new Float32Array(frames);
+          for (let i = 0; i < frames; i++) plane[i] = pcm[i * channels + c];
+          return plane;
+        });
+        send(meta.ts, planes);
+      },
+      close() { dec.close(); this.state = 'closed'; },
+    };
+  }
+  const dec = new AudioDecoder({
+    output: (ad) => {
+      const planes = Array.from({ length: ad.numberOfChannels }, (_, c) => {
+        const plane = new Float32Array(ad.numberOfFrames);
+        ad.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+        return plane;
+      });
+      send(ad.timestamp, planes);
+      ad.close();
+    },
+    error: (err) => console.warn('direct audio decoder', err),
+  });
+  dec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: channels });
+  return {
+    get state() { return dec.state; },
+    decode(meta, data) {
+      if (dec.state === 'configured') dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: meta.ts, data }));
+    },
+    close() { dec.close(); },
+  };
 }
 
 async function playDirectAudio(d, meta, data) {
+  if (!canDirect.audio) return; // this browser has no way to play it
   const channels = Math.max(1, Math.min(8, meta.sub >> 4));
   const pair = meta.sub & 15;
   if (pair * 2 >= channels) return;
@@ -3018,24 +1942,10 @@ async function playDirectAudio(d, meta, data) {
   }
   let dec = a.decoders[pair];
   if (!dec || dec.state === 'closed') {
-    dec = new AudioDecoder({
-      output: (ad) => {
-        const frames = ad.numberOfFrames;
-        const planes = [];
-        for (let c = 0; c < ad.numberOfChannels; c++) {
-          const plane = new Float32Array(frames);
-          ad.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
-          planes.push(plane);
-        }
-        a.node.port.postMessage({ pair, ts: ad.timestamp, frames, planes }, planes.map((p) => p.buffer));
-        ad.close();
-      },
-      error: (err) => console.warn('direct audio decoder', err),
-    });
-    dec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: Math.min(2, channels - pair * 2) });
+    dec = pairDecoder(a, pair, Math.min(2, channels - pair * 2));
     a.decoders[pair] = dec;
   }
-  if (dec.state === 'configured') dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: meta.ts, data }));
+  dec.decode(meta, data);
 }
 
 function onDirectMedia(meta, data) {
@@ -3065,20 +1975,26 @@ function renderStatsRows(rows) {
 
 function directStatsTick() {
   const d = viewer.direct;
+  if (!d) {
+    $('#viewerInfo').textContent = '';
+    return;
+  }
   const now = performance.now();
   const fps = (d.frames * 1000) / Math.max(1, now - d.fpsAt);
   d.frames = 0;
   d.fpsAt = now;
   const lat = median(d.lat);
   const r = d.report;
-  const canvas = $('#directCanvas');
-  const res = d.drawn ? `${canvas.width}×${canvas.height}` : '–';
+  const el = canvas();
+  const res = d.drawn ? `${el.width}×${el.height}` : '–';
   if (viewer.tick++ % 2 === 0 && lat != null) sendToHost({ type: 'stats', lat: Math.round(lat), fps: Math.round(fps), loss: r?.loss ?? 0, measured: true });
-  $('#viewerInfo').textContent = d.drawn ? `${res} · ${Math.round(fps)} FPS${lat != null ? ` · ${Math.round(lat)} ms` : ''} · közvetlen` : '';
+  $('#viewerInfo').textContent = d.drawn ? `${res} · ${Math.round(fps)} FPS${lat != null ? ` · ${Math.round(lat)} ms` : ''}` : '';
   if ($('#stats').hidden) return;
   const a = d.audio;
+  const own = 'saját C++ kód (WebAssembly)';
   renderStatsRows([
-    ['Mód', `Közvetlen (WebRTC nélkül${DIRECT?.web ? ', böngészőben' : ''})`],
+    ['Átvitel', 'saját protokoll, végig titkosítva (WebRTC nélkül)'],
+    ['Kulcscsere', `X25519 · ${canDirect.keys === 'wasm' ? own : 'WebCrypto'}`],
     ['Felbontás', res],
     ['FPS', d.drawn ? String(Math.round(fps)) : '–'],
     ['Bitráta', fmtKbps(r?.kbps ?? null)],
@@ -3086,64 +2002,21 @@ function directStatsTick() {
     ['Küldő kódolója', senderEncoderText(viewer.hostStats), viewer.hostStats?.hw === false],
     ['Késés (mért)', lat != null ? `${Math.round(lat)} ms` : '–', lat > 100],
     ['RTT', fmtMs(d.rtt)],
-    ['Csomagvesztés', `${nf1.format(r?.loss ?? 0)} %`, (r?.loss ?? 0) > 2],
     ['Kihagyott képek', String(r?.skips ?? 0), (r?.skips ?? 0) > 0],
     ['Kapcsolat', PATH_LABEL[d.path] || '–'],
-    ['Hang', a ? `Opus · ${a.channels > 2 ? `${surroundName(a.channels)} → ${a.out} hangszóró` : 'sztereó'}` : 'nincs'],
+    ['Hang', !canDirect.audio ? 'ez a böngésző nem tudja lejátszani' : a ? `Opus · ${a.wasm ? own : 'WebCodecs'} · ${a.channels > 2 ? `${a.channels} csatorna → ${a.out} hangszóró` : 'sztereó'}` : 'nincs', !canDirect.audio],
   ]);
 }
 
-/* ---- the desktop app: version, server, updates ---- */
-
-let lastUpdate = null;
-
-function initAppChrome() {
-  if (!APP) return;
-  let serverHost = '';
-  try { serverHost = new URL(SERVER_ORIGIN).host; } catch { /* keep empty */ }
-  $('#appInfo').textContent = `v${APP.version || '?'}${serverHost ? ` · ${serverHost}` : ''}`;
-  if (!APP.updates) return;
-  APP.updates.onState(renderUpdate);
-  APP.updates.getState().then((s) => { if (s) renderUpdate(s); }).catch(() => {});
-  $('#btnUpdate').addEventListener('click', () => {
-    if (lastUpdate?.status === 'ready' && isLive() && host.viewers.size
-      && !confirm('A frissítéshez az alkalmazás újraindul, a megosztás leáll. Folytatod?')) return;
-    if (lastUpdate?.status === 'ready') window.removeEventListener('beforeunload', confirmLeave);
-    APP.updates.install();
-  });
-}
-
-function renderUpdate(s) {
-  lastUpdate = s;
-  const bar = $('#updateBar');
-  const btn = $('#btnUpdate');
-  bar.hidden = !['downloading', 'ready', 'available'].includes(s.status);
-  bar.classList.toggle('ready', s.status !== 'downloading');
-  if (s.status === 'downloading') {
-    $('#updateText').textContent = `Új verzió (${s.version}) letöltése… ${s.progress ?? 0}%`;
-    btn.hidden = true;
-  } else if (s.status === 'ready') {
-    $('#updateText').textContent = `Új verzió kész: ${s.version}`;
-    btn.textContent = 'Újraindítás és frissítés';
-    btn.hidden = false;
-  } else if (s.status === 'available') {
-    $('#updateText').textContent = `Új verzió: ${s.version}`;
-    btn.textContent = 'Letöltés';
-    btn.hidden = false;
-  }
-}
+/* ============================== boot ============================== */
 
 function init() {
   if (IS_IOS) document.documentElement.classList.add('is-ios'); // no volume control: iOS keeps media at full volume
-  initAppChrome();
-  DIRECT?.onEvent(onDirectEvent);
-  DIRECT?.onMedia(onDirectMedia);
-  NATIVE?.onEvent(onNativeEvent);
-  if (!DIRECT && window.ScreenShareWebDirect && !IS_IOS) {
-    // a browser: the same direct mode, through the server's WebSocket
-    directReady = window.ScreenShareWebDirect.supported().then((ok) => {
-      if (!ok) return;
-      DIRECT = window.ScreenShareWebDirect.create({ tcpUrl: `${SERVER_ORIGIN.replace(/^http/, 'ws')}/direct` });
+  if (window.ScreenShareWebDirect) {
+    directReady = window.ScreenShareWebDirect.supported().then((s) => {
+      canDirect = s;
+      if (!s.ok) return;
+      DIRECT = window.ScreenShareWebDirect.create({ tcpUrl: `${location.origin.replace(/^http/, 'ws')}/direct` });
       DIRECT.onEvent(onDirectEvent);
       DIRECT.onMedia(onDirectMedia);
     }).catch(() => {});

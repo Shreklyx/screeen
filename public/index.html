@@ -15,6 +15,7 @@
   <meta name="apple-mobile-web-app-title" content="Screen Share">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff4d5e'/%3E%3Cpath d='M8 10.5h16v10H8zM13 24h6' fill='none' stroke='white' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
+  <script src="ss-web.js" defer></script>
   <script src="direct-web.js" defer></script>
   <script src="app.js" defer></script>
 </head>
@@ -24,14 +25,7 @@
       <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M8 10.5h16v10H8zM13 24h6" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span>Screen Share</span>
     </a>
-    <span class="topbar-note web-only"><span class="dot" aria-hidden="true"></span>Közvetlen P2P · titkosított kapcsolat</span>
-    <div class="topbar-app app-only">
-      <div id="updateBar" class="update-bar" role="status" hidden>
-        <span id="updateText"></span>
-        <button id="btnUpdate" class="btn btn-primary btn-sm" type="button" hidden>Frissítés</button>
-      </div>
-      <span id="appInfo" class="topbar-note"></span>
-    </div>
+    <span class="topbar-note"><span class="dot" aria-hidden="true"></span>Saját átvitel · végig titkosítva</span>
   </header>
 
   <main>
@@ -40,11 +34,6 @@
       <div class="hero">
         <h1>Képernyőmegosztás <em>4K&#8209;ban</em>, hanggal, késés nélkül.</h1>
         <p class="lead">Nincs regisztráció, nincs telepítés. A kép és a hang a saját, puffer nélküli átvitelünkkel megy, végig titkosítva. Nézni bárki tud a linkkel, megosztani a jelszóval lehet.</p>
-      </div>
-
-      <div class="app-hero app-only">
-        <h1>Mit szeretnél?</h1>
-        <p>A kép WebRTC nélkül, puffer nélkül megy – ha a túloldalon is ez az alkalmazás fut, közvetlenül, a legkisebb késéssel.</p>
       </div>
 
       <div class="cards">
@@ -61,7 +50,7 @@
             <p id="shareError" class="hint error" role="alert" hidden></p>
           </form>
           <p id="macHint" class="hint" hidden>Mac: első megosztáskor engedélyezd a böngészőnek a képernyőfelvételt (Rendszerbeállítások → Adatvédelem és biztonság → Képernyőfelvétel), majd indítsd újra a böngészőt.</p>
-          <p id="shareUnsupported" class="hint warn" hidden>Ez a böngésző nem tud képernyőt megosztani. Számítógépen használj Chrome-ot vagy Edge-et.</p>
+          <p id="shareUnsupported" class="hint warn" hidden>Ez a böngésző nem tud képernyőt megosztani. Számítógépen használj friss Chrome-ot, Edge-et, Firefoxot vagy Safarit.</p>
         </article>
 
         <article class="card">
@@ -80,7 +69,7 @@
       <ul class="features">
         <li><strong>4K · 60 FPS</strong><span>Akár 250 Mbit/s, a gépedhez igazítva</span></li>
         <li><strong>Rendszerhang</strong><span>Sztereó, 510 kbit/s Opus</span></li>
-        <li><strong>Minimális késés</strong><span>Közvetlen kapcsolat, saját relé szerver</span></li>
+        <li><strong>Minimális késés</strong><span>Saját átvitel, WebRTC nélkül, puffer nélkül</span></li>
         <li><strong>Hardveres kódolás</strong><span>NVIDIA NVENC, Apple, Intel, AMD</span></li>
       </ul>
 
@@ -99,7 +88,7 @@
         <div>
           <h2 id="ios-title">iPhone / iPad alkalmazás</h2>
           <p class="hint"><b>Nézéshez</b> elég a főképernyő: Safariban koppints a <b>Megosztás</b> gombra (négyzet felfelé nyíllal), majd a <b>Főképernyőhöz adás</b>-ra.</p>
-          <p class="hint"><b>A képernyőd megosztásához</b> a Screen Share iOS alkalmazás kell (az Apple böngészőből nem enged). Telepítés Windowsról vagy Macről a <b>Sideloadly</b>-vel, a saját Apple ID-ddal: töltsd le az IPA-t, csatlakoztasd a telefont, húzd be a Sideloadly-be.</p>
+          <p class="hint"><b>A képernyőd megosztásához</b> a Screen Share iOS alkalmazás kell (az Apple böngészőből nem enged). Telepítés Windowsról vagy Macről a <b>Sideloadly</b>-vel, a saját Apple ID-ddal: töltsd le az IPA-t, csatlakoztasd a telefont, húzd be a Sideloadly-be. (Az iPhone-alkalmazás még a régi, WebRTC-s átvitellel küld – amíg át nem áll a sajátunkra, a nézők nem kapnak tőle képet.)</p>
         </div>
         <div class="dl-buttons">
           <a id="dlIos" class="btn btn-lg" href="https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-iOS.ipa">iOS alkalmazás (IPA)</a>
@@ -113,8 +102,8 @@
           <li>A felugró ablakban válaszd a <b>Teljes képernyő</b> lehetőséget, és pipáld be a <b>Rendszerhang megosztása</b> négyzetet.</li>
           <li>Csak egy böngészőfül hangja kell (pl. egy film)? Válaszd a <b>Chrome-lap</b> fület, és kapcsold be a <b>lap hangjának megosztását</b>.</li>
           <li><b>Mac:</b> a teljes rendszerhanghoz használd a Mac alkalmazást (fent, macOS 13 vagy újabb) – semmit nem kell mellé telepíteni. Böngészőből egy Chrome-lap hangja megosztható; a Safari nem tud hangot megosztani.</li>
-          <li><b>A legkisebb késés:</b> a kép WebRTC nélkül, a saját átvitelünkkel megy, puffer nélkül, végig titkosítva – két alkalmazás között közvetlenül (UDP), böngészőben a szerveren át (Chrome, Edge, friss Firefox / Safari). A leggyorsabb: mindkét oldalon az asztali alkalmazás. A néző statisztikájában (S) a mért késés látszik.</li>
-          <li><b>5.1 / 7.1 térhang:</b> ha a gépeden 5.1 vagy 7.1 hangszóró (vagy 7.1-es fejhallgató) van beállítva, a Windows alkalmazás minden csatornát átküld. A térhangos hangszórójú nézők Chrome-ban, Edge-ben vagy az alkalmazásban térhangot kapnak, a többiek sztereó keveréket.</li>
+          <li><b>A legkisebb késés:</b> a kép sehol nem WebRTC-vel, hanem a saját átvitelünkkel megy, puffer nélkül, végig titkosítva – két alkalmazás között közvetlenül (UDP), böngészőben a szerveren át (Chrome, Edge, Firefox, Safari; ami egy böngészőből hiányzik, azt a saját C++ kódunk adja WebAssemblyként). A leggyorsabb: mindkét oldalon az asztali alkalmazás. A néző statisztikájában (S) a mért késés látszik.</li>
+          <li><b>5.1 / 7.1 térhang:</b> ha a gépeden 5.1 vagy 7.1 hangszóró (vagy 7.1-es fejhallgató) van beállítva, a Windows alkalmazás minden csatornát átküld. A térhangos hangszórójú nézők térhangot kapnak, a többiek sztereó keveréket.</li>
         </ol>
         <p class="hint">Ha egyetlen ablak megosztásakor nincs hang, oszd meg inkább a teljes képernyőt. A nézők bármilyen böngészőben nézhetik, telefonon is.</p>
       </section>
@@ -172,9 +161,8 @@
 
         <section class="box">
           <h3>Kódolás</h3>
-          <p id="gpuName" class="enc-gpu"></p>
-          <p id="encoderStatus" class="hint">Az első néző csatlakozásakor kiderül, hogy a videókártya kódol-e.</p>
-          <p id="latencyTip" class="hint" hidden>Tipp a legkisebb késéshez: oszd meg az asztali alkalmazásból. Böngészőből a kép csak a szerveren át mehet (ahol a böngésző nem tudja a saját átvitelünket, ott WebRTC-vel, pufferrel), az alkalmazásból az alkalmazásos nézőkhöz közvetlenül, NVIDIA kártyán natív kódolással.</p>
+          <p id="encoderStatus" class="hint">Az első néző csatlakozásakor indul a kódolás (H.264).</p>
+          <p class="hint">Tipp a legkisebb késéshez: oszd meg az asztali alkalmazásból – onnan az alkalmazásos nézőkhöz közvetlenül megy a kép, böngészőből a szerveren át.</p>
         </section>
 
         <section class="box">
@@ -224,17 +212,6 @@
               <option value="balanced">Kiegyensúlyozott</option>
             </select>
           </div>
-          <div class="field">
-            <label for="setCodec">Kodek</label>
-            <select id="setCodec">
-              <option value="auto">Automatikus – hardveres (legjobb)</option>
-              <option value="AV1">AV1</option>
-              <option value="H265">H.265</option>
-              <option value="VP9">VP9</option>
-              <option value="H264">H.264</option>
-              <option value="VP8">VP8</option>
-            </select>
-          </div>
           <label class="check"><input id="setAudio" type="checkbox"> Hang megosztása (rendszerhang / lap hangja)</label>
           <p class="hint">A változások azonnal élnek. A hang ki-/bekapcsolása a következő forrásválasztáskor érvényes.</p>
         </section>
@@ -250,7 +227,6 @@
     <!-- ============ VIEWER ============ -->
     <section id="view-viewer" data-view class="viewer" hidden>
       <div id="player" class="player ui-visible">
-        <video id="remoteVideo" autoplay playsinline></video>
         <canvas id="directCanvas" hidden></canvas>
 
         <div id="overlay" class="overlay">
@@ -277,11 +253,6 @@
             <svg class="ico-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg>
           </button>
           <input id="volume" class="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Hangerő">
-          <select id="latency" class="latency" aria-label="Késleltetés" title="Késleltetés / puffer">
-            <option value="0">Minimális késés</option>
-            <option value="150">Simább (+150 ms)</option>
-            <option value="400">Stabil (+400 ms)</option>
-          </select>
           <button id="btnStats" class="icon-btn" type="button" aria-label="Statisztika (S)" title="Statisztika (S)">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V11M10 19V5M15 19v-6M20 19V8"/></svg>
           </button>

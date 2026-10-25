@@ -4,46 +4,31 @@ Saját szerveren futó képernyőmegosztó oldal: **4K / 60 FPS**, **rendszerhan
 **5.1 / 7.1 térhang** is), minimális késleltetés.
 Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel bárki tud – regisztráció és telepítés nélkül, telefonon is.
 
-- **Saját átvitel, WebRTC nélkül** (*közvetlen mód*, lásd lent) – puffer nélkül, végponttól végpontig titkosítva
-  (X25519 + AES-GCM): két asztali alkalmazás között közvetlenül, UDP-n; böngészőben a szerver WebSocketjén át.
-  Ahol a böngésző ezt nem tudja (régebbi böngésző, iPhone), **WebRTC** megy (DTLS-SRTP, közvetlenül vagy **TURN
-  relével**, ha a két gép nem éri el egymást).
-- **Alapból a legjobb beállítás, a gép alapján (Automatikus):** ha a videókártya kódol, **4K · 60 FPS · max. 150 Mbit/s**
-  (4K-ra korlátozva, így egy 5K-s Retina kijelző sem terheli feleslegesen a gépet). Ha a processzor kódol, a szálak
-  száma szerint annyit, amennyit késés nélkül bír (pl. 12+ szál: 1440p60, 8 szál: 1080p60, kevesebb: 1080p30), és
-  több néző esetén egy fokozattal lejjebb. Nézőnként külön dönt: aki a processzorra szorul (pl. a GeForce kb. 8-as
-  korlátja fölött), csak az kap könnyebb beállítást. A tényleges sebességhez a WebRTC folyamatosan igazodik.
-  Kézzel minden felülírható (felbontás, FPS, 6–250 Mbit/s; 150 Mbit/s fölött helyi hálózat vagy gigabites net kell). A WebRTC alapértelmezett 2,5 Mbit/s-os plafonja fel van
-  oldva, és a kapcsolat rögtön magas bitrátáról indul.
-- **Hardveres kódolás a videókártyán**: NVIDIA NVENC, Apple VideoToolbox (Mac), Intel Quick Sync, AMD VCN. Automatikusan
-  azt a kodeket választja (AV1 / H.265 / VP9 / H.264 / VP8), amelyiket a videókártya kódol – megosztás közben
-  **ellenőrzi**, hogy tényleg a videókártya kódol-e, ha nem, kodeket vált, és a gépre megjegyzi az eredményt.
-  A megosztó panelen látszik: *Videókártya: NVIDIA GeForce …* · *Hardveres kódolás: NVIDIA NVENC · H.264 · 3 ms/kép*.
-- **Rendszerhang**: Opus, sztereó, 510 kbit/s, 10 ms-os csomagok, zajszűrés / visszhangszűrés / hangerő-szabályzás
-  nélkül (filmhez, zenéhez).
+- **Saját átvitel, sehol nincs WebRTC** (*közvetlen mód*, lásd lent) – puffer nélkül, végponttól végpontig titkosítva
+  (X25519 + AES-GCM, a szerver sem látja a képet): két asztali alkalmazás között közvetlenül, UDP-n; böngészőben
+  (WebCodecs H.264 + Opus) a szerver WebSocketjén át. Ahol a böngészőből hiányzik az X25519 kulcscsere vagy az
+  Opus-dekódoló (régebbi Safari / Firefox), az alkalmazások saját C/C++ kódja (BearSSL, libopus) fut az oldalon
+  WebAssemblyként (`native/web`).
+- **Alapból a legjobb beállítás, a gép alapján (Automatikus):** ha a videókártya kódol, **4K · 60 FPS**, ha a
+  processzor, 1080p 30 – és ha a kódoló mégsem bírja a tempót, magától kisebb felbontásra vált. A bitrátát a nézők
+  jelentései szabályozzák (csomagvesztés, kihagyott kép, növekvő RTT → kevesebb; ha minden rendben, lassan több).
+  Kézzel minden felülírható (felbontás, FPS, bitráta, tartalomtípus).
+- **Hardveres kódolás a videókártyán** (H.264): az alkalmazásban NVIDIA NVENC, Intel / AMD (Media Foundation), Apple
+  VideoToolbox; böngészőben a WebCodecs a videókártyán kódol, ha tud. A megosztó **egyszer** kódol minden nézőnek.
+  A megosztó panelen látszik: *Hardveres kódolás (videókártya) · H.264 · 3840×2160 · 3 ms/kép*.
+- **Rendszerhang**: Opus, 2,5 ms-os csomagokban (az Opus legkisebb késése), zajszűrés / visszhangszűrés /
+  hangerő-szabályzás nélkül (filmhez, zenéhez).
 - **5.1 / 7.1 térhang** (Windows alkalmazás): ha a megosztó gépen 5.1/7.1 hangszóró vagy 7.1-es fejhallgató van
-  beállítva, az alkalmazás mind a 8 csatornát átküldi (többcsatornás Opus, kb. 510 kbit/s). A térhangos
-  hangszórójú nézők Chrome-ban, Edge-ben vagy az alkalmazásban **térhangot** kapnak, a többiek (sztereó gép, Firefox,
-  Safari, telefon) helyesen lekevert sztereót – a középső (párbeszéd) csatornával együtt. Böngészőből megosztva csak
-  sztereó megy (a böngészők a rendszerhangot sztereóban adják).
-- **Alacsony késleltetés**: hardveres kódolás, minimális jitter puffer a nézőnél (rossz hálózaton „Simább” / „Stabil”
-  módra állítható), mozgásra hangolt kódolás filmhez/játékhoz. „Minimális késés” módban a néző minden képkockát
-  azonnal megjelenít, amint dekódolta: az alkalmazásból megosztva a kép „nulla lejátszási késleltetéssel” megy
-  (RTP playout-delay), és a kép nem vár a hang (hosszabb) pufferére – a tesztben kb. 48 → 36 ms képtől képig.
-  Az alkalmazás (asztali és iOS) egy képkockát a célbitráta 3-szorosával küld ki (a WebRTC alapból 1,1-szeresével,
-  ami 4K-ban egy képkockát majdnem a teljes képkocka-időre szétteríti), és a küldési sor legfeljebb 200 ms lehet –
-  nagy bitrátán a küldő oldali várakozás a tesztben ~50 → ~5 ms. 120/144 Hz-es monitorhoz kézzel **120 FPS** is
-  választható (kétszer gyakoribb képkocka, de a kódolót is kétszer annyira terheli). Böngészőből megosztva ezek
-  nem állíthatók: mozgalmas, nagy bitrátájú képnél a néző Chrome-ja a tesztben ~190 ms jitter puffert tartott
-  (képtől képig ~240 ms), az alkalmazásból megosztva ~4 ms-ot (~50 ms) – ezért a böngészős megosztó erre tippet kap.
-  (A néző oldaláról ez nem kerülhető meg: a Chrome a fogadott képkockák időbélyegét nem engedi átírni.)
-  0 ms nem lehetséges: a képet rögzíteni, kódolni, átküldeni, dekódolni és a monitornak kirajzolni is idő
-  (60 Hz-en egy képkocka 16,7 ms). A késést méri is: a néző statisztikájában és a megosztó
-  nézőlistájában nézőnként látszik (kódolás + hálózat + fogadástól a megjelenésig).
-- **Közvetlen mód – alkalmazás → alkalmazás, WebRTC nélkül** (a legkisebb késés): ha a megosztó és a néző is az
-  asztali alkalmazást használja, a kép nem WebRTC-n megy, hanem az alkalmazás saját UDP-átvitelén (lásd lent).
-  A tesztgépen (videókártya nélkül, szoftveres kódolással) képtől képig: közvetlen mód **~21–23 ms** (p90 ~30 ms),
-  ugyanott WebRTC ~35 ms (p90 ~43 ms). A böngészős nézők közben ugyanúgy WebRTC-n néznek.
+  beállítva, az alkalmazás mind a 8 csatornát átküldi. A térhangos hangszórójú nézők Chrome-ban, Edge-ben vagy az
+  alkalmazásban **térhangot** kapnak, a többiek helyesen lekevert sztereót – a középső (párbeszéd) csatornával együtt.
+  Böngészőből megosztva csak sztereó megy (a böngészők a rendszerhangot sztereóban adják).
+- **Alacsony késleltetés**: a néző **puffer nélkül** dolgozik – minden képkockát azonnal dekódol és egy alacsony
+  késleltetésű vásznon kirajzol; ha a gép nem bírja a tempót, mindig csak a legfrissebb kép kerül ki. A megosztó, ha
+  a kódoló épp dolgozik, a következő képkockát kihagyja ahelyett, hogy sorba állna (a sor csak késés). A tesztgépen
+  (videókártya nélkül, szoftveres kódolással) képtől képig: alkalmazás → alkalmazás **~21–23 ms**, böngésző →
+  böngésző **~23–30 ms** (medián). 0 ms nem lehetséges: a képet rögzíteni, kódolni, átküldeni, dekódolni és a
+  monitornak kirajzolni is idő (60 Hz-en egy képkocka 16,7 ms). A késést méri is: a néző statisztikájában és a
+  megosztó nézőlistájában nézőnként látszik.
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).
 - Ha a megosztó újratölti az oldalt vagy megszakad a nete, a szoba (és a link) 2 percig megmarad, a nézők maguktól
@@ -97,10 +82,11 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
 
 ## Használat
 
-1. Nyisd meg az oldalt **Chrome**-ban vagy **Edge**-ben, írd be a megosztási jelszót, és kattints a
+1. Nyisd meg az oldalt **Chrome**-ban, **Edge**-ben, **Firefoxban** vagy **Safariban** (számítógépen), írd be a megosztási jelszót, és kattints a
    **Képernyő megosztása** gombra.
 2. Válaszd ki, mit osztasz meg, majd küldd el a kapott linket (vagy a 6 karakteres kódot) a nézőknek.
-3. A nézők megnyitják a linket bármilyen modern böngészőben (telefonon is).
+3. A nézők megnyitják a linket bármilyen friss böngészőben (telefonon is). Ami nagyon régi (WebCodecs nélküli)
+   böngésző, az üzenetet kap, hogy frissítsen vagy használja az alkalmazást.
 
 ### Hang Windows 10 / 11 alatt
 
@@ -129,7 +115,9 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
 
 ### Screen Share iOS alkalmazás (iPhone / iPad képernyő megosztása)
 
-Az `ios/` mappában van (SwiftUI + ReplayKit közvetítés-kiegészítő + WebRTC). Két füle van:
+Az `ios/` mappában van (SwiftUI + ReplayKit közvetítés-kiegészítő + WebRTC). **Még WebRTC-vel küld, amit az oldal
+már nem fogad** – amíg nem kapja meg a saját átvitelt, az iPhone-ról megosztott képet nem lehet nézni (a *Nézés*
+füle működik). Két füle van:
 **Megosztás** (szerver, jelszó, „Képernyő megosztása”, a szobakód és a link küldése) és **Nézés** (az oldal).
 Megosztáskor a telefon képernyője (H.264 hardveres kódolás, max. 1080p 60 FPS) és **az alkalmazások hangja**
 (pl. YouTube, játék – a mikrofon nem) megy, akkor is, ha közben más alkalmazásra váltasz.
@@ -174,12 +162,12 @@ Fordítás: a GitHub Actions (`.github/workflows/ios.yml`) macOS gépen építi 
 - Chrome / Edge: legyen bekapcsolva a *Beállítások → Rendszer → Grafikus gyorsítás használata, ha rendelkezésre áll*,
   és legyen friss a videókártya illesztőprogramja – a **Kódolás** dobozban látszik, hogy a videókártya kódol-e.
   Szoftveres kódolásnál a késés a többszöröse is lehet.
-- NVIDIA: a GeForce kártyák egyszerre kb. 8 hardveres kódolást bírnak (nézőnként egyet); afölött a processzor kódol.
 - Filmhez / játékhoz a **Tartalom: Film / játék** mód kell, szöveghez / kódhoz a **Szöveg / prezentáció**.
-- Minden néző külön kódolt adatfolyamot kap, ezért sok nézőnél (4–5 felett) érdemes 1080p-re vagy kisebb bitrátára váltani.
-- A néző statisztikájában (**S** billentyű) a **Kapcsolat: TURN relé** azt jelenti, hogy a kép a szerveren keresztül
-  megy – ilyenkor a szerver sávszélessége is számít.
-- Hibakereséshez: a link elé írt `?relay=1` (pl. `https://mozizas.hu/?relay=1#kod`) mindenképp a TURN relén át küldi a képet.
+- A megosztó egyszer kódol minden nézőnek. A böngészős nézők képe a szerveren át megy (böngészőből nem lehet UDP-t
+  küldeni), ezért sok böngészős nézőnél a szerver feltöltési sávszélessége a korlát – az alkalmazások közvetlenül is
+  tudnak egymásnak küldeni.
+- A néző statisztikájában (**S** billentyű) a **Kapcsolat** sor mutatja, merre megy a kép (helyi hálózat /
+  interneten át / a szerveren át).
 
 ## Asztali alkalmazás (Windows, Mac)
 
@@ -238,15 +226,19 @@ lehető legrövidebb úton:
 
 A néző statisztikájában (**S**) a *Mód* sorban: *Közvetlen*, a *Késés (mért)* a valódi, végponttól végpontig mért
 késés (a megosztó gépen a rögzítéstől a néző vásznára rajzolásig, a két gép órájának eltérésével korrigálva).
-**Böngészőben is** (Chrome, Edge, friss Firefox / Safari – ahol van WebCodecs H.264 és WebCrypto X25519;
-`public/direct-web.js`): ugyanez a protokoll és ugyanaz a végponttól végpontig titkosítás, de mivel böngészőből nem
-lehet UDP-t küldeni, a csomagok WebSocketben, a szerver HTTPS-portján (`wss://…/direct`) mennek, és a szerver adja
-tovább őket (a képet nem látja). Ezen az úton egy képkocka egy csomag (a TCP nem veszít el semmit, nincs újrakérés);
-ha a néző vonala nem bírja, a megosztó eldobja a képkockákat a következő kulcskockáig ahelyett, hogy sorba állítaná
-őket (a sor csak késés), és a bitráta lejjebb megy. A néző itt is puffer nélkül, minden képet azonnal kirajzol. Így
-mehet alkalmazás → böngésző, böngésző → böngésző és böngésző → alkalmazás (böngészőből megosztani Chrome / Edge
-kell). Ahol a böngésző ezt nem tudja (régebbi böngésző, iPhone), WebRTC megy; a megosztó nézőlistájában látszik,
-ki melyiket kapja és miért. A böngészős nézők képe a szerver sávszélességét használja.
+**Böngészőben is** (Chrome, Edge, Firefox, Safari – ahol van WebCodecs H.264; `public/direct-web.js`): ugyanez a
+protokoll és ugyanaz a végponttól végpontig titkosítás, de mivel böngészőből nem lehet UDP-t küldeni, a csomagok
+WebSocketben, a szerver HTTPS-portján (`wss://…/direct`) mennek, és a szerver adja tovább őket (a képet nem látja).
+Ezen az úton egy képkocka egy csomag (a TCP nem veszít el semmit, nincs újrakérés); ha a néző vonala nem bírja, a
+megosztó eldobja a képkockákat a következő kulcskockáig ahelyett, hogy sorba állítaná őket, és a bitráta lejjebb
+megy. A néző itt is puffer nélkül, minden képet azonnal kirajzol. Így megy alkalmazás → böngésző, böngésző →
+böngésző és böngésző → alkalmazás. A kulcscsere a böngésző WebCrypto X25519-e, ha van, különben az alkalmazások
+BearSSL-kódja WebAssemblyként; a hang a böngésző Opus-dekódolója (WebCodecs), ha van, különben a libopus
+WebAssemblyként (`public/ss-web.wasm`, forrás: `native/web`). A megosztó a képet és a hangot a
+`MediaStreamTrackProcessor`-ral olvassa (Chrome, Edge), ahol ez nincs (Firefox, Safari), egy videóelemből
+(`requestVideoFrameCallback`) és egy AudioWorkletből. **WebRTC sehol nincs** az oldalon; ahol a böngésző ezt sem
+tudja (nagyon régi, WebCodecs nélküli böngésző), a néző üzenetet kap, és a megosztó nézőlistájában is látszik, miért
+nem kap képet.
 
 Windowson az első közvetlen kapcsolatnál a Windows tűzfal rákérdezhet a Screen Share-re: engedélyezd (enélkül is
 működik, de a helyi hálózaton a közvetlen út biztosabb). A szerveren a telepítő megnyitja a **3479/udp** portot; ha a
@@ -266,9 +258,6 @@ Képernyő- és rendszerhangfelvétel* → kapcsold be a Screen Share-t a rendsz
 5.1 – ha ez sztereó, sztereó megy. A megosztó panel **Hang** dobozában látszik: *Hang megosztva: 7.1 térhang*, a
 nézőlistában pedig, ki kapja térhangban. A néző statisztikájában (**S**) a *Hang* sorban: *7.1 térhang*.
 
-**Szerver címe:** *Fájl → Szerver címe…* (alap: `https://mozizas.hu`). Az alkalmazás a szerverhez a saját,
-beépített oldaláról kapcsolódik (`app://screenshare`) – ehhez a szerveren is az új verzió kell
-(`sudo bash deploy/install.sh`).
 
 A `native/` mappában van. A GitHub Actions (`.github/workflows/native.yml`) minden változásnál lefordítja (Windows:
 MSVC, Mac: arm64 + x86_64 egy alkalmazásba fűzve), és a CI gépeken valódi megosztással és nézéssel teszteli (az
@@ -288,26 +277,30 @@ A `build/ss-cli` parancssoros megosztó / néző (teszteléshez: `ss-cli host --
 ```bash
 npm install
 HOST_PASSWORD=titok123 npm start     # http://localhost:8080
-npm test                              # szerver, közvetlen mód (UDP-átvitel, relé, hang) tesztek
+npm test                              # szerver, közvetlen mód (UDP-átvitel, relé, hang), WebAssembly tesztek
+native/web/build.sh                   # public/ss-web.wasm újraépítése (clang, lld, wasi-libc kell)
 ```
 
-A képernyőmegosztás csak HTTPS-en vagy `localhost`-on működik. TURN relé nélkül (üres `TURN_SECRET`) csak STUN-nal fut.
+A képernyőmegosztás csak HTTPS-en vagy `localhost`-on működik. TURN nélkül (üres `TURN_SECRET`) az alkalmazások a
+szerver 3479/udp reléjét vagy a WebSocketet használják. A `ss-web.wasm` reprodukálható: a CI újraépíti a forrásból,
+és ellenőrzi, hogy bájtra egyezik a feltöltöttel.
 
 ## Hogyan működik
 
 - `server/server.js` – Node.js szerver (egyetlen függőség: `ws`): kiszolgálja az oldalt biztonsági fejlécekkel (CSP stb.),
-  a `/ws` WebSocketen szobákat kezel és továbbítja a kapcsolatfelépítő üzeneteket (SDP, ICE) a megosztó és a nézők között,
-  és 24 órás TURN jelszavakat ad (TURN REST API). Jelszó- és csatlakozási próbálkozások IP-nként korlátozva.
-- `public/` – a böngészős oldal. A megosztó nézőnként egy `RTCPeerConnection`-t tart, csak küldő (sendonly) sávokkal;
-  a minőséget `RTCRtpSender.setParameters()` (bitráta, FPS, felbontás-skálázás, degradáció, prioritás),
-  `setCodecPreferences()` és az SDP hangolása (Opus sztereó/510k, kezdő bitráta) állítja. Forrásváltáskor
-  `replaceTrack()`, kodekváltáskor újratárgyalás ugyanazon a kapcsolaton, megszakadáskor ICE restart.
+  a `/ws` WebSocketen szobákat kezel és továbbítja a kapcsolatfelépítő üzeneteket (a közvetlen mód ajánlatai) a
+  megosztó és a nézők között, a `/direct` WebSocketen a böngészők (titkosított) csomagjait adja tovább, és az
+  alkalmazásoknak 24 órás TURN jelszavakat ad (TURN REST API). Jelszó- és csatlakozási próbálkozások IP-nként korlátozva.
+- `public/` – a böngészős oldal, WebRTC nélkül: a megosztó a képernyőt `getDisplayMedia()`-val rögzíti, WebCodecs-szel
+  egyszer kódolja (H.264 + Opus), és a közvetlen mód protokolljával küldi minden nézőnek (lásd lent).
 - Közvetlen mód: `native/core` (a natív alkalmazások közös C++ magja: X25519 + AES-GCM titkosítás – BearSSL –,
   darabolás, NACK, kulcskocka-kérés, óra-egyeztetés, lyukasztás a NAT-on, szerveres / TURN relé, WebSocket-tartalék,
   a megosztó és a néző logikája), `server/direct-relay.js` (a szerver 3479/udp portja: címfelderítés és relé, csak a
   munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része (WebCodecs kódolás/dekódolás,
   kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet), `public/direct-web.js` (ugyanez a
-  böngészőben: WebCrypto + WebSocket a szerveren át), `desktop/direct.js` (ugyanez Node-ban – a korábbi Electron
+  böngészőben: WebCrypto / WebAssembly + WebSocket a szerveren át), `public/capture-audio.js` (a megosztó hangja
+  ott, ahol nincs `MediaStreamTrackProcessor`), `public/ss-web.js` + `native/web` (X25519 és Opus-dekódoló a
+  BearSSL-ből és a libopusból, WebAssemblyként), `desktop/direct.js` (ugyanez Node-ban – a korábbi Electron
   alkalmazásé, a tesztek használják).
 - `native/windows` (Win32 + Direct3D 11: DXGI képrögzítés, NVENC – az NVIDIA Video Codec SDK API-fejléce a
   `native/third_party/nvenc` mappában, MIT licenc –, Media Foundation kódolás / dekódolás, WASAPI hang, NSIS

@@ -3,7 +3,7 @@
   "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "4K, alacsony késleltetésű képernyőmegosztás hanggal (WebRTC), saját szerveren",
+  "description": "4K, alacsony késleltetésű képernyőmegosztás hanggal, saját titkosított átvitellel (WebRTC nélkül), saját szerveren",
   "engines": {
     "node": ">=22"
   },

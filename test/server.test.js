@@ -68,10 +68,14 @@ test('serves the page with security headers', async () => {
   const res = await fetch(`http://${base}/`);
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-type'), /text\/html/);
-  assert.match(res.headers.get('content-security-policy'), /script-src 'self'/);
+  assert.match(res.headers.get('content-security-policy'), /script-src 'self' 'wasm-unsafe-eval'/); // ss-web.wasm
   assert.match(res.headers.get('permissions-policy'), /display-capture=\(self\)/);
   assert.match(res.headers.get('permissions-policy'), /microphone=\(self\)/); // audio source picker
   assert.equal((await fetch(`http://${base}/app.js`)).status, 200);
+  for (const f of ['/direct-web.js', '/direct-audio.js', '/capture-audio.js', '/ss-web.js']) assert.equal((await fetch(`http://${base}${f}`)).status, 200, f);
+  const wasm = await fetch(`http://${base}/ss-web.wasm`);
+  assert.equal(wasm.headers.get('content-type'), 'application/wasm');
+  assert.ok(WebAssembly.validate(new Uint8Array(await wasm.arrayBuffer())));
   assert.equal((await fetch(`http://${base}/../server/server.js`)).status, 404);
   assert.equal((await fetch(`http://${base}/server/server.js`)).status, 404);
   assert.equal((await fetch(`http://${base}/healthz`)).status, 200);
@@ -107,7 +111,7 @@ test('odd request lines do not crash the server', async () => {
   assert.equal((await fetch(`http://${base}/healthz`)).status, 200);
 });
 
-test('relay only forwards the expected message types', async () => {
+test('relay only forwards the expected message types – no WebRTC ones', async () => {
   const h = await client();
   h.send({ t: 'host', password: 'titok123' });
   const { code } = await h.next(is('hosted'));
@@ -116,8 +120,12 @@ test('relay only forwards the expected message types', async () => {
   const { id } = await v.next(is('joined'));
   await h.next(is('viewer'));
   v.send({ t: 'signal', to: 'host', data: { type: 'offer', sdp: 'x' } });
-  v.send({ t: 'signal', to: 'host', data: { type: 'answer', sdp: 'y'.repeat(40 * 1024) } });
-  h.send({ t: 'signal', to: id, data: { type: 'answer', sdp: 'z' } });
+  v.send({ t: 'signal', to: 'host', data: { type: 'direct-answer', pub: 'y'.repeat(40 * 1024) } });
+  v.send({ t: 'signal', to: 'host', data: { type: 'answer', sdp: 'y' } });
+  v.send({ t: 'signal', to: 'host', data: { type: 'candidate', candidate: {} } });
+  h.send({ t: 'signal', to: id, data: { type: 'offer', sdp: 'z' } });
+  h.send({ t: 'signal', to: id, data: { type: 'candidate', candidate: {} } });
+  h.send({ t: 'signal', to: id, data: { type: 'direct-answer', pub: 'z' } });
   await h.nothing((m) => m.t === 'signal');
   await v.nothing((m) => m.t === 'signal');
   v.send({ t: 'signal', to: 'host', data: { type: 'recall' } });
@@ -153,18 +161,18 @@ test('full host/viewer flow with relay, state and close', async () => {
   assert.ok(turn.urls.some((u) => u.startsWith('turn:example.test:3478')));
 
   const v = await client();
-  v.send({ t: 'join', code: hosted.code.toUpperCase(), caps: { H264: { supported: true, hw: true }, junk: 1, surround: true } });
+  v.send({ t: 'join', code: hosted.code.toUpperCase(), caps: { H264: { supported: true, hw: true }, junk: 1, surround: true, direct: true } });
   const joined = await v.next(is('joined'));
   assert.equal(joined.hostPresent, true);
   const announced = await h.next(is('viewer'));
   assert.equal(announced.id, joined.id);
-  assert.deepEqual(announced.caps, { H264: { supported: true, hw: true }, surround: true });
+  assert.deepEqual(announced.caps, { surround: true, direct: true });
   assert.equal((await v.next(is('count'))).n, 1);
 
-  h.send({ t: 'signal', to: joined.id, data: { type: 'offer', sdp: 'x' } });
-  assert.deepEqual(await v.next(is('signal')), { t: 'signal', from: 'host', data: { type: 'offer', sdp: 'x' } });
-  v.send({ t: 'signal', to: 'host', data: { type: 'answer', sdp: 'y' } });
-  assert.deepEqual(await h.next(is('signal')), { t: 'signal', from: joined.id, data: { type: 'answer', sdp: 'y' } });
+  h.send({ t: 'signal', to: joined.id, data: { type: 'direct-offer', pub: 'x' } });
+  assert.deepEqual(await v.next(is('signal')), { t: 'signal', from: 'host', data: { type: 'direct-offer', pub: 'x' } });
+  v.send({ t: 'signal', to: 'host', data: { type: 'direct-answer', pub: 'y' } });
+  assert.deepEqual(await h.next(is('signal')), { t: 'signal', from: joined.id, data: { type: 'direct-answer', pub: 'y' } });
 
   h.send({ t: 'state', live: true });
   assert.deepEqual(await v.next(is('state')), { t: 'state', live: true });
@@ -174,7 +182,7 @@ test('full host/viewer flow with relay, state and close', async () => {
   v2.send({ t: 'join', code: hosted.code, caps: { surround: 'yes' } });
   const joined2 = await v2.next(is('joined'));
   assert.deepEqual((await h.next(is('viewer'))).caps, {});
-  v2.send({ t: 'signal', to: joined.id, data: { type: 'offer', sdp: 'evil' } });
+  v2.send({ t: 'signal', to: joined.id, data: { type: 'direct-offer', pub: 'evil' } });
   v2.send({ t: 'state', live: false });
   await v.nothing((m) => m.t === 'signal' || m.t === 'state');
 

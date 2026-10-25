@@ -1,11 +1,12 @@
 # The server and the website: the tests (signaling, direct mode's protocol in every implementation,
-# the audio buffer) on every change. (The Electron build used to run them; it is retired.)
+# the audio buffer, the website's WebAssembly) on every change, and public/ss-web.wasm rebuilt from
+# its source (native/web): it has to be byte for byte the file in the repository.
 name: Server and website
 
 on:
   push:
     branches: [claude/elegant-gauss-mi4rl5, main]
-    paths: ['server/**', 'public/**', 'desktop/direct.js', 'test/**', 'package.json', 'package-lock.json', '.github/workflows/web.yml']
+    paths: ['server/**', 'public/**', 'desktop/direct.js', 'test/**', 'native/web/**', 'native/third_party/bearssl/**', 'package.json', 'package-lock.json', '.github/workflows/web.yml']
   workflow_dispatch:
 
 jobs:
@@ -19,4 +20,10 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: ss-web.wasm from its source
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang-18 lld-18 wasi-libc libclang-rt-18-dev-wasm32
+          CC=clang-18 native/web/build.sh "$RUNNER_TEMP/ss-web.wasm"
+          cmp "$RUNNER_TEMP/ss-web.wasm" public/ss-web.wasm || { echo '::error::public/ss-web.wasm is not what native/web builds – run native/web/build.sh'; exit 1; }
       - run: npm test

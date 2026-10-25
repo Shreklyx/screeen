@@ -1,11 +1,9 @@
-// Screen Share – static site + WebSocket signaling + TURN credentials.
+// Screen Share – static site + WebSocket signaling + the direct mode's relay.
 //
-// The browser pages talk to this server only to set up connections; the
-// screen video and audio go directly between the browsers (WebRTC), or via
-// the TURN relay when a direct path is not possible. The desktop apps – and
-// browsers with WebCodecs – send the picture without WebRTC ("direct mode", see
-// direct-relay.js): the server's UDP port tells the apps their public address and
-// relays if needed; browsers send through the /direct WebSocket.
+// No WebRTC: the picture and the sound go with our own protocol ("direct mode", see
+// direct-relay.js), encrypted end to end. The apps send to each other directly over UDP – the
+// server's UDP port tells them their public address and relays if needed (or the TURN server);
+// browsers send through the /direct WebSocket, which the server passes on.
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -23,6 +21,10 @@ const STATIC_FILES = {
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
   '/direct-audio.js': ['direct-audio.js', 'text/javascript; charset=utf-8'], // direct mode: audio playback worklet
   '/direct-web.js': ['direct-web.js', 'text/javascript; charset=utf-8'], // direct mode in the browser (WebSocket)
+  '/capture-audio.js': ['capture-audio.js', 'text/javascript; charset=utf-8'], // sharing sound without MediaStreamTrackProcessor
+  // our C/C++ code as WebAssembly: X25519, an Opus decoder (native/web)
+  '/ss-web.js': ['ss-web.js', 'text/javascript; charset=utf-8'],
+  '/ss-web.wasm': ['ss-web.wasm', 'application/wasm'],
   // home-screen app (iPhone / iPad / Android)
   '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json; charset=utf-8'],
   '/apple-touch-icon.png': ['apple-touch-icon.png', 'image/png'],
@@ -35,9 +37,9 @@ const STATIC_FILES = {
 const APP_ORIGIN = 'app://screenshare'; // the desktop app (desktop/main.js)
 const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 const CODE_RE = /^[a-z0-9]{4,12}$/;
-const CODECS = ['AV1', 'VP9', 'H264', 'VP8'];
-const HOST_SIGNALS = new Set(['offer', 'candidate', 'stats', 'direct-offer', 'unsupported']);
-const VIEWER_SIGNALS = new Set(['answer', 'candidate', 'recall', 'stats', 'direct-answer', 'direct-fail']);
+// what the two ends may tell each other (no WebRTC offers / answers / ICE candidates any more)
+const HOST_SIGNALS = new Set(['stats', 'direct-offer', 'unsupported']);
+const VIEWER_SIGNALS = new Set(['recall', 'stats', 'direct-answer', 'direct-fail']);
 
 const LIMITS = {
   rooms: 100,
@@ -47,12 +49,12 @@ const LIMITS = {
   authWindowMs: 15 * 60 * 1000, // … per 15 minutes
   joins: 30, // join attempts per IP …
   joinWindowMs: 60 * 1000, // … per minute
-  hostBurst: 600, // messages a host may send in a burst (offers + ICE candidates for every viewer)
+  hostBurst: 600, // messages a host may send in a burst (every viewer's connection set up at once)
   hostPerSec: 120,
   viewerBurst: 100, // everyone else (viewers, sockets that have not joined yet)
   viewerPerSec: 20,
   maxPayload: 64 * 1024,
-  maxSignal: 32 * 1024, // one SDP or ICE message
+  maxSignal: 32 * 1024, // one signal (keys, addresses, statistics)
   maxBuffered: 1 << 20, // skip sending to a socket that does not keep up
   turnTtlSec: 24 * 3600,
 };
@@ -144,12 +146,8 @@ function clientIp(req, trustProxy) {
 function sanitizeCaps(caps) {
   if (!caps || typeof caps !== 'object') return null;
   const out = {};
-  for (const c of CODECS) {
-    const v = caps[c];
-    if (v && typeof v === 'object') out[c] = { supported: v.supported !== false, hw: v.hw === true };
-  }
-  if (caps.surround === true) out.surround = true; // 5.1/7.1 speakers that can play multi-channel Opus
-  if (caps.direct === true) out.direct = true; // the app, or a browser with WebCodecs: can receive without WebRTC
+  if (caps.surround === true) out.surround = true; // 5.1/7.1 speakers
+  if (caps.direct === true) out.direct = true; // speaks our protocol: an app, or a browser with WebCodecs
   return out;
 }
 
@@ -160,7 +158,7 @@ function securityHeaders(req) {
   return {
     'Content-Security-Policy': [
       "default-src 'self'",
-      "script-src 'self'",
+      "script-src 'self' 'wasm-unsafe-eval'", // our WebAssembly (ss-web.wasm)
       "style-src 'self'",
       "img-src 'self' data:",
       `connect-src 'self' wss://${host} ws://${host}`,
@@ -346,7 +344,7 @@ export function createApp(config = loadConfig()) {
       iceServers: iceServers(config),
       live: room.live,
       viewers: [...room.viewers.values()].map((v) => ({ id: v.id, caps: v.caps })),
-      direct: true, // this server sets up direct mode (app ↔ app)
+      direct: true, // this server sets up the direct mode
     });
     for (const v of room.viewers.values()) send(v, { t: 'host-back', live: room.live });
     broadcastCount(room);

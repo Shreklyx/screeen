@@ -377,6 +377,8 @@ input[type="password"] {
 .btn-sm { padding: 5px 12px; font-size: 13px; border-radius: 999px; }
 .player:fullscreen { max-height: none; width: 100vw; height: 100vh; aspect-ratio: auto; border-radius: 0; border: 0; }
 .player:-webkit-full-screen { max-height: none; width: 100vw; height: 100vh; border-radius: 0; border: 0; }
+/* an iPhone has no full screen for a page element: the player fills the window instead */
+.player.pseudo-full { position: fixed; inset: 0; z-index: 1000; max-height: none; width: 100vw; height: 100dvh; aspect-ratio: auto; border-radius: 0; border: 0; }
 .player.idle { cursor: none; }
 
 .overlay {

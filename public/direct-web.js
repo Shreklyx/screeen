@@ -5,14 +5,15 @@
 //
 // A browser cannot send UDP, so its packets travel in a WebSocket to the server
 // (wss://…/direct), which passes them to the other side (the app's "tcp" path). The packets
-// are encrypted end to end like the app's (X25519 + HKDF → AES-128-GCM, WebCrypto): the
-// server pairs the two ends by session and HMAC, but cannot read the picture.
+// are encrypted end to end like the app's (X25519 + HKDF → AES-128-GCM, WebCrypto – X25519 from
+// our WebAssembly, ss-web.js, where WebCrypto has none): the server pairs the two ends by session
+// and HMAC, but cannot read the picture.
 // Over the WebSocket a frame goes as one packet (TCP loses nothing, so no NACK); a frame that
 // cannot be sent in time is dropped instead of waiting in a queue, and the viewer asks for a
 // keyframe. The viewer hands every frame to the page the moment it arrives.
 //
-// window.ScreenShareWebDirect: { supported(): Promise<bool>, create({ tcpUrl }) } – the object
-// create() returns has the same calls as the desktop app's (preload.js `direct`).
+// window.ScreenShareWebDirect: { supported(): Promise<{ ok, keys, audio }>, create({ tcpUrl }) } – the
+// object create() returns has the same calls as the apps' engine.
 
 (() => {
   const PEER = 0x53;
@@ -30,21 +31,81 @@
   const randomBytes = (n) => crypto.getRandomValues(new Uint8Array(n));
   const hex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 
+  /* ------------------------------------------------ the key exchange: WebCrypto, or our WebAssembly */
+
+  // generate() → { pub, shared(theirPub) → Promise<32 bytes>, wipe?() }
+  const webCryptoKeys = {
+    async generate() {
+      const kp = await subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+      return {
+        pub: new Uint8Array(await subtle.exportKey('raw', kp.publicKey)),
+        async shared(theirs) {
+          const other = await subtle.importKey('raw', theirs, { name: 'X25519' }, false, []);
+          return new Uint8Array(await subtle.deriveBits({ name: 'X25519', public: other }, kp.privateKey, 256));
+        },
+      };
+    },
+  };
+  const wasmKeys = (wasm) => ({
+    async generate() {
+      const secret = randomBytes(32);
+      return {
+        pub: wasm.x25519(secret),
+        async shared(theirs) {
+          return wasm.x25519(secret, theirs);
+        },
+        wipe() {
+          secret.fill(0);
+        },
+      };
+    },
+  });
+  // our WebAssembly (ss-web.js), loaded when needed; null when it cannot be
+  let wasm;
+  const loadWasm = async () => {
+    if (wasm === undefined) wasm = await (globalThis.ScreenShareWasm?.load() ?? Promise.reject(new Error('no ss-web.js'))).catch(() => null);
+    return wasm;
+  };
+
+  let keys = null;
+  /** The key exchange: WebCrypto's X25519 where the browser has it, else ours. */
+  async function keyExchange() {
+    if (keys) return keys;
+    try {
+      await subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
+      keys = webCryptoKeys;
+    } catch {
+      if (!(await loadWasm())) throw new Error('no key exchange');
+      keys = wasmKeys(wasm);
+    }
+    return keys;
+  }
+
   let support = null;
-  /** WebCrypto X25519, a WebSocket, and decoders for H.264 and Opus (what a viewer needs). */
+  /** What this browser can do: { ok } – a WebSocket, WebCrypto and an H.264 decoder, at least; keys:
+   *  'webcrypto' | 'wasm' (X25519); audio: 'webcodecs' | 'wasm' (an Opus decoder) | null. */
   function supported() {
     support ||= (async () => {
-      if (!subtle || typeof WebSocket !== 'function' || typeof VideoDecoder !== 'function' || typeof AudioDecoder !== 'function') return false;
+      const no = { ok: false };
+      if (!subtle || typeof WebSocket !== 'function' || typeof VideoDecoder !== 'function') return no;
       try {
-        await subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
-        const [video, audio] = await Promise.all([
-          VideoDecoder.isConfigSupported({ codec: 'avc1.640034' }),
-          AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }),
-        ]);
-        return video.supported === true && audio.supported === true;
+        if ((await VideoDecoder.isConfigSupported({ codec: 'avc1.640034' })).supported !== true) return no;
       } catch {
-        return false;
+        return no;
       }
+      try {
+        await keyExchange();
+      } catch {
+        return no;
+      }
+      let audio = null;
+      try {
+        if (typeof AudioDecoder === 'function' && (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 })).supported === true) audio = 'webcodecs';
+      } catch {
+        // our decoder then
+      }
+      if (!audio && typeof AudioWorkletNode === 'function' && (await loadWasm())) audio = 'wasm';
+      return { ok: true, keys: keys === webCryptoKeys ? 'webcrypto' : 'wasm', audio };
     })();
     return support;
   }
@@ -56,7 +117,7 @@
       this.id = id;
       this.session = session >>> 0;
       this.role = role;
-      this.kp = null;
+      this.kx = null; // our key pair (see webCryptoKeys)
       this.hmacKey = null;
       this.sendKey = null;
       this.recvKey = null;
@@ -136,13 +197,12 @@
       this.removePeer(id);
       const peer = new Peer(id, Number(session), this.role);
       this.peers.set(id, peer);
-      peer.kp = await subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
+      peer.kx = await (await keyExchange()).generate();
       peer.hmacKey = await subtle.importKey('raw', unb64(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
       if (this.peers.get(id) !== peer) throw new Error('closed');
       this.openSocket(peer);
-      const pub = new Uint8Array(await subtle.exportKey('raw', peer.kp.publicKey));
       // no UDP addresses: the other side uses the WebSocket path at once
-      return { pub: b64(pub), cands: [], tcp: true };
+      return { pub: b64(peer.kx.pub), cands: [], tcp: true };
     }
 
     /** The WebSocket to the server; the first message proves the session (HMAC of its secret). */
@@ -185,8 +245,7 @@
       const peer = this.peers.get(id);
       if (!peer) return;
       try {
-        const other = await subtle.importKey('raw', unb64(pub), { name: 'X25519' }, false, []);
-        const shared = await subtle.deriveBits({ name: 'X25519', public: other }, peer.kp.privateKey, 256);
+        const shared = await peer.kx.shared(unb64(pub));
         const hkdf = await subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
         const salt = new Uint8Array(4);
         new DataView(salt.buffer).setUint32(0, peer.session);
@@ -212,6 +271,7 @@
       if (!peer) return;
       if (peer.path) peer.send(T.BYE, new Uint8Array(1));
       clearTimeout(peer.failTimer);
+      peer.kx?.wipe?.(); // (our key pair: the private half does not stay in memory)
       this.peers.delete(id);
       const ws = peer.ws;
       peer.ws = null;

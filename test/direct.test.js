@@ -420,3 +420,37 @@ test('browser transport: a browser shares to an app', async () => {
     await p.close();
   }
 });
+
+test('browser transport: without WebCrypto X25519 the key exchange is our WebAssembly – the app still connects', async () => {
+  const fs = await import('node:fs');
+  const vm = await import('node:vm');
+  vm.runInThisContext(fs.readFileSync(new URL('../public/ss-web.js', import.meta.url), 'utf8'));
+  const instance = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(new URL('../public/ss-web.wasm', import.meta.url))), {});
+  const ours = globalThis.ScreenShareWasm.wrap(instance.exports);
+  let used = 0;
+  const load = globalThis.ScreenShareWasm.load;
+  globalThis.ScreenShareWasm.load = async () => {
+    used++;
+    return ours;
+  };
+  const subtle = globalThis.crypto.subtle;
+  const generateKey = subtle.generateKey;
+  subtle.generateKey = function (alg, ...rest) {
+    if (alg?.name === 'X25519') return Promise.reject(new DOMException('not supported', 'NotSupportedError')); // an older browser
+    return generateKey.call(this, alg, ...rest);
+  };
+  try {
+    const p = await webPair('viewer');
+    try {
+      assert.ok(used > 0, 'the WebAssembly was used');
+      p.native.sendMedia({ stream: 0, key: true, ts: 1, capture: 1 }, frame(1, 5000));
+      await until(() => p.media.some((m) => m.meta.stream === 0));
+      assert.ok(p.media[0].data.equals(frame(1, 5000)));
+    } finally {
+      await p.close();
+    }
+  } finally {
+    subtle.generateKey = generateKey;
+    globalThis.ScreenShareWasm.load = load;
+  }
+});
