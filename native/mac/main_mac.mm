@@ -1,13 +1,11 @@
 // Screen Share for macOS – native (AppKit), without Electron or Chromium.
 //
-// Home: share the screen (sharing password, which display, quality, system sound) or watch a room
-// (code or link). Sharing: the room code and link, the viewers with their connection and latency.
-// Watching: the picture fills the window, the bar over it fades away (F / double click: full
-// screen, S: statistics, M: mute). About: version, updates, the open-source parts.
-//
-// The look is glass: the window is see-through to the desktop (blurred), coloured light behind,
-// the panels frosted glass over it (Liquid Glass on macOS 26, the system's blur before). Screens
-// cross-fade, buttons light up, the spinner turns on the GPU.
+// A Mac app like the system's own: its standard controls (Liquid Glass on macOS 26), settings in
+// rounded groups as in System Settings, questions in sheets, the standard About panel.
+// Home: share the screen (password, display, quality, system sound) or watch a room (code or
+// link). Sharing: the room code and link, the viewers with their connection and latency.
+// Watching: the window grows, the picture fills it, a floating glass bar over it that fades away
+// (F / double click: full screen, S: statistics, M: mute). The server is always mozizas.hu.
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Security/Security.h>
@@ -21,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "clock.h"
 #include "engine.h"
@@ -29,6 +28,9 @@
 
 #ifndef SS_VERSION
 #define SS_VERSION "2.0.0"
+#endif
+#ifndef SS_BUILD
+#define SS_BUILD "0"
 #endif
 
 namespace ss {
@@ -39,18 +41,12 @@ using namespace ss;
 static NSString* S(const std::string& s) { return [NSString stringWithUTF8String:s.c_str()] ?: @""; }
 static std::string U(NSString* s) { return s.UTF8String ?: ""; }
 
+static const char* const kServer = "https://mozizas.hu";
 static NSString* const kFeed = @"https://github.com/Shreklyx/screeen/releases/download/desktop-latest";
 static NSString* const kSite = @"https://mozizas.hu";
-static NSString* const kReleases = @"https://github.com/Shreklyx/screeen/releases/tag/desktop-latest";
 
-static NSColor* rgb(uint32_t hex, CGFloat a = 1) {
-  return [NSColor colorWithSRGBRed:CGFloat((hex >> 16) & 0xFF) / 255.0 green:CGFloat((hex >> 8) & 0xFF) / 255.0 blue:CGFloat(hex & 0xFF) / 255.0 alpha:a];
-}
-
-static const uint32_t kAccent = 0xFF4D6A, kAccent2 = 0x8B5CF6, kOk = 0x4ADE80, kWarn = 0xFBBF24, kErr = 0xFF6B7A;
-static NSColor* textColor() { return rgb(0xEFEFF6); }
-static NSColor* mutedColor() { return rgb(0xA0A0B6); }
-static NSColor* faintColor() { return rgb(0x7A7A92); }
+// the compact window: content width, margins (the title bar is part of the window's content)
+static const CGFloat kHomeWidth = 420, kHostWidth = 440, kSide = 30, kTop = 46, kBottom = 26;
 
 struct Quality {
   const char* name;
@@ -59,10 +55,10 @@ struct Quality {
 };
 static const Quality kQualities[] = {
     {"Automatikus", "A legszebb, amit a gép és a hálózat bír: akár 4K, 60 FPS.", 3840, 2160, 60},
-    {"1440p · 60", "2560×1440, 60 FPS.", 2560, 1440, 60},
-    {"1080p · 60", "1920×1080, 60 FPS.", 1920, 1080, 60},
-    {"1080p · 120", "1920×1080, 120 FPS – játékhoz, gyors mozgáshoz.", 1920, 1080, 120},
-    {"720p · 60", "1280×720, 60 FPS – gyenge internetre.", 1280, 720, 60},
+    {"1440p · 60 FPS", "2560×1440, 60 FPS.", 2560, 1440, 60},
+    {"1080p · 60 FPS", "1920×1080, 60 FPS.", 1920, 1080, 60},
+    {"1080p · 120 FPS", "1920×1080, 120 FPS – játékhoz, gyors mozgáshoz.", 1920, 1080, 120},
+    {"720p · 60 FPS", "1280×720, 60 FPS – gyenge internetre.", 1280, 720, 60},
     {"Eredeti", "A képernyő saját felbontása, 60 FPS.", 0, 0, 60},
 };
 
@@ -88,35 +84,39 @@ static NSString* loadPassword() {
 
 /* ------------------------------------------------ small helpers */
 
-static NSImage* symbol(NSString* name, CGFloat size, NSFontWeight weight = NSFontWeightSemibold) {
-  if (!name) return nil;
+static NSImage* symbol(NSString* name, CGFloat size, NSFontWeight weight = NSFontWeightRegular) {
   NSImage* img = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
-  if (!img) return nil;
-  return [img imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:size weight:weight]];
+  if (!img) return [NSImage new];
+  return [img imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:size weight:weight]] ?: img;
 }
 
-static NSTextField* label(NSString* text, CGFloat size, NSFontWeight weight, NSColor* color, bool wrap = false) {
-  NSTextField* l = wrap ? [NSTextField wrappingLabelWithString:text] : [NSTextField labelWithString:text];
+/** A label; with `wrapWidth` it wraps at that width. */
+static NSTextField* label(NSString* text, CGFloat size, NSFontWeight weight, NSColor* color, CGFloat wrapWidth = 0) {
+  NSTextField* l = wrapWidth > 0 ? [NSTextField wrappingLabelWithString:text] : [NSTextField labelWithString:text];
   l.font = [NSFont systemFontOfSize:size weight:weight];
   l.textColor = color;
   l.translatesAutoresizingMaskIntoConstraints = NO;
-  if (!wrap) l.lineBreakMode = NSLineBreakByTruncatingTail;
-  [l setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+  if (wrapWidth > 0) {
+    l.preferredMaxLayoutWidth = wrapWidth;
+    l.selectable = NO;
+  } else {
+    l.lineBreakMode = NSLineBreakByTruncatingTail;
+  }
   return l;
 }
 
-static void pin(NSView* v, NSView* to, CGFloat inset = 0) {
+static void pin(NSView* v, NSView* to) {
   v.translatesAutoresizingMaskIntoConstraints = NO;
   [NSLayoutConstraint activateConstraints:@[
-    [v.leadingAnchor constraintEqualToAnchor:to.leadingAnchor constant:inset], [v.trailingAnchor constraintEqualToAnchor:to.trailingAnchor constant:-inset],
-    [v.topAnchor constraintEqualToAnchor:to.topAnchor constant:inset], [v.bottomAnchor constraintEqualToAnchor:to.bottomAnchor constant:-inset]
+    [v.leadingAnchor constraintEqualToAnchor:to.leadingAnchor], [v.trailingAnchor constraintEqualToAnchor:to.trailingAnchor],
+    [v.topAnchor constraintEqualToAnchor:to.topAnchor], [v.bottomAnchor constraintEqualToAnchor:to.bottomAnchor]
   ]];
 }
 
 static NSStackView* vstack(NSArray<NSView*>* views, CGFloat spacing) {
   NSStackView* s = [NSStackView stackViewWithViews:views];
   s.orientation = NSUserInterfaceLayoutOrientationVertical;
-  s.alignment = NSLayoutAttributeLeading;
+  s.alignment = NSLayoutAttributeCenterX;
   s.spacing = spacing;
   s.translatesAutoresizingMaskIntoConstraints = NO;
   return s;
@@ -131,9 +131,9 @@ static NSStackView* hstack(NSArray<NSView*>* views, CGFloat spacing) {
   return s;
 }
 
-/** The child as wide as the (vertical) stack. */
-static void stretch(NSView* child, NSStackView* stack) {
-  [child.widthAnchor constraintEqualToAnchor:stack.widthAnchor constant:-(stack.edgeInsets.left + stack.edgeInsets.right)].active = YES;
+/** The child as wide as the (vertical) stack, less `inset` on each side. */
+static void stretch(NSView* child, NSStackView* stack, CGFloat inset = 0) {
+  [child.widthAnchor constraintEqualToAnchor:stack.widthAnchor constant:-2 * inset].active = YES;
 }
 
 static NSView* spacer() {
@@ -144,6 +144,12 @@ static NSView* spacer() {
   return v;
 }
 
+static void sizeTo(NSView* v, CGFloat w, CGFloat h) {
+  v.translatesAutoresizingMaskIntoConstraints = NO;
+  if (w > 0) [v.widthAnchor constraintEqualToConstant:w].active = YES;
+  if (h > 0) [v.heightAnchor constraintEqualToConstant:h].active = YES;
+}
+
 static void animateAlpha(NSView* v, CGFloat to, double seconds = 0.22) {
   [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
     ctx.duration = seconds;
@@ -152,489 +158,138 @@ static void animateAlpha(NSView* v, CGFloat to, double seconds = 0.22) {
   }];
 }
 
-/* ------------------------------------------------ glass */
-
-/** A frosted-glass panel: Liquid Glass (macOS 26) or the system blur of what is behind it, a faint
- *  white sheen, an edge that catches the light, a soft shadow. Content goes into `content`. */
-@interface SSGlass : NSView
-@property(nonatomic, readonly) NSView* content;
-- (instancetype)initWithRadius:(CGFloat)radius strength:(CGFloat)strength;
-@end
-
-@implementation SSGlass
-- (instancetype)initWithRadius:(CGFloat)radius strength:(CGFloat)strength {
-  if ((self = [super initWithFrame:NSZeroRect])) {
-    self.translatesAutoresizingMaskIntoConstraints = NO;
-    self.wantsLayer = YES;
-    NSShadow* sh = [NSShadow new];
-    sh.shadowColor = rgb(0x000000, 0.45);
-    sh.shadowBlurRadius = 22;
-    sh.shadowOffset = NSMakeSize(0, -6);
-    self.shadow = sh;
-    NSView* blur = nil;
-    Class glass = NSClassFromString(@"NSGlassEffectView");
-    if (glass) {
-      blur = [glass new];
-      @try {
-        [blur setValue:@(radius) forKey:@"cornerRadius"];
-      } @catch (NSException*) {
-      }
-    } else {
-      NSVisualEffectView* v = [NSVisualEffectView new];
-      v.material = NSVisualEffectMaterialHUDWindow;
-      v.blendingMode = NSVisualEffectBlendingModeWithinWindow;
-      v.state = NSVisualEffectStateActive;
-      v.wantsLayer = YES;
-      v.layer.cornerRadius = radius;
-      v.layer.masksToBounds = YES;
-      blur = v;
-    }
-    NSView* sheen = [NSView new];
-    CAGradientLayer* g = [CAGradientLayer layer];
-    g.colors = @[ (id)rgb(0xFFFFFF, 0.11 * strength).CGColor, (id)rgb(0xFFFFFF, 0.04 * strength).CGColor, (id)rgb(0xFFFFFF, 0.02 * strength).CGColor ];
-    g.locations = @[ @0, @0.4, @1 ];
-    g.startPoint = CGPointMake(0.5, 1); // (layer coordinates: y up)
-    g.endPoint = CGPointMake(0.5, 0);
-    g.cornerRadius = radius;
-    g.borderWidth = 1;
-    g.borderColor = rgb(0xFFFFFF, 0.17 * strength).CGColor;
-    sheen.layer = g; // layer-hosting: the layer first, then wantsLayer
-    sheen.wantsLayer = YES;
-    _content = [NSView new];
-    [self addSubview:blur];
-    pin(blur, self);
-    [self addSubview:sheen];
-    pin(sheen, self);
-    [self addSubview:_content];
-    pin(_content, self);
-  }
-  return self;
-}
-@end
-
-/** The coloured light behind the glass: soft radial glows in the window's corners. */
-@interface SSLights : NSView
-@end
-
-@implementation SSLights {
-  NSArray<CAGradientLayer*>* _glows;
-}
-- (instancetype)initWithFrame:(NSRect)r {
-  if ((self = [super initWithFrame:r])) {
-    self.wantsLayer = YES;
-    NSMutableArray* list = [NSMutableArray array];
-    const uint32_t colors[4] = {kAccent, kAccent2, 0x3B82F6, 0x22D3EE};
-    const CGFloat alphas[4] = {0.50, 0.46, 0.38, 0.20};
-    for (int i = 0; i < 4; i++) {
-      CAGradientLayer* g = [CAGradientLayer layer];
-      g.type = kCAGradientLayerRadial;
-      g.colors = @[ (id)rgb(colors[i], alphas[i]).CGColor, (id)rgb(colors[i], 0).CGColor ];
-      g.startPoint = CGPointMake(0.5, 0.5);
-      g.endPoint = CGPointMake(1, 1);
-      [self.layer addSublayer:g];
-      [list addObject:g];
-    }
-    _glows = list;
-  }
-  return self;
-}
-- (BOOL)isFlipped {
-  return YES;
-}
-- (void)layout {
-  [super layout];
-  CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
-  // centre (as a share of the size) and radius
-  const CGFloat spots[4][3] = {{0.12, 0.84, 560}, {0.90, 0.70, 600}, {0.52, -0.05, 640}, {0.0, 0.14, 380}};
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  for (NSUInteger i = 0; i < _glows.count; i++) {
-    CGFloat r = spots[i][2];
-    _glows[i].frame = CGRectMake(W * spots[i][0] - r, H * spots[i][1] - r, 2 * r, 2 * r);
-  }
-  [CATransaction commit];
-}
-- (NSView*)hitTest:(NSPoint)p {
-  return nil; // light only, not in the way of clicks
-}
-@end
-
-/* ------------------------------------------------ buttons, chips */
-
-typedef NS_ENUM(NSInteger, SSStyle) { SSPrimary, SSSecondary, SSDanger, SSGhost, SSChip, SSSuccess };
-
-@interface SSButton : NSView
-@property(nonatomic) SSStyle style;
-@property(nonatomic) BOOL selected;
-@property(nonatomic) BOOL enabled;
-@property(nonatomic, copy) void (^onClick)(void);
-- (instancetype)initWithTitle:(NSString*)title symbol:(NSString*)sym style:(SSStyle)style;
-- (void)setTitle:(NSString*)title symbol:(NSString*)sym;
-@end
-
-@implementation SSButton {
-  CAGradientLayer* _fill;
-  CAGradientLayer* _gloss;
-  CALayer* _hover;
-  NSTextField* _label;
-  NSImageView* _icon;
-  NSStackView* _row;
-  BOOL _inside, _down;
-  NSTrackingArea* _tracking;
+static void fade(NSView* v, double seconds = 0.22) {
+  CATransition* t = [CATransition animation];
+  t.type = kCATransitionFade;
+  t.duration = seconds;
+  t.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+  [v.layer addAnimation:t forKey:@"fade"];
 }
 
-- (instancetype)initWithTitle:(NSString*)title symbol:(NSString*)sym style:(SSStyle)style {
-  if ((self = [super initWithFrame:NSZeroRect])) {
-    self.translatesAutoresizingMaskIntoConstraints = NO;
-    self.wantsLayer = YES;
-    _enabled = YES;
-    _fill = [CAGradientLayer layer];
-    _fill.startPoint = CGPointMake(0, 0.5);
-    _fill.endPoint = CGPointMake(1, 0.5);
-    _fill.borderWidth = 1;
-    _gloss = [CAGradientLayer layer];
-    _gloss.colors = @[ (id)rgb(0xFFFFFF, 0.26).CGColor, (id)rgb(0xFFFFFF, 0.03).CGColor, (id)rgb(0xFFFFFF, 0).CGColor ];
-    _gloss.locations = @[ @0, @0.5, @1 ];
-    _gloss.startPoint = CGPointMake(0.5, 1);
-    _gloss.endPoint = CGPointMake(0.5, 0);
-    _hover = [CALayer layer];
-    _hover.backgroundColor = rgb(0xFFFFFF, 1).CGColor;
-    _hover.opacity = 0;
-    [self.layer addSublayer:_fill];
-    [self.layer addSublayer:_gloss];
-    [self.layer addSublayer:_hover];
-    _icon = [NSImageView new];
-    _icon.translatesAutoresizingMaskIntoConstraints = NO;
-    _label = label(@"", 14, NSFontWeightSemibold, textColor());
-    _label.alignment = NSTextAlignmentCenter;
-    _row = hstack(@[ _icon, _label ], 8);
-    [self addSubview:_row];
-    [NSLayoutConstraint activateConstraints:@[
-      [_row.centerXAnchor constraintEqualToAnchor:self.centerXAnchor], [_row.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-      [_row.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.leadingAnchor constant:12],
-      [_row.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor constant:-12],
-    ]];
-    _style = style;
-    [self setTitle:title symbol:sym];
-  }
-  return self;
+static NSView* makeDot(NSColor* color, CGFloat d = 8) {
+  NSView* v = [NSView new];
+  v.wantsLayer = YES;
+  v.layer.backgroundColor = color.CGColor;
+  v.layer.cornerRadius = d / 2;
+  sizeTo(v, d, d);
+  return v;
 }
 
-- (void)setTitle:(NSString*)title symbol:(NSString*)sym {
-  _label.stringValue = title ?: @"";
-  _label.hidden = title.length == 0;
-  NSImage* img = symbol(sym, 14);
-  _icon.image = img;
-  _icon.hidden = img == nil;
-  [self restyle];
-  [self invalidateIntrinsicContentSize];
+static void setDotColor(NSView* dot, NSColor* color) {
+  dot.layer.backgroundColor = color.CGColor;
 }
 
-- (NSSize)intrinsicContentSize {
-  NSSize s = _row.fittingSize;
-  return NSMakeSize(s.width + 32, _style == SSChip ? 36 : 44);
-}
-
-- (void)setStyle:(SSStyle)style {
-  _style = style;
-  [self restyle];
-}
-- (void)setSelected:(BOOL)selected {
-  _selected = selected;
-  [self restyle];
-}
-- (void)setEnabled:(BOOL)enabled {
-  _enabled = enabled;
-  self.alphaValue = enabled ? 1 : 0.55;
-  [self restyle];
-}
-
-- (void)restyle {
-  NSColor* text = textColor();
-  NSArray* colors;
-  NSColor* border;
-  BOOL gloss = NO;
-  switch (_style) {
-    case SSPrimary:
-      colors = @[ (id)rgb(kAccent).CGColor, (id)rgb(kAccent2).CGColor ];
-      border = rgb(0xFFFFFF, 0.35);
-      gloss = YES;
-      text = NSColor.whiteColor;
-      break;
-    case SSSuccess:
-      colors = @[ (id)rgb(0x174A30, 0.85).CGColor, (id)rgb(0x123222, 0.85).CGColor ];
-      border = rgb(kOk, 0.6);
-      text = rgb(kOk);
-      break;
-    case SSDanger:
-      colors = @[ (id)rgb(0x5A1426, 0.6).CGColor, (id)rgb(0x3A0F1C, 0.6).CGColor ];
-      border = rgb(kErr, 0.5);
-      text = rgb(0xFFC9D0);
-      break;
-    case SSSecondary:
-      colors = @[ (id)rgb(0xFFFFFF, 0.10).CGColor, (id)rgb(0xFFFFFF, 0.06).CGColor ];
-      border = rgb(0xFFFFFF, 0.22);
-      break;
-    case SSGhost:
-      colors = @[ (id)NSColor.clearColor.CGColor, (id)NSColor.clearColor.CGColor ];
-      border = NSColor.clearColor;
-      text = mutedColor();
-      break;
-    case SSChip:
-      colors = _selected ? @[ (id)rgb(kAccent, 0.32).CGColor, (id)rgb(kAccent2, 0.26).CGColor ] : @[ (id)rgb(0xFFFFFF, 0.05).CGColor, (id)rgb(0xFFFFFF, 0.05).CGColor ];
-      border = _selected ? rgb(0xFF8DA0, 0.9) : rgb(0xFFFFFF, 0.14);
-      text = _selected ? textColor() : mutedColor();
-      break;
-  }
-  [CATransaction begin];
-  [CATransaction setAnimationDuration:0.18];
-  _fill.colors = colors;
-  _fill.borderColor = border.CGColor;
-  _gloss.hidden = !gloss;
-  [CATransaction commit];
-  _label.textColor = text;
-  _label.font = [NSFont systemFontOfSize:_style == SSChip ? 13 : 14 weight:(_style == SSChip && !_selected) ? NSFontWeightMedium : NSFontWeightSemibold];
-  _icon.contentTintColor = text;
-}
-
-- (void)layout {
-  [super layout];
-  CGFloat radius = std::min<CGFloat>(12, self.bounds.size.height / 2);
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  for (CALayer* l in @[ _fill, _gloss, _hover ]) {
-    l.frame = self.bounds;
-    l.cornerRadius = _style == SSChip ? 10 : radius;
-  }
-  [CATransaction commit];
-}
-
-- (void)updateTrackingAreas {
-  [super updateTrackingAreas];
-  if (_tracking) [self removeTrackingArea:_tracking];
-  _tracking = [[NSTrackingArea alloc] initWithRect:NSZeroRect options:NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect owner:self userInfo:nil];
-  [self addTrackingArea:_tracking];
-}
-
-- (void)resetCursorRects {
-  if (_enabled) [self addCursorRect:self.bounds cursor:NSCursor.pointingHandCursor];
-}
-
-- (void)light {
-  [CATransaction begin];
-  [CATransaction setAnimationDuration:_down ? 0.06 : 0.16];
-  _hover.opacity = !_enabled ? 0 : _down ? 0.16 : _inside ? 0.08 : 0;
-  [CATransaction commit];
-}
-
-- (void)mouseEntered:(NSEvent*)e {
-  _inside = YES;
-  [self light];
-}
-- (void)mouseExited:(NSEvent*)e {
-  _inside = NO;
-  [self light];
-}
-- (void)mouseDown:(NSEvent*)e {
-  if (!_enabled) return;
-  _down = YES;
-  [self light];
-}
-- (void)mouseUp:(NSEvent*)e {
-  if (!_down) return;
-  _down = NO;
-  [self light];
-  NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-  if (NSPointInRect(p, self.bounds) && _enabled && _onClick) _onClick();
-}
-- (BOOL)acceptsFirstMouse:(NSEvent*)e {
-  return YES;
-}
-@end
-
-/* ------------------------------------------------ a text box in a dark well */
-
-@interface SSField : NSView <NSTextFieldDelegate>
-@property(nonatomic, readonly) NSTextField* field;
-@property(nonatomic, copy) void (^onEnter)(void);
-@property(nonatomic, copy) void (^onEdit)(void);
-- (instancetype)initSecure:(BOOL)secure symbol:(NSString*)sym placeholder:(NSString*)placeholder;
-@end
-
-@implementation SSField {
-  CALayer* _well;
-  CALayer* _ring;
-}
-- (instancetype)initSecure:(BOOL)secure symbol:(NSString*)sym placeholder:(NSString*)placeholder {
-  if ((self = [super initWithFrame:NSZeroRect])) {
-    self.translatesAutoresizingMaskIntoConstraints = NO;
-    self.wantsLayer = YES;
-    _well = [CALayer layer];
-    _well.backgroundColor = rgb(0x0E0E18, 0.78).CGColor;
-    _well.borderWidth = 1;
-    _well.borderColor = rgb(0xFFFFFF, 0.14).CGColor;
-    _well.cornerRadius = 10;
-    _ring = [CALayer layer];
-    _ring.borderWidth = 3;
-    _ring.borderColor = rgb(kAccent, 0.0).CGColor;
-    _ring.cornerRadius = 13;
-    [self.layer addSublayer:_ring];
-    [self.layer addSublayer:_well];
-    NSImageView* icon = [NSImageView imageViewWithImage:symbol(sym, 13, NSFontWeightMedium) ?: [NSImage new]];
-    icon.translatesAutoresizingMaskIntoConstraints = NO;
-    icon.contentTintColor = faintColor();
-    _field = secure ? [NSSecureTextField new] : [NSTextField new];
-    _field.translatesAutoresizingMaskIntoConstraints = NO;
-    _field.bezeled = NO;
-    _field.bordered = NO;
-    _field.drawsBackground = NO;
-    _field.focusRingType = NSFocusRingTypeNone;
-    _field.font = [NSFont systemFontOfSize:14];
-    _field.textColor = textColor();
-    _field.delegate = self;
-    if (placeholder)
-      _field.placeholderAttributedString = [[NSAttributedString alloc] initWithString:placeholder
-                                                                           attributes:@{NSForegroundColorAttributeName : faintColor(), NSFontAttributeName : _field.font}];
-    [self addSubview:icon];
-    [self addSubview:_field];
-    [NSLayoutConstraint activateConstraints:@[
-      [self.heightAnchor constraintEqualToConstant:42], [icon.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
-      [icon.centerYAnchor constraintEqualToAnchor:self.centerYAnchor], [icon.widthAnchor constraintEqualToConstant:18],
-      [_field.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:10], [_field.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
-      [_field.centerYAnchor constraintEqualToAnchor:self.centerYAnchor]
-    ]];
-  }
-  return self;
-}
-- (void)layout {
-  [super layout];
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  _well.frame = self.bounds;
-  _ring.frame = NSInsetRect(self.bounds, -3, -3);
-  [CATransaction commit];
-}
-- (void)focus:(BOOL)on {
-  [CATransaction begin];
-  [CATransaction setAnimationDuration:0.18];
-  _ring.borderColor = rgb(kAccent, on ? 0.28 : 0).CGColor;
-  _well.borderColor = on ? rgb(0xFF8DA0, 0.9).CGColor : rgb(0xFFFFFF, 0.14).CGColor;
-  [CATransaction commit];
-}
-- (void)controlTextDidBeginEditing:(NSNotification*)n {
-  [self focus:YES];
-}
-- (void)controlTextDidEndEditing:(NSNotification*)n {
-  [self focus:NO];
-}
-- (void)controlTextDidChange:(NSNotification*)n {
-  if (_onEdit) _onEdit();
-}
-- (BOOL)control:(NSControl*)c textView:(NSTextView*)tv doCommandBySelector:(SEL)sel {
-  if (sel == @selector(insertNewline:) && _onEnter) {
-    _onEnter();
-    return YES;
-  }
-  return NO;
-}
-- (void)mouseDown:(NSEvent*)e {
-  [self.window makeFirstResponder:_field];
-}
-@end
-
-/* ------------------------------------------------ a spinner (turns on the GPU), a status dot */
-
-@interface SSSpinner : NSView
-- (instancetype)initWithSize:(CGFloat)size color:(NSColor*)color;
-@end
-
-@implementation SSSpinner {
-  CAShapeLayer* _arc;
-  CAShapeLayer* _track;
-  CGFloat _size;
-}
-- (instancetype)initWithSize:(CGFloat)size color:(NSColor*)color {
-  if ((self = [super initWithFrame:NSMakeRect(0, 0, size, size)])) {
-    self.translatesAutoresizingMaskIntoConstraints = NO;
-    self.wantsLayer = YES;
-    _size = size;
-    [NSLayoutConstraint activateConstraints:@[ [self.widthAnchor constraintEqualToConstant:size], [self.heightAnchor constraintEqualToConstant:size] ]];
-    CGFloat w = std::max<CGFloat>(2, size / 12);
-    CGPathRef full = CGPathCreateWithEllipseInRect(CGRectInset(CGRectMake(0, 0, size, size), w, w), nullptr);
-    _track = [CAShapeLayer layer];
-    _track.path = full;
-    _track.fillColor = nil;
-    _track.strokeColor = [color colorWithAlphaComponent:0.15].CGColor;
-    _track.lineWidth = w;
-    _arc = [CAShapeLayer layer];
-    _arc.path = full;
-    _arc.fillColor = nil;
-    _arc.strokeColor = color.CGColor;
-    _arc.lineWidth = w;
-    _arc.lineCap = kCALineCapRound;
-    _arc.strokeEnd = 0.32;
-    CGPathRelease(full);
-    _arc.frame = CGRectMake(0, 0, size, size);
-    _track.frame = _arc.frame;
-    [self.layer addSublayer:_track];
-    [self.layer addSublayer:_arc];
-    CABasicAnimation* spin = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
-    spin.fromValue = @0;
-    spin.toValue = @(-2 * M_PI);
-    spin.duration = 0.9;
-    spin.repeatCount = HUGE_VALF;
-    [_arc addAnimation:spin forKey:@"spin"];
-    CABasicAnimation* breathe = [CABasicAnimation animationWithKeyPath:@"strokeEnd"];
-    breathe.fromValue = @0.18;
-    breathe.toValue = @0.62;
-    breathe.duration = 0.85;
-    breathe.autoreverses = YES;
-    breathe.repeatCount = HUGE_VALF;
-    breathe.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-    [_arc addAnimation:breathe forKey:@"breathe"];
-  }
-  return self;
-}
-- (void)layout {
-  [super layout];
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  _arc.position = CGPointMake(self.bounds.size.width / 2, self.bounds.size.height / 2);
-  _arc.bounds = CGRectMake(0, 0, _size, _size);
-  _track.frame = self.bounds;
-  [CATransaction commit];
-}
-@end
-
-static NSView* makeDot(NSColor* color, CGFloat size = 9) {
-  NSView* d = [NSView new];
-  d.translatesAutoresizingMaskIntoConstraints = NO;
-  d.wantsLayer = YES;
-  d.layer.backgroundColor = color.CGColor;
-  d.layer.cornerRadius = size / 2;
-  d.layer.shadowColor = color.CGColor;
-  d.layer.shadowOpacity = 0.8;
-  d.layer.shadowRadius = 5;
-  d.layer.shadowOffset = CGSizeZero;
-  [NSLayoutConstraint activateConstraints:@[ [d.widthAnchor constraintEqualToConstant:size], [d.heightAnchor constraintEqualToConstant:size] ]];
-  return d;
-}
-
-static void setDotColor(NSView* d, NSColor* color) {
-  d.layer.backgroundColor = color.CGColor;
-  d.layer.shadowColor = color.CGColor;
-}
-
-/** A switch with its text. */
-static NSStackView* switchRow(NSSwitch* __strong* out, NSString* text, BOOL on, id target, SEL action) {
+static NSSwitch* makeSwitch(BOOL on) {
   NSSwitch* s = [NSSwitch new];
   s.state = on ? NSControlStateValueOn : NSControlStateValueOff;
-  s.target = target;
-  s.action = action;
   s.controlSize = NSControlSizeSmall;
-  *out = s;
-  return hstack(@[ s, label(text, 13.5, NSFontWeightRegular, textColor()) ], 10);
+  s.translatesAutoresizingMaskIntoConstraints = NO;
+  return s;
 }
+
+static NSButton* button(NSString* title, NSString* sym, id target, SEL action) {
+  NSButton* b = sym ? [NSButton buttonWithTitle:title image:symbol(sym, 13) target:target action:action] : [NSButton buttonWithTitle:title target:target action:action];
+  if (sym) b.imagePosition = NSImageLeading;
+  b.translatesAutoresizingMaskIntoConstraints = NO;
+  return b;
+}
+
+/** A button with only a symbol, no bezel (on the viewer's bar). */
+static NSButton* iconButton(NSString* sym, id target, SEL action) {
+  NSButton* b = [NSButton buttonWithImage:symbol(sym, 15) target:target action:action];
+  b.bordered = NO;
+  sizeTo(b, 30, 28);
+  return b;
+}
+
+/** One row of a settings group: the title on the left (and a line under it), the control right. */
+static NSStackView* formRow(NSString* title, NSString* sub, NSView* control) {
+  NSTextField* t = label(title, 13, NSFontWeightRegular, NSColor.labelColor);
+  NSView* text = t;
+  if (sub) {
+    NSStackView* two = vstack(@[ t, label(sub, 11, NSFontWeightRegular, NSColor.secondaryLabelColor) ], 1);
+    two.alignment = NSLayoutAttributeLeading;
+    text = two;
+  }
+  control.translatesAutoresizingMaskIntoConstraints = NO;
+  NSStackView* r = hstack(@[ text, spacer(), control ], 12);
+  r.edgeInsets = NSEdgeInsetsMake(7, 12, 7, 12);
+  [r.heightAnchor constraintGreaterThanOrEqualToConstant:40].active = YES;
+  return r;
+}
+
+/** The glass under the viewer's controls: Liquid Glass on macOS 26, the HUD blur before. */
+static NSView* glassCapsule(NSView* content, CGFloat radius) {
+  Class glass = NSClassFromString(@"NSGlassEffectView");
+  if (glass) {
+    NSView* g = [glass new];
+    @try {
+      [g setValue:@(radius) forKey:@"cornerRadius"];
+      [g setValue:content forKey:@"contentView"];
+      g.translatesAutoresizingMaskIntoConstraints = NO;
+      pin(content, g);
+      return g;
+    } @catch (NSException*) {
+    }
+  }
+  NSVisualEffectView* v = [NSVisualEffectView new];
+  v.material = NSVisualEffectMaterialHUDWindow;
+  v.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+  v.state = NSVisualEffectStateActive;
+  v.wantsLayer = YES;
+  v.layer.cornerRadius = radius;
+  v.layer.masksToBounds = YES;
+  v.translatesAutoresizingMaskIntoConstraints = NO;
+  [v addSubview:content];
+  pin(content, v);
+  return v;
+}
+
+/* ------------------------------------------------ a settings group (as in System Settings) */
+
+@interface SSGroup : NSView
+- (void)setRows:(NSArray<NSView*>*)rows;
+@end
+
+@implementation SSGroup {
+  NSStackView* _stack;
+}
+- (instancetype)init {
+  if ((self = [super initWithFrame:NSZeroRect])) {
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+    self.wantsLayer = YES;
+    self.layer.cornerRadius = 11;
+    self.layer.borderWidth = 1;
+    _stack = vstack(@[], 0);
+    [self addSubview:_stack];
+    pin(_stack, self);
+  }
+  return self;
+}
+- (BOOL)wantsUpdateLayer {
+  return YES;
+}
+- (void)updateLayer {
+  // the colours follow light and dark mode (updateLayer runs again when it changes)
+  BOOL dark = [[self.effectiveAppearance bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]] isEqualToString:NSAppearanceNameDarkAqua];
+  self.layer.backgroundColor = [NSColor colorWithWhite:dark ? 1 : 0 alpha:dark ? 0.055 : 0.035].CGColor;
+  self.layer.borderColor = [NSColor colorWithWhite:dark ? 1 : 0 alpha:dark ? 0.07 : 0.06].CGColor;
+}
+- (void)setRows:(NSArray<NSView*>*)rows {
+  for (NSView* v in [_stack.arrangedSubviews copy]) [v removeFromSuperview];
+  for (NSUInteger i = 0; i < rows.count; i++) {
+    if (i) {
+      NSBox* line = [NSBox new];
+      line.boxType = NSBoxSeparator;
+      sizeTo(line, 0, 1);
+      [_stack addArrangedSubview:line];
+      stretch(line, _stack, 12);
+    }
+    [_stack addArrangedSubview:rows[i]];
+    stretch(rows[i], _stack);
+  }
+}
+@end
 
 /* ------------------------------------------------ the video view (double click: full screen) */
 
@@ -652,6 +307,9 @@ static NSStackView* switchRow(NSSwitch* __strong* out, NSString* text, BOOL on, 
     self.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
   }
   return self;
+}
+- (BOOL)mouseDownCanMoveWindow {
+  return NO;
 }
 - (void)updateTrackingAreas {
   [super updateTrackingAreas];
@@ -679,31 +337,6 @@ static NSStackView* switchRow(NSSwitch* __strong* out, NSString* text, BOOL on, 
 
 /* ------------------------------------------------ one viewer in the sharer's list */
 
-@interface SSViewerRow : SSGlass
-- (void)update:(const Json&)v;
-@end
-
-@implementation SSViewerRow {
-  NSView* _dot;
-  NSTextField *_name, *_sub;
-  NSStackView* _pills;
-}
-- (instancetype)init {
-  if ((self = [super initWithRadius:16 strength:0.85])) {
-    _dot = makeDot(rgb(kOk));
-    _name = label(@"", 14, NSFontWeightSemibold, textColor());
-    _sub = label(@"", 12, NSFontWeightRegular, mutedColor());
-    _pills = hstack(@[], 6);
-    NSStackView* text = vstack(@[ _name, _sub ], 2);
-    NSStackView* row = hstack(@[ _dot, text, spacer(), _pills ], 12);
-    row.edgeInsets = NSEdgeInsetsMake(0, 18, 0, 14);
-    [self.content addSubview:row];
-    pin(row, self.content);
-    [self.heightAnchor constraintEqualToConstant:58].active = YES;
-  }
-  return self;
-}
-
 static NSString* pathName(const std::string& p) {
   static const std::map<std::string, std::string> names = {
       {"lan", "helyi hálózat"}, {"internet", "interneten át"}, {"relay", "a szerveren át"}, {"turn", "TURN relén át"}, {"tcp", "HTTPS-en át"}};
@@ -711,140 +344,149 @@ static NSString* pathName(const std::string& p) {
   return S(it == names.end() ? p : it->second);
 }
 
-static NSView* pill(NSString* text, NSColor* color) {
-  NSView* v = [NSView new];
-  v.translatesAutoresizingMaskIntoConstraints = NO;
-  v.wantsLayer = YES;
-  v.layer.backgroundColor = rgb(0xFFFFFF, 0.07).CGColor;
-  v.layer.cornerRadius = 13;
-  NSTextField* l = label(text, 12, NSFontWeightSemibold, color);
-  [v addSubview:l];
-  [NSLayoutConstraint activateConstraints:@[
-    [v.heightAnchor constraintEqualToConstant:26], [l.leadingAnchor constraintEqualToAnchor:v.leadingAnchor constant:10],
-    [l.trailingAnchor constraintEqualToAnchor:v.trailingAnchor constant:-10], [l.centerYAnchor constraintEqualToAnchor:v.centerYAnchor]
-  ]];
-  return v;
+static NSColor* latencyColor(double ms) {
+  return ms < 40 ? NSColor.systemGreenColor : ms < 90 ? NSColor.systemOrangeColor : NSColor.systemRedColor;
+}
+
+@interface SSViewerRow : NSView
+- (void)update:(const Json&)v;
+@end
+
+@implementation SSViewerRow {
+  NSView* _dot;
+  NSTextField *_name, *_sub, *_stats;
+}
+- (instancetype)init {
+  if ((self = [super initWithFrame:NSZeroRect])) {
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+    _dot = makeDot(NSColor.systemGreenColor);
+    _name = label(@"", 13, NSFontWeightMedium, NSColor.labelColor);
+    _sub = label(@"", 11, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    [_sub setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    _stats = label(@"", 11.5, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    _stats.font = [NSFont monospacedDigitSystemFontOfSize:11.5 weight:NSFontWeightRegular];
+    NSStackView* text = vstack(@[ _name, _sub ], 1);
+    text.alignment = NSLayoutAttributeLeading;
+    NSStackView* row = hstack(@[ _dot, text, spacer(), _stats ], 10);
+    row.edgeInsets = NSEdgeInsetsMake(8, 12, 8, 12);
+    [self addSubview:row];
+    pin(row, self);
+  }
+  return self;
 }
 
 - (void)update:(const Json&)v {
   std::string state = v["state"].str("");
   bool connected = state == "connected";
-  setDotColor(_dot, rgb(connected ? kOk : state == "unsupported" ? kErr : state == "retrying" ? kWarn : 0xA0A0B6));
+  setDotColor(_dot, connected ? NSColor.systemGreenColor : state == "unsupported" ? NSColor.systemRedColor : state == "retrying" ? NSColor.systemOrangeColor : NSColor.tertiaryLabelColor);
   _name.stringValue = [NSString stringWithFormat:@"Néző #%d", int(v["n"].num())];
   _sub.stringValue = connected                 ? [@"közvetlen mód · " stringByAppendingString:pathName(v["path"].str(""))]
                      : state == "unsupported" ? [@"nem tud nézni: " stringByAppendingString:S(v["whyText"].str(""))]
                      : state == "retrying"    ? [@"kapcsolat újra… " stringByAppendingString:S(v["whyText"].str(""))]
                                               : @"kapcsolódik…";
-  for (NSView* p in _pills.arrangedSubviews) [p removeFromSuperview];
-  if (!connected) return;
-  if (v["fps"].isNumber()) [_pills addArrangedSubview:pill([NSString stringWithFormat:@"%d FPS", int(v["fps"].num())], textColor())];
-  if (v["kbps"].isNumber()) [_pills addArrangedSubview:pill([NSString stringWithFormat:@"%.1f Mbit/s", v["kbps"].num() / 1000], textColor())];
-  if (v["rtt"].isNumber()) [_pills addArrangedSubview:pill([NSString stringWithFormat:@"RTT %d ms", int(std::lround(v["rtt"].num()))], textColor())];
-  if (v["lat"].isNumber()) {
-    double lat = v["lat"].num();
-    [_pills addArrangedSubview:pill([NSString stringWithFormat:@"késés ~%d ms", int(std::lround(lat))], rgb(lat < 40 ? kOk : lat < 90 ? kWarn : kErr))];
+  NSMutableAttributedString* s = [NSMutableAttributedString new];
+  NSDictionary* plain = @{NSFontAttributeName : _stats.font, NSForegroundColorAttributeName : NSColor.secondaryLabelColor};
+  auto add = [&](NSString* text, NSDictionary* attrs) {
+    if (s.length) [s appendAttributedString:[[NSAttributedString alloc] initWithString:@" · " attributes:plain]];
+    [s appendAttributedString:[[NSAttributedString alloc] initWithString:text attributes:attrs]];
+  };
+  if (connected) {
+    if (v["fps"].isNumber()) add([NSString stringWithFormat:@"%d FPS", int(v["fps"].num())], plain);
+    if (v["kbps"].isNumber()) add([NSString stringWithFormat:@"%.1f Mbit/s", v["kbps"].num() / 1000], plain);
+    if (v["rtt"].isNumber()) add([NSString stringWithFormat:@"RTT %d ms", int(std::lround(v["rtt"].num()))], plain);
+    if (v["lat"].isNumber()) {
+      double lat = v["lat"].num();
+      add([NSString stringWithFormat:@"~%d ms", int(std::lround(lat))],
+          @{NSFontAttributeName : [NSFont monospacedDigitSystemFontOfSize:11.5 weight:NSFontWeightSemibold], NSForegroundColorAttributeName : latencyColor(lat)});
+    }
   }
+  _stats.attributedStringValue = s;
 }
 @end
 
 /* ------------------------------------------------ the app */
 
-@interface SSApp : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@interface SSApp : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate>
 @end
 
 @implementation SSApp {
   NSWindow* _window;
   NSView *_stage, *_current;
-  NSView *_home, *_host, *_viewer, *_about;
+  NSView *_home, *_host, *_viewer;
+  NSStackView *_homeContent, *_hostContent;
+  NSPoint _anchor; // where the compact window's top centre goes back to after watching
+  bool _anchored, _homeAfterFullScreen;
   // home
-  SSField *_password, *_code, *_server;
+  NSSegmentedControl* _tabs;
+  NSStackView *_sharePane, *_watchPane;
+  NSSecureTextField* _password;
+  NSTextField* _code;
   NSSwitch *_remember, *_audio;
-  NSMutableArray<SSButton*>*_monitorChips, *_qualityChips;
+  NSPopUpButton *_displayPopup, *_qualityPopup;
   NSTextField *_qualityHint, *_shareError, *_joinError;
-  SSButton* _updateButton;
-  int _monitor, _quality;
+  NSButton *_shareButton, *_joinButton, *_updateButton;
   std::vector<MacDisplay> _displays;
   // sharing
-  NSTextField *_roomCode, *_link, *_status, *_info, *_badgeText, *_viewerCount;
-  NSView *_statusDot, *_badge, *_badgeDot, *_emptyViewers;
-  SSSpinner* _statusSpinner;
-  SSButton *_pauseButton, *_copyButton;
-  NSStackView* _viewerList;
+  NSView *_livePill, *_liveDot, *_statusDot;
+  NSTextField *_liveText, *_roomCode, *_link, *_status, *_info, *_viewerCount;
+  NSProgressIndicator* _statusSpinner;
+  NSButton *_pauseButton, *_copyButton;
+  SSGroup* _viewersGroup;
+  NSView* _noViewers;
   std::map<std::string, SSViewerRow*> _rows;
+  std::vector<std::string> _order;
   // watching
   SSVideoView* _video;
   NSView *_bar, *_overlay, *_viewDot;
   NSTextField *_viewTitle, *_viewInfo, *_overlayText;
+  NSProgressIndicator* _overlaySpinner;
   NSSlider* _volume;
-  SSButton* _muteButton;
+  NSButton* _muteButton;
   double _lastMove;
-  // about
-  SSButton *_checkButton, *_aboutUpdate;
-  NSTextField* _updateNote;
-  SSSpinner* _checkSpinner;
-  // the dialog
-  NSView* _modal;
-  NSTextField *_modalTitle, *_modalText;
-  SSButton *_modalOk, *_modalCancel;
-  void (^_modalAction)(void);
 
   std::unique_ptr<Engine> _engine;
   std::unique_ptr<MacHost> _hostPipe;
   std::unique_ptr<MacPlayer> _player;
   std::unique_ptr<MacAudioOut> _audioOut;
   int _session;
-  bool _live, _picture, _stats, _muted, _checking;
+  bool _live, _picture, _stats, _muted, _checking, _barHidden;
   std::string _roomLink, _statusKind;
   Json _viewStats;
-  NSTimer* _timer;
   NSString *_updateFile, *_updateVersion;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification*)n {
-  [NSApp setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
   [self makeMenu];
-  _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1100, 780)
-                                        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable |
-                                                  NSWindowStyleMaskFullSizeContentView
+  _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, kHomeWidth + 2 * kSide, 560)
+                                        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView
                                           backing:NSBackingStoreBuffered
                                             defer:NO];
   _window.title = @"Screen Share";
   _window.titlebarAppearsTransparent = YES;
   _window.titleVisibility = NSWindowTitleHidden;
-  _window.minSize = NSMakeSize(980, 720);
+  _window.movableByWindowBackground = YES;
   _window.delegate = self;
-  _window.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
-  // the window: the desktop behind it, blurred and darkened; coloured light; the screens; the dialog
+  _window.collectionBehavior = NSWindowCollectionBehaviorFullScreenNone;
+  // the window's own background: what is behind it, blurred – as the system's panels
   NSVisualEffectView* root = [NSVisualEffectView new];
   root.material = NSVisualEffectMaterialUnderWindowBackground;
   root.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-  root.state = NSVisualEffectStateActive;
+  root.state = NSVisualEffectStateFollowsWindowActiveState;
   _window.contentView = root;
-  NSView* shade = [NSView new];
-  shade.wantsLayer = YES;
-  shade.layer.backgroundColor = rgb(0x06060C, 0.55).CGColor;
-  [root addSubview:shade];
-  pin(shade, root);
-  SSLights* lights = [SSLights new];
-  [root addSubview:lights];
-  pin(lights, root);
   _stage = [SSFlipped new];
   _stage.wantsLayer = YES;
   [root addSubview:_stage];
   pin(_stage, root);
   _live = true;
-  _monitor = 0;
-  _quality = int(std::min<NSInteger>([NSUserDefaults.standardUserDefaults integerForKey:@"quality"], NSInteger(std::size(kQualities)) - 1));
   [self makeHome];
   [self makeHost];
   [self makeViewer];
-  [self makeAbout];
-  [self makeModal:root];
   [self show:_home];
+  [self fitWindow:NO];
   [_window center];
   [_window makeKeyAndOrderFront:nil];
   [NSApp activateIgnoringOtherApps:YES];
-  _timer = [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+  [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(tick) userInfo:nil repeats:YES];
   [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(barTick) userInfo:nil repeats:YES];
   [self checkUpdatesLater];
   __weak SSApp* weak = self;
@@ -857,30 +499,23 @@ static NSView* pill(NSString* text, NSColor* color) {
 
 - (NSEvent*)key:(NSEvent*)e {
   if (e.modifierFlags & NSEventModifierFlagCommand) return e;
+  if (e.window != _window || _window.attachedSheet || _current != _viewer) return e;
   NSString* k = e.charactersIgnoringModifiers.lowercaseString;
-  if (!_modal.hidden) {
-    if (e.keyCode == 53) [self closeModal:NO]; // Esc
-    else if (e.keyCode == 36) [self closeModal:YES]; // Return
-    return nil;
-  }
-  if (_current == _viewer) {
-    if ([k isEqualToString:@"f"]) [_window toggleFullScreen:nil];
-    else if ([k isEqualToString:@"s"]) {
-      _stats = !_stats;
-      [self tick];
-    } else if ([k isEqualToString:@"m"]) [self setMuted:!_muted];
-    else return e;
-    [self moved];
-    return nil;
-  }
-  if (_current == _about && e.keyCode == 53) {
-    [self show:_home];
-    return nil;
-  }
-  return e;
+  if ([k isEqualToString:@"f"]) [_window toggleFullScreen:nil];
+  else if ([k isEqualToString:@"s"]) {
+    _stats = !_stats;
+    [self tick];
+  } else if ([k isEqualToString:@"m"]) [self setMuted:!_muted];
+  else return e;
+  [self moved];
+  return nil;
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)a {
+  return YES;
+}
+
+- (BOOL)applicationSupportsSecureRestorableState:(NSApplication*)a {
   return YES;
 }
 
@@ -896,11 +531,19 @@ static NSView* pill(NSString* text, NSColor* color) {
   [app addItemWithTitle:@"A Screen Share névjegye" action:@selector(showAbout) keyEquivalent:@""];
   [app addItemWithTitle:@"Frissítések keresése…" action:@selector(checkUpdatesNow) keyEquivalent:@""];
   [app addItem:[NSMenuItem separatorItem]];
+  [app addItemWithTitle:@"A Screen Share elrejtése" action:@selector(hide:) keyEquivalent:@"h"];
+  [app addItemWithTitle:@"A többi elrejtése" action:@selector(hideOtherApplications:) keyEquivalent:@"h"].keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagOption;
+  [app addItemWithTitle:@"Az összes megjelenítése" action:@selector(unhideAllApplications:) keyEquivalent:@""];
+  [app addItem:[NSMenuItem separatorItem]];
   [app addItemWithTitle:@"Kilépés a Screen Share-ből" action:@selector(terminate:) keyEquivalent:@"q"];
   appItem.submenu = app;
   NSMenuItem* editItem = [NSMenuItem new];
   [bar addItem:editItem];
   NSMenu* edit = [[NSMenu alloc] initWithTitle:@"Szerkesztés"];
+  [edit addItemWithTitle:@"Visszavonás" action:@selector(undo:) keyEquivalent:@"z"];
+  [edit addItemWithTitle:@"Ismét" action:@selector(redo:) keyEquivalent:@"Z"];
+  [edit addItem:[NSMenuItem separatorItem]];
   [edit addItemWithTitle:@"Kivágás" action:@selector(cut:) keyEquivalent:@"x"];
   [edit addItemWithTitle:@"Másolás" action:@selector(copy:) keyEquivalent:@"c"];
   [edit addItemWithTitle:@"Beillesztés" action:@selector(paste:) keyEquivalent:@"v"];
@@ -912,315 +555,360 @@ static NSView* pill(NSString* text, NSColor* color) {
   [view addItemWithTitle:@"Teljes képernyő" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask =
       NSEventModifierFlagCommand | NSEventModifierFlagControl;
   viewItem.submenu = view;
+  NSMenuItem* windowItem = [NSMenuItem new];
+  [bar addItem:windowItem];
+  NSMenu* window = [[NSMenu alloc] initWithTitle:@"Ablak"];
+  [window addItemWithTitle:@"Kis méret" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+  [window addItemWithTitle:@"Nagyítás" action:@selector(performZoom:) keyEquivalent:@""];
+  windowItem.submenu = window;
   NSApp.mainMenu = bar;
+  NSApp.windowsMenu = window;
 }
 
-/* ---- pieces */
+/* ---- the standard About panel: icon, name, version (build), copyright – as every Mac app's */
 
-- (NSView*)logo:(CGFloat)size {
-  NSView* v = [NSView new];
-  v.translatesAutoresizingMaskIntoConstraints = NO;
-  NSView* bg = [NSView new]; // the gradient: a layer-hosting view of its own (no subviews in it)
-  CAGradientLayer* g = [CAGradientLayer layer];
-  g.colors = @[ (id)rgb(kAccent).CGColor, (id)rgb(kAccent2).CGColor ];
-  g.startPoint = CGPointMake(0, 1);
-  g.endPoint = CGPointMake(1, 0);
-  g.cornerRadius = size * 0.3;
-  g.borderWidth = 1;
-  g.borderColor = rgb(0xFFFFFF, 0.4).CGColor;
-  g.shadowColor = rgb(kAccent).CGColor;
-  g.shadowOpacity = 0.5;
-  g.shadowRadius = size * 0.35;
-  g.shadowOffset = CGSizeZero;
-  bg.layer = g;
-  bg.wantsLayer = YES;
-  [v addSubview:bg];
-  pin(bg, v);
-  NSImageView* icon = [NSImageView imageViewWithImage:symbol(@"display", size * 0.42, NSFontWeightSemibold) ?: [NSImage new]];
-  icon.translatesAutoresizingMaskIntoConstraints = NO;
-  icon.contentTintColor = NSColor.whiteColor;
-  [v addSubview:icon];
-  [NSLayoutConstraint activateConstraints:@[
-    [v.widthAnchor constraintEqualToConstant:size], [v.heightAnchor constraintEqualToConstant:size], [icon.centerXAnchor constraintEqualToAnchor:v.centerXAnchor],
-    [icon.centerYAnchor constraintEqualToAnchor:v.centerYAnchor]
-  ]];
-  return v;
+- (void)showAbout {
+  NSMutableParagraphStyle* centred = [NSMutableParagraphStyle new];
+  centred.alignment = NSTextAlignmentCenter;
+  NSDictionary* small = @{
+    NSFontAttributeName : [NSFont systemFontOfSize:11],
+    NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
+    NSParagraphStyleAttributeName : centred
+  };
+  NSMutableAttributedString* credits = [NSMutableAttributedString new];
+  NSMutableDictionary* link = [small mutableCopy];
+  link[NSLinkAttributeName] = [NSURL URLWithString:kSite];
+  [credits appendAttributedString:[[NSAttributedString alloc] initWithString:@"mozizas.hu" attributes:link]];
+  [credits appendAttributedString:[[NSAttributedString alloc] initWithString:@"\nBearSSL (MIT) · Opus (BSD)" attributes:small]];
+  [NSApp orderFrontStandardAboutPanelWithOptions:@{
+    NSAboutPanelOptionApplicationName : @"Screen Share",
+    NSAboutPanelOptionApplicationVersion : @SS_VERSION,
+    NSAboutPanelOptionVersion : @SS_BUILD,
+    NSAboutPanelOptionCredits : credits
+  }];
+  [NSApp activateIgnoringOtherApps:YES];
 }
 
-- (NSView*)badgeIcon:(NSString*)sym color:(uint32_t)color {
-  NSView* v = [NSView new];
-  v.translatesAutoresizingMaskIntoConstraints = NO;
-  v.wantsLayer = YES;
-  v.layer.backgroundColor = rgb(color, 0.17).CGColor;
-  v.layer.cornerRadius = 11;
-  NSImageView* icon = [NSImageView imageViewWithImage:symbol(sym, 16) ?: [NSImage new]];
-  icon.translatesAutoresizingMaskIntoConstraints = NO;
-  icon.contentTintColor = rgb(color == kAccent2 ? 0xB49CFF : color);
-  [v addSubview:icon];
-  [NSLayoutConstraint activateConstraints:@[
-    [v.widthAnchor constraintEqualToConstant:38], [v.heightAnchor constraintEqualToConstant:38], [icon.centerXAnchor constraintEqualToAnchor:v.centerXAnchor],
-    [icon.centerYAnchor constraintEqualToAnchor:v.centerYAnchor]
-  ]];
-  return v;
+/* ---- the window: compact for home and sharing (as tall as its content), large for watching */
+
+- (NSStackView*)compactContent {
+  return _current == _home ? _homeContent : _current == _host ? _hostContent : nil;
 }
 
-- (NSStackView*)cardTitle:(NSString*)title sub:(NSString*)sub symbol:(NSString*)sym color:(uint32_t)color {
-  return hstack(@[ [self badgeIcon:sym color:color], vstack(@[ label(title, 17, NSFontWeightSemibold, textColor()), label(sub, 12.5, NSFontWeightRegular, mutedColor()) ], 2) ], 14);
+- (NSRect)clamp:(NSRect)f {
+  NSRect vis = (_window.screen ?: NSScreen.mainScreen).visibleFrame;
+  f.size.width = std::min(f.size.width, vis.size.width);
+  f.size.height = std::min(f.size.height, vis.size.height);
+  f.origin.x = std::max(NSMinX(vis), std::min(f.origin.x, NSMaxX(vis) - f.size.width));
+  f.origin.y = std::max(NSMinY(vis), std::min(f.origin.y, NSMaxY(vis) - f.size.height));
+  return f;
 }
 
-- (NSTextField*)caption:(NSString*)text {
-  return label(text, 12.5, NSFontWeightMedium, mutedColor());
+- (void)setWindowFrame:(NSRect)f animate:(BOOL)animate {
+  f = NSIntegralRect([self clamp:f]);
+  if (NSEqualRects(f, _window.frame)) return;
+  if (!animate || !_window.visible) {
+    [_window setFrame:f display:YES];
+    return;
+  }
+  NSWindow* w = _window;
+  [NSAnimationContext runAnimationGroup:^(NSAnimationContext* ctx) {
+    ctx.duration = 0.32;
+    ctx.timingFunction = [CAMediaTimingFunction functionWithControlPoints:0.2:0.9:0.25:1];
+    [w.animator setFrame:f display:YES];
+  }];
 }
 
-/** The screen's content: centred, at most `maxWidth` wide, below the title bar. */
-- (NSView*)screenWith:(NSView*)content maxWidth:(CGFloat)maxWidth top:(CGFloat)top {
-  NSView* screen = [SSFlipped new];
-  [screen addSubview:content];
-  content.translatesAutoresizingMaskIntoConstraints = NO;
-  NSLayoutConstraint* full = [content.widthAnchor constraintEqualToAnchor:screen.widthAnchor constant:-72];
-  full.priority = NSLayoutPriorityDefaultHigh;
-  [NSLayoutConstraint activateConstraints:@[
-    full, [content.widthAnchor constraintLessThanOrEqualToConstant:maxWidth], [content.centerXAnchor constraintEqualToAnchor:screen.centerXAnchor],
-    [content.topAnchor constraintEqualToAnchor:screen.topAnchor constant:top]
-  ]];
-  return screen;
+/** The compact window as tall as what it shows, its top edge (and centre) where it was. */
+- (void)fitWindow:(BOOL)animate {
+  NSStackView* content = [self compactContent];
+  if (!content || (_window.styleMask & NSWindowStyleMaskFullScreen)) return;
+  NSSize fit = content.fittingSize;
+  NSSize sz = NSMakeSize(fit.width + 2 * kSide, fit.height + kTop + kBottom);
+  NSRect old = _window.frame;
+  NSPoint top = _anchored ? _anchor : NSMakePoint(NSMidX(old), NSMaxY(old));
+  _anchored = false;
+  [self setWindowFrame:NSMakeRect(top.x - sz.width / 2, top.y - sz.height, sz.width, sz.height) animate:animate];
 }
 
-- (SSButton*)chip:(NSString*)title action:(void (^)(void))action {
-  SSButton* b = [[SSButton alloc] initWithTitle:title symbol:nil style:SSChip];
-  b.onClick = action;
-  return b;
+- (NSRect)viewerFrame {
+  NSRect vis = (_window.screen ?: NSScreen.mainScreen).visibleFrame;
+  NSString* saved = [NSUserDefaults.standardUserDefaults stringForKey:@"viewerFrame"];
+  if (saved) {
+    NSRect r = NSRectFromString(saved);
+    if (r.size.width >= 640 && r.size.height >= 400 && NSIntersectsRect(r, vis)) return r;
+  }
+  CGFloat w = std::min<CGFloat>(1280, vis.size.width * 0.86), h = w * 9 / 16;
+  if (h > vis.size.height * 0.86) {
+    h = vis.size.height * 0.86;
+    w = h * 16 / 9;
+  }
+  NSRect old = _window.frame;
+  return NSMakeRect(NSMidX(old) - w / 2, NSMidY(old) - h / 2, w, h);
+}
+
+- (NSView*)titlebar {
+  return [_window standardWindowButton:NSWindowCloseButton].superview;
+}
+
+/** Another screen: a cross-fade, and the window changes size with it. */
+- (void)show:(NSView*)v {
+  if (!v || v == _current) return;
+  bool fromViewer = _current == _viewer, toViewer = v == _viewer;
+  fade(_stage, 0.24);
+  [_current removeFromSuperview];
+  [_stage addSubview:v];
+  pin(v, _stage);
+  _current = v;
+  if (toViewer) {
+    _anchor = NSMakePoint(NSMidX(_window.frame), NSMaxY(_window.frame));
+    _anchored = true;
+    _window.styleMask = _window.styleMask | NSWindowStyleMaskResizable;
+    _window.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
+    _window.minSize = NSMakeSize(640, 400);
+    [self setWindowFrame:[self viewerFrame] animate:YES];
+    [_window makeFirstResponder:_video];
+    _bar.alphaValue = 1;
+    _barHidden = false;
+    _lastMove = nowMs();
+  } else {
+    if (fromViewer) {
+      [NSUserDefaults.standardUserDefaults setObject:NSStringFromRect(_window.frame) forKey:@"viewerFrame"];
+      _window.styleMask = _window.styleMask & ~NSWindowStyleMaskResizable;
+      _window.collectionBehavior = NSWindowCollectionBehaviorFullScreenNone;
+      _window.minSize = NSMakeSize(200, 200);
+      [self titlebar].alphaValue = 1;
+    }
+    [self fitWindow:YES];
+    [_window makeFirstResponder:nil];
+  }
+}
+
+/* ---- questions: a sheet on the window */
+
+- (void)ask:(NSString*)title text:(NSString*)text ok:(NSString*)ok cancel:(NSString*)cancel danger:(BOOL)danger action:(void (^)(void))action {
+  NSAlert* a = [NSAlert new];
+  a.messageText = title;
+  a.informativeText = text ?: @"";
+  a.alertStyle = danger ? NSAlertStyleWarning : NSAlertStyleInformational;
+  NSButton* yes = [a addButtonWithTitle:ok];
+  if (danger) yes.hasDestructiveAction = YES;
+  if (cancel) [a addButtonWithTitle:cancel].keyEquivalent = @"\033";
+  [self moved];
+  [a beginSheetModalForWindow:_window
+            completionHandler:^(NSModalResponse r) {
+              if (r == NSAlertFirstButtonReturn && action) action();
+            }];
 }
 
 /* ---- home */
 
 - (void)makeHome {
-  __weak SSApp* weak = self;
   NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
-  // header
-  NSTextField* title = label(@"Screen Share", 26, NSFontWeightBold, textColor());
-  NSTextField* sub = label(@"4K képernyőmegosztás hanggal · saját, titkosított átvitel", 13, NSFontWeightRegular, mutedColor());
-  SSButton* about = [[SSButton alloc] initWithTitle:@"Névjegy" symbol:@"info.circle" style:SSGhost];
-  about.onClick = ^{ [weak showAbout]; };
-  NSStackView* header = hstack(@[ [self logo:46], vstack(@[ title, sub ], 2), spacer(), about ], 14);
+  NSImageView* icon = [NSImageView imageViewWithImage:NSApp.applicationIconImage];
+  icon.imageScaling = NSImageScaleProportionallyUpOrDown;
+  sizeTo(icon, 84, 84);
+  NSTextField* title = label(@"Screen Share", 22, NSFontWeightBold, NSColor.labelColor);
+  NSTextField* sub = label(@"Képernyőmegosztás hanggal, a lehető legkisebb késéssel.", 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+  _tabs = [NSSegmentedControl segmentedControlWithLabels:@[ @"Megosztás", @"Nézés" ] trackingMode:NSSegmentSwitchTrackingSelectOne target:self action:@selector(tabChanged)];
+  _tabs.translatesAutoresizingMaskIntoConstraints = NO;
+  _tabs.controlSize = NSControlSizeLarge;
+  for (NSInteger i = 0; i < 2; i++) [_tabs setWidth:132 forSegment:i];
+
   // sharing
-  _password = [[SSField alloc] initSecure:YES symbol:@"lock" placeholder:@"jelszó"];
-  _password.field.stringValue = loadPassword();
-  _password.onEnter = ^{ [weak share]; };
-  NSStackView* rememberRow = switchRow(&_remember, @"Jelszó megjegyzése", _password.field.stringValue.length > 0, nil, nil);
+  _password = [NSSecureTextField new];
+  _password.placeholderString = @"megosztási jelszó";
+  _password.bezelStyle = NSTextFieldRoundedBezel;
+  _password.stringValue = loadPassword();
+  sizeTo(_password, 210, 0);
+  _remember = makeSwitch(_password.stringValue.length > 0);
+  SSGroup* access = [SSGroup new];
+  [access setRows:@[ formRow(@"Jelszó", nil, _password), formRow(@"Jelszó megjegyzése", nil, _remember) ]];
   _displays = listDisplays();
-  _monitorChips = [NSMutableArray array];
-  NSStackView* monitors = vstack(@[], 8);
-  NSStackView* monitorRow = nil;
-  for (size_t i = 0; i < _displays.size(); i++) {
-    if (i % 2 == 0) {
-      monitorRow = hstack(@[], 8);
-      [monitors addArrangedSubview:monitorRow];
-    }
-    int index = int(i);
-    SSButton* c = [self chip:S(_displays[i].name) action:^{ [weak pickMonitor:index]; }];
-    [_monitorChips addObject:c];
-    [monitorRow addArrangedSubview:c];
+  _displayPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+  _displayPopup.autoenablesItems = NO;
+  for (const MacDisplay& d : _displays) [_displayPopup.menu addItemWithTitle:S(d.name) action:nil keyEquivalent:@""]; // same names allowed
+  if (_displays.empty()) {
+    [_displayPopup addItemWithTitle:@"Nem találok képernyőt"];
+    _displayPopup.enabled = NO;
   }
-  if (_displays.empty()) [monitors addArrangedSubview:label(@"Nem találok képernyőt.", 13, NSFontWeightRegular, rgb(kErr))];
-  _qualityChips = [NSMutableArray array];
-  NSStackView* qualities = vstack(@[], 8);
-  NSStackView* qrow = nil;
-  for (int i = 0; i < int(std::size(kQualities)); i++) {
-    if (i % 3 == 0) {
-      qrow = hstack(@[], 8);
-      qrow.distribution = NSStackViewDistributionFillEqually;
-      [qualities addArrangedSubview:qrow];
-      stretch(qrow, qualities);
-    }
-    SSButton* c = [self chip:@(kQualities[i].name) action:^{ [weak pickQuality:i]; }];
-    [_qualityChips addObject:c];
-    [qrow addArrangedSubview:c];
-  }
-  _qualityHint = label(@"", 12, NSFontWeightRegular, faintColor());
-  NSStackView* audioRow = switchRow(&_audio, @"A gép hangja is (macOS 13-tól)", !([ud objectForKey:@"audio"] && ![ud boolForKey:@"audio"]), nil, nil);
-  SSButton* shareButton = [[SSButton alloc] initWithTitle:@"Megosztás indítása" symbol:@"play.fill" style:SSPrimary];
-  shareButton.onClick = ^{ [weak share]; };
-  [shareButton.heightAnchor constraintEqualToConstant:48].active = YES;
-  _shareError = label(@"", 13, NSFontWeightMedium, rgb(kErr), true);
+  [_displayPopup selectItemAtIndex:0];
+  _qualityPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+  for (const Quality& q : kQualities) [_qualityPopup addItemWithTitle:@(q.name)];
+  [_qualityPopup selectItemAtIndex:std::min<NSInteger>(std::max<NSInteger>([ud integerForKey:@"quality"], 0), NSInteger(std::size(kQualities)) - 1)];
+  _qualityPopup.target = self;
+  _qualityPopup.action = @selector(qualityChanged);
+  _audio = makeSwitch(!([ud objectForKey:@"audio"] && ![ud boolForKey:@"audio"]));
+  SSGroup* picture = [SSGroup new];
+  [picture setRows:@[ formRow(@"Képernyő", nil, _displayPopup), formRow(@"Minőség", nil, _qualityPopup), formRow(@"A gép hangja", @"macOS 13-tól", _audio) ]];
+  _qualityHint = label(@"", 11, NSFontWeightRegular, NSColor.secondaryLabelColor, kHomeWidth - 24);
+  _shareButton = button(@"Megosztás indítása", nil, self, @selector(share));
+  _shareButton.controlSize = NSControlSizeLarge;
+  [_shareButton.widthAnchor constraintGreaterThanOrEqualToConstant:230].active = YES;
+  _shareError = label(@"", 12, NSFontWeightRegular, NSColor.systemRedColor, kHomeWidth);
+  _shareError.alignment = NSTextAlignmentCenter;
   _shareError.hidden = YES;
-  NSStackView* share = vstack(@[
-    [self cardTitle:@"Képernyő megosztása" sub:@"A képernyőd és a gép hangja – a lehető legkisebb késéssel." symbol:@"display" color:kAccent],
-    [self caption:@"Megosztási jelszó"], _password, rememberRow, [self caption:@"Képernyő"], monitors, [self caption:@"Minőség"], qualities, _qualityHint, audioRow,
-    shareButton, _shareError
-  ],
-                              12);
-  share.edgeInsets = NSEdgeInsetsMake(24, 24, 24, 24);
-  [share setCustomSpacing:20 afterView:share.arrangedSubviews[0]];
-  [share setCustomSpacing:16 afterView:rememberRow];
-  [share setCustomSpacing:16 afterView:monitors];
-  [share setCustomSpacing:16 afterView:audioRow];
-  for (NSView* v in @[ _password, qualities, shareButton, _shareError ]) stretch(v, share);
-  SSGlass* shareCard = [[SSGlass alloc] initWithRadius:20 strength:1];
-  [shareCard.content addSubview:share];
-  pin(share, shareCard.content);
+  _sharePane = vstack(@[ access, picture, _qualityHint, _shareButton, _shareError ], 14);
+  [_sharePane setCustomSpacing:6 afterView:picture];
+  [_sharePane setCustomSpacing:22 afterView:_qualityHint];
+  stretch(access, _sharePane);
+  stretch(picture, _sharePane);
+  stretch(_qualityHint, _sharePane, 12);
+
   // watching
-  _code = [[SSField alloc] initSecure:NO symbol:@"link" placeholder:@"pl. abc123 vagy https://mozizas.hu/#abc123"];
-  _code.onEnter = ^{ [weak join]; };
-  _code.onEdit = ^{ [weak clearJoinError]; };
-  SSButton* joinButton = [[SSButton alloc] initWithTitle:@"Csatlakozás" symbol:@"eye" style:SSPrimary];
-  joinButton.onClick = ^{ [weak join]; };
-  [joinButton.heightAnchor constraintEqualToConstant:48].active = YES;
-  _joinError = label(@"", 13, NSFontWeightMedium, rgb(kErr), true);
+  _code = [NSTextField new];
+  _code.placeholderString = @"abc123 vagy link";
+  _code.bezelStyle = NSTextFieldRoundedBezel;
+  _code.delegate = self;
+  sizeTo(_code, 220, 0);
+  SSGroup* room = [SSGroup new];
+  [room setRows:@[ formRow(@"Szobakód vagy link", nil, _code) ]];
+  NSTextField* hint = label(@"A megosztótól kapott 6 jelű kód, vagy a teljes link (pl. mozizas.hu/#abc123).", 11, NSFontWeightRegular,
+                            NSColor.secondaryLabelColor, kHomeWidth - 24);
+  _joinButton = button(@"Csatlakozás", nil, self, @selector(join));
+  _joinButton.controlSize = NSControlSizeLarge;
+  [_joinButton.widthAnchor constraintGreaterThanOrEqualToConstant:230].active = YES;
+  _joinError = label(@"", 12, NSFontWeightRegular, NSColor.systemRedColor, kHomeWidth);
+  _joinError.alignment = NSTextAlignmentCenter;
   _joinError.hidden = YES;
-  NSBox* line = [NSBox new];
-  line.boxType = NSBoxSeparator;
-  line.translatesAutoresizingMaskIntoConstraints = NO;
-  _server = [[SSField alloc] initSecure:NO symbol:@"bolt.fill" placeholder:@"https://mozizas.hu"];
-  _server.field.stringValue = [ud stringForKey:@"server"] ?: @"https://mozizas.hu";
-  NSStackView* join = vstack(@[
-    [self cardTitle:@"Megosztás nézése" sub:@"Írd be a szobakódot, vagy illeszd be a kapott linket." symbol:@"eye" color:kAccent2],
-    [self caption:@"Szobakód vagy link"], _code, joinButton, _joinError, line, [self caption:@"Szerver"], _server,
-    label(@"Csak akkor írd át, ha saját szervered van.", 12, NSFontWeightRegular, faintColor()), spacer()
-  ],
-                             12);
-  join.edgeInsets = NSEdgeInsetsMake(24, 24, 24, 24);
-  [join setCustomSpacing:20 afterView:join.arrangedSubviews[0]];
-  [join setCustomSpacing:16 afterView:_code];
-  [join setCustomSpacing:26 afterView:_joinError];
-  [join setCustomSpacing:22 afterView:line];
-  for (NSView* v in @[ _code, joinButton, _joinError, line, _server ]) stretch(v, join);
-  SSGlass* joinCard = [[SSGlass alloc] initWithRadius:20 strength:1];
-  [joinCard.content addSubview:join];
-  pin(join, joinCard.content);
-  NSStackView* cards = hstack(@[ shareCard, joinCard ], 20);
-  cards.alignment = NSLayoutAttributeTop;
-  cards.distribution = NSStackViewDistributionFillEqually;
-  [joinCard.heightAnchor constraintEqualToAnchor:shareCard.heightAnchor].active = YES;
-  // footer
-  _updateButton = [[SSButton alloc] initWithTitle:@"" symbol:@"arrow.down.circle" style:SSPrimary];
-  _updateButton.onClick = ^{ [weak installUpdate]; };
+  _watchPane = vstack(@[ room, hint, _joinButton, _joinError ], 14);
+  [_watchPane setCustomSpacing:6 afterView:room];
+  [_watchPane setCustomSpacing:22 afterView:hint];
+  stretch(room, _watchPane);
+  stretch(hint, _watchPane, 12);
+
+  _updateButton = button(@"", @"arrow.down.circle", self, @selector(installUpdate));
+  _updateButton.controlSize = NSControlSizeSmall;
   _updateButton.hidden = YES;
-  NSStackView* footer =
-      hstack(@[ label([NSString stringWithFormat:@"Screen Share %s · natív alkalmazás", SS_VERSION], 12, NSFontWeightRegular, faintColor()), spacer(), _updateButton ], 12);
-  NSStackView* all = vstack(@[ header, cards, footer ], 22);
-  for (NSView* v in @[ header, cards, footer ]) stretch(v, all);
-  _home = [self screenWith:all maxWidth:1060 top:48];
-  [self pickMonitor:0];
-  [self pickQuality:_quality];
+  _homeContent = vstack(@[ icon, title, sub, _tabs, _sharePane, _watchPane, _updateButton ], 4);
+  [_homeContent setCustomSpacing:12 afterView:icon];
+  [_homeContent setCustomSpacing:24 afterView:sub];
+  [_homeContent setCustomSpacing:22 afterView:_tabs];
+  [_homeContent setCustomSpacing:20 afterView:_sharePane];
+  [_homeContent setCustomSpacing:20 afterView:_watchPane];
+  stretch(_sharePane, _homeContent);
+  stretch(_watchPane, _homeContent);
+  _home = [self screenWith:_homeContent width:kHomeWidth];
+  _tabs.selectedSegment = [ud integerForKey:@"tab"] == 1 ? 1 : 0;
+  [self qualityChanged];
+  [self applyTab];
 }
 
-- (void)pickMonitor:(int)i {
-  _monitor = i;
-  for (NSUInteger k = 0; k < _monitorChips.count; k++) _monitorChips[k].selected = int(k) == i;
+/** A compact screen: the content at a fixed width, centred, below the title bar. */
+- (NSView*)screenWith:(NSStackView*)content width:(CGFloat)width {
+  NSView* screen = [SSFlipped new];
+  [screen addSubview:content];
+  [NSLayoutConstraint activateConstraints:@[
+    [content.widthAnchor constraintEqualToConstant:width], [content.centerXAnchor constraintEqualToAnchor:screen.centerXAnchor],
+    [content.topAnchor constraintEqualToAnchor:screen.topAnchor constant:kTop]
+  ]];
+  return screen;
 }
 
-- (void)pickQuality:(int)i {
-  _quality = i;
-  for (NSUInteger k = 0; k < _qualityChips.count; k++) _qualityChips[k].selected = int(k) == i;
+- (void)applyTab {
+  bool watch = _tabs.selectedSegment == 1;
+  _sharePane.hidden = watch;
+  _watchPane.hidden = !watch;
+  _shareButton.keyEquivalent = watch ? @"" : @"\r"; // Return: the button of the pane shown
+  _joinButton.keyEquivalent = watch ? @"\r" : @"";
+}
+
+- (void)tabChanged {
+  fade(_home, 0.2);
+  [self applyTab];
+  [NSUserDefaults.standardUserDefaults setInteger:_tabs.selectedSegment forKey:@"tab"];
+  [self fitWindow:YES];
+  if (_tabs.selectedSegment == 1) [_window makeFirstResponder:_code];
+  else if (!_password.stringValue.length) [_window makeFirstResponder:_password];
+}
+
+- (void)qualityChanged {
+  NSInteger i = std::max<NSInteger>(_qualityPopup.indexOfSelectedItem, 0);
   _qualityHint.stringValue = @(kQualities[i].hint);
 }
 
 - (void)setError:(NSTextField*)l text:(NSString*)text {
   l.stringValue = text ?: @"";
-  if (text.length) {
+  bool show = text.length > 0;
+  l.hidden = !show;
+  if (show) {
     l.alphaValue = 0;
-    l.hidden = NO;
     animateAlpha(l, 1);
-  } else {
-    l.hidden = YES;
   }
+  [self fitWindow:YES];
 }
 
-- (void)clearJoinError {
-  if (!_joinError.hidden) [self setError:_joinError text:@""];
+- (void)controlTextDidChange:(NSNotification*)n {
+  if (n.object == _code && !_joinError.hidden) [self setError:_joinError text:@""];
 }
 
 /* ---- sharing */
 
 - (void)makeHost {
-  __weak SSApp* weak = self;
-  NSTextField* title = label(@"Képernyőmegosztás", 24, NSFontWeightBold, textColor());
-  _badgeDot = makeDot(rgb(kAccent), 7);
-  _badgeText = label(@"ÉLŐ", 11.5, NSFontWeightBold, rgb(0xFFB3BF));
-  NSStackView* badgeRow = hstack(@[ _badgeDot, _badgeText ], 7);
-  badgeRow.edgeInsets = NSEdgeInsetsMake(0, 10, 0, 12);
-  _badge = badgeRow;
-  _badge.wantsLayer = YES;
-  _badge.layer.backgroundColor = rgb(kAccent, 0.18).CGColor;
-  _badge.layer.cornerRadius = 12;
-  [_badge.heightAnchor constraintEqualToConstant:24].active = YES;
-  _pauseButton = [[SSButton alloc] initWithTitle:@"Szünet" symbol:@"pause.fill" style:SSSecondary];
-  _pauseButton.onClick = ^{ [weak togglePause]; };
-  SSButton* stop = [[SSButton alloc] initWithTitle:@"Megosztás vége" symbol:@"stop.fill" style:SSDanger];
-  stop.onClick = ^{ [weak askStop]; };
-  NSStackView* header = hstack(@[ title, _badge, spacer(), _pauseButton, stop ], 12);
-  // the room
-  _roomCode = label(@"······", 46, NSFontWeightBold, rgb(0xFF8DA0));
-  _link = label(@"A link a kapcsolódás után jelenik meg…", 14, NSFontWeightRegular, faintColor());
-  NSView* well = [NSView new];
-  well.translatesAutoresizingMaskIntoConstraints = NO;
-  well.wantsLayer = YES;
-  well.layer.backgroundColor = rgb(0x0E0E18, 0.78).CGColor;
-  well.layer.cornerRadius = 12;
-  well.layer.borderWidth = 1;
-  well.layer.borderColor = rgb(0xFFFFFF, 0.14).CGColor;
-  NSImageView* linkIcon = [NSImageView imageViewWithImage:symbol(@"link", 13, NSFontWeightMedium) ?: [NSImage new]];
-  linkIcon.contentTintColor = faintColor();
-  NSStackView* linkInner = hstack(@[ linkIcon, _link ], 10);
-  [well addSubview:linkInner];
+  _liveDot = makeDot(NSColor.systemRedColor, 7);
+  _liveText = label(@"ÉLŐ", 11, NSFontWeightBold, NSColor.systemRedColor);
+  NSStackView* pill = hstack(@[ _liveDot, _liveText ], 6);
+  pill.edgeInsets = NSEdgeInsetsMake(3, 9, 3, 10);
+  pill.wantsLayer = YES;
+  pill.layer.cornerRadius = 10;
+  _livePill = pill;
+  NSTextField* caption = label(@"SZOBAKÓD", 11, NSFontWeightSemibold, NSColor.secondaryLabelColor);
+  _roomCode = label(@"······", 40, NSFontWeightBold, NSColor.labelColor);
+  _roomCode.font = [NSFont monospacedSystemFontOfSize:40 weight:NSFontWeightBold];
+  _roomCode.selectable = YES;
+  _link = label(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+  _link.lineBreakMode = NSLineBreakByTruncatingMiddle;
+  _link.selectable = YES;
+  [_link.widthAnchor constraintLessThanOrEqualToConstant:kHostWidth].active = YES;
+  _copyButton = button(@"Link másolása", @"doc.on.doc", self, @selector(copyLink));
+  _copyButton.controlSize = NSControlSizeLarge;
+  [_copyButton.widthAnchor constraintGreaterThanOrEqualToConstant:200].active = YES;
+  // how it goes
+  _statusSpinner = [NSProgressIndicator new];
+  _statusSpinner.style = NSProgressIndicatorStyleSpinning;
+  _statusSpinner.controlSize = NSControlSizeSmall;
+  _statusSpinner.displayedWhenStopped = NO;
+  sizeTo(_statusSpinner, 16, 16);
+  _statusDot = makeDot(NSColor.systemGreenColor);
+  _status = label(@"", 13, NSFontWeightRegular, NSColor.labelColor, kHostWidth - 60);
+  NSStackView* statusRow = hstack(@[ _statusSpinner, _statusDot, _status, spacer() ], 9);
+  statusRow.edgeInsets = NSEdgeInsetsMake(10, 12, 10, 12);
+  _info = label(@"", 11.5, NSFontWeightRegular, NSColor.secondaryLabelColor, kHostWidth - 24);
+  NSStackView* infoRow = hstack(@[ _info, spacer() ], 0);
+  infoRow.edgeInsets = NSEdgeInsetsMake(9, 12, 9, 12);
+  SSGroup* status = [SSGroup new];
+  [status setRows:@[ statusRow, infoRow ]];
+  // the viewers
+  _viewerCount = label(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+  NSStackView* viewersHead = hstack(@[ label(@"Nézők", 13, NSFontWeightSemibold, NSColor.labelColor), spacer(), _viewerCount ], 8);
+  viewersHead.edgeInsets = NSEdgeInsetsMake(0, 4, 0, 4);
+  NSView* none = [NSView new];
+  none.translatesAutoresizingMaskIntoConstraints = NO;
+  NSTextField* noneText = label(@"Még nincs néző – küldd el a linket vagy a kódot.", 12.5, NSFontWeightRegular, NSColor.secondaryLabelColor);
+  [none addSubview:noneText];
   [NSLayoutConstraint activateConstraints:@[
-    [well.heightAnchor constraintEqualToConstant:46], [linkInner.leadingAnchor constraintEqualToAnchor:well.leadingAnchor constant:16],
-    [linkInner.trailingAnchor constraintLessThanOrEqualToAnchor:well.trailingAnchor constant:-12], [linkInner.centerYAnchor constraintEqualToAnchor:well.centerYAnchor]
+    [none.heightAnchor constraintEqualToConstant:56], [noneText.centerXAnchor constraintEqualToAnchor:none.centerXAnchor],
+    [noneText.centerYAnchor constraintEqualToAnchor:none.centerYAnchor]
   ]];
-  _copyButton = [[SSButton alloc] initWithTitle:@"Link másolása" symbol:@"doc.on.doc" style:SSPrimary];
-  _copyButton.onClick = ^{ [weak copyLink]; };
-  [_copyButton.widthAnchor constraintEqualToConstant:190].active = YES;
-  [_copyButton.heightAnchor constraintEqualToConstant:46].active = YES;
-  NSStackView* linkRow = hstack(@[ well, _copyButton ], 12);
-  _statusSpinner = [[SSSpinner alloc] initWithSize:14 color:mutedColor()];
-  _statusDot = makeDot(rgb(kOk));
-  _status = label(@"", 13.5, NSFontWeightMedium, textColor());
-  NSStackView* statusRow = hstack(@[ _statusSpinner, _statusDot, _status ], 10);
-  _info = label(@"", 12.5, NSFontWeightRegular, mutedColor());
-  NSStackView* room = vstack(@[ label(@"SZOBAKÓD", 11.5, NSFontWeightBold, faintColor()), _roomCode, linkRow, statusRow, _info ], 10);
-  room.edgeInsets = NSEdgeInsetsMake(26, 26, 26, 26);
-  [room setCustomSpacing:2 afterView:room.arrangedSubviews[0]];
-  [room setCustomSpacing:16 afterView:linkRow];
-  [room setCustomSpacing:4 afterView:statusRow];
-  stretch(linkRow, room);
-  SSGlass* roomCard = [[SSGlass alloc] initWithRadius:20 strength:1];
-  [roomCard.content addSubview:room];
-  pin(room, roomCard.content);
-  // viewers
-  NSImageView* users = [NSImageView imageViewWithImage:symbol(@"person.2", 15) ?: [NSImage new]];
-  users.contentTintColor = mutedColor();
-  _viewerCount = label(@"0", 12, NSFontWeightBold, mutedColor());
-  NSView* count = [NSView new];
-  count.translatesAutoresizingMaskIntoConstraints = NO;
-  count.wantsLayer = YES;
-  count.layer.backgroundColor = rgb(0xFFFFFF, 0.08).CGColor;
-  count.layer.cornerRadius = 11;
-  [count addSubview:_viewerCount];
-  [NSLayoutConstraint activateConstraints:@[
-    [count.heightAnchor constraintEqualToConstant:22], [count.widthAnchor constraintGreaterThanOrEqualToConstant:28],
-    [_viewerCount.centerXAnchor constraintEqualToAnchor:count.centerXAnchor], [_viewerCount.centerYAnchor constraintEqualToAnchor:count.centerYAnchor],
-    [_viewerCount.leadingAnchor constraintGreaterThanOrEqualToAnchor:count.leadingAnchor constant:8]
-  ]];
-  NSStackView* viewersHead = hstack(@[ users, label(@"Nézők", 16, NSFontWeightSemibold, textColor()), count ], 8);
-  SSGlass* empty = [[SSGlass alloc] initWithRadius:18 strength:0.6];
-  NSImageView* emptyIcon = [NSImageView imageViewWithImage:symbol(@"person.2", 26, NSFontWeightRegular) ?: [NSImage new]];
-  emptyIcon.contentTintColor = faintColor();
-  NSStackView* emptyStack = vstack(@[ emptyIcon, label(@"Még nincs néző. Küldd el a linket vagy a kódot!", 14, NSFontWeightMedium, mutedColor()) ], 10);
-  emptyStack.alignment = NSLayoutAttributeCenterX;
-  [empty.content addSubview:emptyStack];
-  [NSLayoutConstraint activateConstraints:@[
-    [empty.heightAnchor constraintEqualToConstant:116], [emptyStack.centerXAnchor constraintEqualToAnchor:empty.content.centerXAnchor],
-    [emptyStack.centerYAnchor constraintEqualToAnchor:empty.content.centerYAnchor]
-  ]];
-  _emptyViewers = empty;
-  _viewerList = vstack(@[ _emptyViewers ], 8);
-  stretch(_emptyViewers, _viewerList);
-  NSStackView* all = vstack(@[ header, roomCard, viewersHead, _viewerList ], 20);
-  [all setCustomSpacing:26 afterView:roomCard];
-  [all setCustomSpacing:12 afterView:viewersHead];
-  for (NSView* v in @[ header, roomCard, _viewerList ]) stretch(v, all);
-  _host = [self screenWith:all maxWidth:1000 top:48];
+  _noViewers = none;
+  _viewersGroup = [SSGroup new];
+  [_viewersGroup setRows:@[ _noViewers ]];
+  _pauseButton = button(@"Szünet", @"pause.fill", self, @selector(togglePause));
+  NSButton* stop = button(@"Megosztás vége", nil, self, @selector(askStop));
+  stop.hasDestructiveAction = YES;
+  NSStackView* buttons = hstack(@[ _pauseButton, stop ], 10);
+  _hostContent = vstack(@[ _livePill, caption, _roomCode, _link, _copyButton, status, viewersHead, _viewersGroup, buttons ], 4);
+  [_hostContent setCustomSpacing:14 afterView:_livePill];
+  [_hostContent setCustomSpacing:0 afterView:caption];
+  [_hostContent setCustomSpacing:14 afterView:_link];
+  [_hostContent setCustomSpacing:24 afterView:_copyButton];
+  [_hostContent setCustomSpacing:22 afterView:status];
+  [_hostContent setCustomSpacing:7 afterView:viewersHead];
+  [_hostContent setCustomSpacing:22 afterView:_viewersGroup];
+  stretch(status, _hostContent);
+  stretch(viewersHead, _hostContent);
+  stretch(_viewersGroup, _hostContent);
+  _host = [self screenWith:_hostContent width:kHostWidth];
 }
 
 /* ---- watching */
@@ -1228,236 +916,72 @@ static NSView* pill(NSString* text, NSColor* color) {
 - (void)makeViewer {
   __weak SSApp* weak = self;
   _viewer = [SSFlipped new];
+  _viewer.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]; // over the picture: always dark
   _video = [[SSVideoView alloc] initWithFrame:NSZeroRect];
   _video.onDoubleClick = ^{ [weak fullScreen]; };
   _video.onMouseMove = ^{ [weak moved]; };
   [_viewer addSubview:_video];
   pin(_video, _viewer);
-  // the overlay: a spinner and what is happening
-  SSSpinner* spin = [[SSSpinner alloc] initWithSize:40 color:rgb(kAccent)];
-  _overlayText = label(@"", 15, NSFontWeightMedium, textColor(), true);
+  // while there is no picture: a spinner and what is happening
+  _overlaySpinner = [NSProgressIndicator new];
+  _overlaySpinner.style = NSProgressIndicatorStyleSpinning;
+  _overlaySpinner.displayedWhenStopped = NO;
+  sizeTo(_overlaySpinner, 32, 32);
+  _overlayText = label(@"", 14, NSFontWeightMedium, [NSColor colorWithWhite:1 alpha:0.85], 480);
   _overlayText.alignment = NSTextAlignmentCenter;
-  NSStackView* overlay = vstack(@[ spin, _overlayText ], 16);
-  overlay.alignment = NSLayoutAttributeCenterX;
-  _overlay = overlay;
+  _overlay = vstack(@[ _overlaySpinner, _overlayText ], 14);
   [_viewer addSubview:_overlay];
   [NSLayoutConstraint activateConstraints:@[
-    [_overlay.centerXAnchor constraintEqualToAnchor:_viewer.centerXAnchor], [_overlay.centerYAnchor constraintEqualToAnchor:_viewer.centerYAnchor],
-    [_overlayText.widthAnchor constraintLessThanOrEqualToConstant:520]
+    [_overlay.centerXAnchor constraintEqualToAnchor:_viewer.centerXAnchor], [_overlay.centerYAnchor constraintEqualToAnchor:_viewer.centerYAnchor]
   ]];
-  // the bar over the picture: glass, it fades away while the mouse rests
-  NSVisualEffectView* bar = [NSVisualEffectView new];
-  bar.material = NSVisualEffectMaterialHUDWindow;
-  bar.blendingMode = NSVisualEffectBlendingModeWithinWindow;
-  bar.state = NSVisualEffectStateActive;
-  bar.translatesAutoresizingMaskIntoConstraints = NO;
-  _bar = bar;
-  _viewDot = makeDot(rgb(kWarn));
-  _viewTitle = label(@"", 14.5, NSFontWeightSemibold, textColor());
-  _viewInfo = label(@"", 12.5, NSFontWeightRegular, mutedColor());
-  _muteButton = [[SSButton alloc] initWithTitle:@"" symbol:@"speaker.wave.2.fill" style:SSGhost];
-  _muteButton.onClick = ^{ [weak toggleMute]; };
+  // the controls: a floating glass capsule at the bottom, it fades away while the mouse rests
+  _viewDot = makeDot(NSColor.systemOrangeColor);
+  _viewTitle = label(@"", 13, NSFontWeightSemibold, NSColor.labelColor);
+  _viewInfo = label(@"", 12, NSFontWeightRegular, NSColor.secondaryLabelColor);
+  _viewInfo.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
+  [_viewInfo setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+  _muteButton = iconButton(@"speaker.wave.2.fill", self, @selector(toggleMute));
   _volume = [NSSlider sliderWithValue:100 minValue:0 maxValue:100 target:self action:@selector(volumeChanged)];
-  _volume.trackFillColor = rgb(kAccent);
   _volume.controlSize = NSControlSizeSmall;
-  [_volume.widthAnchor constraintEqualToConstant:120].active = YES;
-  SSButton* full = [[SSButton alloc] initWithTitle:@"" symbol:@"arrow.up.left.and.arrow.down.right" style:SSGhost];
-  full.onClick = ^{ [weak fullScreen]; };
-  SSButton* leave = [[SSButton alloc] initWithTitle:@"Kilépés" symbol:@"xmark" style:SSDanger];
-  leave.onClick = ^{ [weak stopToHome]; };
-  [leave.heightAnchor constraintEqualToConstant:36].active = YES;
-  NSStackView* row = hstack(@[ _viewDot, _viewTitle, _viewInfo, spacer(), _muteButton, _volume, full, leave ], 12);
-  [row setCustomSpacing:14 afterView:_viewTitle];
-  [bar addSubview:row];
-  [NSLayoutConstraint activateConstraints:@[
-    [row.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:84], [row.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-14],
-    [row.centerYAnchor constraintEqualToAnchor:bar.centerYAnchor]
-  ]];
+  sizeTo(_volume, 96, 0);
+  NSButton* full = iconButton(@"arrow.up.left.and.arrow.down.right", self, @selector(fullScreen));
+  NSButton* leave = button(@"Kilépés", nil, self, @selector(stopToHome));
+  leave.hasDestructiveAction = YES;
+  NSStackView* row = hstack(@[ _viewDot, _viewTitle, _viewInfo, _muteButton, _volume, full, leave ], 10);
+  [row setCustomSpacing:14 afterView:_viewInfo];
+  [row setCustomSpacing:4 afterView:_muteButton];
+  [row setCustomSpacing:14 afterView:full];
+  row.edgeInsets = NSEdgeInsetsMake(0, 20, 0, 9);
+  _bar = glassCapsule(row, 25);
   [_viewer addSubview:_bar];
   [NSLayoutConstraint activateConstraints:@[
-    [_bar.topAnchor constraintEqualToAnchor:_viewer.topAnchor], [_bar.leadingAnchor constraintEqualToAnchor:_viewer.leadingAnchor],
-    [_bar.trailingAnchor constraintEqualToAnchor:_viewer.trailingAnchor], [_bar.heightAnchor constraintEqualToConstant:56]
+    [_bar.heightAnchor constraintEqualToConstant:50], [_bar.centerXAnchor constraintEqualToAnchor:_viewer.centerXAnchor],
+    [_bar.bottomAnchor constraintEqualToAnchor:_viewer.bottomAnchor constant:-22],
+    [_bar.widthAnchor constraintLessThanOrEqualToAnchor:_viewer.widthAnchor constant:-40]
   ]];
 }
 
 - (void)moved {
   _lastMove = nowMs();
-  if (_bar.alphaValue < 1) animateAlpha(_bar, 1, 0.18);
+  if (_barHidden) {
+    _barHidden = false;
+    animateAlpha(_bar, 1, 0.18);
+    if (!(_window.styleMask & NSWindowStyleMaskFullScreen)) animateAlpha([self titlebar], 1, 0.18);
+  }
 }
 
 - (void)barTick {
-  // the bar fades away while the picture plays and the mouse rests
-  if (_current != _viewer || !_picture) return;
-  if (nowMs() - _lastMove > 2600 && _bar.alphaValue > 0 && _modal.hidden) {
-    animateAlpha(_bar, 0, 0.5);
-    if (_window.styleMask & NSWindowStyleMaskFullScreen) [NSCursor setHiddenUntilMouseMoves:YES];
-  }
-}
-
-/* ---- about */
-
-- (NSView*)feature:(NSString*)sym title:(NSString*)title text:(NSString*)text {
-  return hstack(@[ [self badgeIcon:sym color:kAccent2], vstack(@[ label(title, 14, NSFontWeightSemibold, textColor()), label(text, 12.5, NSFontWeightRegular, mutedColor()) ], 2) ],
-                12);
-}
-
-- (void)makeAbout {
-  __weak SSApp* weak = self;
-  SSButton* back = [[SSButton alloc] initWithTitle:@"Vissza" symbol:@"chevron.left" style:SSGhost];
-  back.onClick = ^{
-    SSApp* me = weak;
-    if (me) [me show:me->_home];
-  };
-  NSStackView* head = hstack(@[
-    [self logo:64], vstack(@[
-      label(@"Screen Share", 30, NSFontWeightBold, textColor()),
-      label([NSString stringWithFormat:@"Verzió %s · natív macOS-alkalmazás (Apple Silicon és Intel)", SS_VERSION], 13, NSFontWeightRegular, mutedColor())
-    ],
-                           4)
-  ],
-                             18);
-  NSTextField* about = label(@"Képernyőmegosztás hanggal, a lehető legkisebb késéssel. A képet a gép hardveres kódolója készíti, és saját, végig titkosított "
-                             @"átvitellel megy a nézőkhöz – két alkalmazás között közvetlenül, puffer nélkül. Böngésző, Electron és Chromium nélkül.",
-                             14, NSFontWeightRegular, textColor(), true);
-  NSStackView* f1 = hstack(@[ [self feature:@"bolt.fill" title:@"Kis késés" text:@"Közvetlen UDP-kapcsolat, pufferek nélkül"],
-                              [self feature:@"display" title:@"Akár 4K 60 FPS" text:@"VideoToolbox hardveres kódolás"] ],
-                           20);
-  NSStackView* f2 = hstack(@[ [self feature:@"waveform" title:@"A gép hangja" text:@"macOS 13-tól, semmit nem kell telepíteni"],
-                              [self feature:@"lock.fill" title:@"Végig titkosítva" text:@"X25519 + AES-GCM – a szerver sem látja a képet"] ],
-                           20);
-  for (NSStackView* f in @[ f1, f2 ]) {
-    f.distribution = NSStackViewDistributionFillEqually;
-    f.alignment = NSLayoutAttributeTop;
-  }
-  NSBox* line = [NSBox new];
-  line.boxType = NSBoxSeparator;
-  line.translatesAutoresizingMaskIntoConstraints = NO;
-  _checkButton = [[SSButton alloc] initWithTitle:@"Frissítések keresése" symbol:@"arrow.clockwise" style:SSSecondary];
-  _checkButton.onClick = ^{ [weak checkUpdatesNow]; };
-  _aboutUpdate = [[SSButton alloc] initWithTitle:@"" symbol:@"arrow.down.circle" style:SSPrimary];
-  _aboutUpdate.onClick = ^{ [weak installUpdate]; };
-  _aboutUpdate.hidden = YES;
-  _checkSpinner = [[SSSpinner alloc] initWithSize:16 color:mutedColor()];
-  _checkSpinner.hidden = YES;
-  _updateNote = label(@"", 13, NSFontWeightMedium, mutedColor());
-  NSStackView* updates = hstack(@[ _checkButton, _aboutUpdate, _checkSpinner, _updateNote ], 14);
-  SSButton* site = [[SSButton alloc] initWithTitle:@"mozizas.hu" symbol:@"link" style:SSGhost];
-  site.onClick = ^{ [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:kSite]]; };
-  SSButton* releases = [[SSButton alloc] initWithTitle:@"Letöltések (GitHub)" symbol:@"arrow.down.circle" style:SSGhost];
-  releases.onClick = ^{ [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:kReleases]]; };
-  NSStackView* links = hstack(@[ site, releases ], 4);
-  NSTextField* credits = label(@"Nyílt forrású részek: BearSSL (MIT) – titkosítás · Opus (BSD) – hang.", 12, NSFontWeightRegular, faintColor(), true);
-  NSStackView* card = vstack(@[ head, about, f1, f2, line, updates, links, credits ], 18);
-  card.edgeInsets = NSEdgeInsetsMake(30, 30, 30, 30);
-  [card setCustomSpacing:22 afterView:head];
-  [card setCustomSpacing:24 afterView:about];
-  [card setCustomSpacing:22 afterView:f2];
-  for (NSView* v in @[ about, f1, f2, line, credits ]) stretch(v, card);
-  SSGlass* glass = [[SSGlass alloc] initWithRadius:22 strength:1];
-  [glass.content addSubview:card];
-  pin(card, glass.content);
-  NSStackView* all = vstack(@[ back, glass ], 16);
-  stretch(glass, all);
-  _about = [self screenWith:all maxWidth:760 top:40];
-}
-
-- (void)showAbout {
-  [self show:_about];
-}
-
-/* ---- the dialog */
-
-- (void)makeModal:(NSView*)root {
-  __weak SSApp* weak = self;
-  _modal = [SSFlipped new];
-  _modal.wantsLayer = YES;
-  _modal.layer.backgroundColor = rgb(0x05050A, 0.6).CGColor;
-  _modal.hidden = YES;
-  [root addSubview:_modal];
-  pin(_modal, root);
-  _modalTitle = label(@"", 18, NSFontWeightSemibold, textColor());
-  _modalText = label(@"", 13.5, NSFontWeightRegular, mutedColor(), true);
-  _modalCancel = [[SSButton alloc] initWithTitle:@"Mégse" symbol:nil style:SSSecondary];
-  _modalCancel.onClick = ^{ [weak closeModal:NO]; };
-  _modalOk = [[SSButton alloc] initWithTitle:@"" symbol:nil style:SSDanger];
-  _modalOk.onClick = ^{ [weak closeModal:YES]; };
-  NSStackView* buttons = hstack(@[ _modalCancel, _modalOk ], 12);
-  buttons.distribution = NSStackViewDistributionFillEqually;
-  NSStackView* box = vstack(@[ _modalTitle, _modalText, buttons ], 14);
-  box.edgeInsets = NSEdgeInsetsMake(28, 28, 28, 28);
-  [box setCustomSpacing:26 afterView:_modalText];
-  stretch(_modalText, box);
-  stretch(buttons, box);
-  SSGlass* card = [[SSGlass alloc] initWithRadius:22 strength:1.4];
-  [card.content addSubview:box];
-  pin(box, card.content);
-  [_modal addSubview:card];
-  [NSLayoutConstraint activateConstraints:@[
-    [card.widthAnchor constraintEqualToConstant:440], [card.centerXAnchor constraintEqualToAnchor:_modal.centerXAnchor],
-    [card.centerYAnchor constraintEqualToAnchor:_modal.centerYAnchor]
-  ]];
-}
-
-- (void)ask:(NSString*)title text:(NSString*)text ok:(NSString*)ok cancel:(NSString*)cancel danger:(BOOL)danger action:(void (^)(void))action {
-  _modalTitle.stringValue = title;
-  _modalText.stringValue = text;
-  [_modalOk setTitle:ok symbol:nil];
-  _modalOk.style = danger ? SSDanger : SSPrimary;
-  _modalCancel.hidden = cancel == nil;
-  _modalAction = action;
-  _modal.alphaValue = 0;
-  _modal.hidden = NO;
-  [_window makeFirstResponder:nil];
-  animateAlpha(_modal, 1, 0.2);
-}
-
-- (void)closeModal:(BOOL)confirmed {
-  if (_modal.hidden) return;
-  void (^action)(void) = _modalAction;
-  _modalAction = nil;
-  NSView* modal = _modal;
-  [NSAnimationContext
-      runAnimationGroup:^(NSAnimationContext* ctx) {
-        ctx.duration = 0.16;
-        modal.animator.alphaValue = 0;
-      }
-      completionHandler:^{
-        modal.hidden = YES;
-      }];
-  if (confirmed && action) action();
-}
-
-/* ---- switching screens: a cross-fade */
-
-- (void)show:(NSView*)v {
-  if (!v || v == _current) return;
-  CATransition* t = [CATransition animation];
-  t.type = kCATransitionFade;
-  t.duration = 0.26;
-  t.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
-  [_stage.layer addAnimation:t forKey:@"swap"];
-  [_current removeFromSuperview];
-  [_stage addSubview:v];
-  pin(v, _stage);
-  _current = v;
-  if (v == _viewer) {
-    [_window makeFirstResponder:_video];
-    _bar.alphaValue = 1;
-    _lastMove = nowMs();
-  } else {
-    [_window makeFirstResponder:nil];
-  }
+  // the bar (and the window's buttons) fade away while the picture plays and the mouse rests
+  if (_current != _viewer || !_picture || _barHidden || _window.attachedSheet) return;
+  NSPoint m = [_bar convertPoint:_window.mouseLocationOutsideOfEventStream fromView:nil];
+  if (NSPointInRect(m, _bar.bounds) || nowMs() - _lastMove < 2600) return;
+  _barHidden = true;
+  animateAlpha(_bar, 0, 0.5);
+  if (!(_window.styleMask & NSWindowStyleMaskFullScreen)) animateAlpha([self titlebar], 0, 0.5);
+  if (_window.styleMask & NSWindowStyleMaskFullScreen) [NSCursor setHiddenUntilMouseMoves:YES];
 }
 
 /* ---- sessions */
-
-- (std::string)serverUrl {
-  std::string s = U([_server.field.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]);
-  while (!s.empty() && s.back() == '/') s.pop_back();
-  if (s.empty()) s = "https://mozizas.hu";
-  if (s.find("://") == std::string::npos) s = "https://" + s;
-  return s;
-}
 
 - (EngineCallbacks)callbacks:(int)session {
   EngineCallbacks cb;
@@ -1487,26 +1011,27 @@ static NSView* pill(NSString* text, NSColor* color) {
 }
 
 - (void)share {
-  NSString* pw = _password.field.stringValue;
+  NSString* pw = _password.stringValue;
   if (!pw.length) {
     [self setError:_shareError text:@"Add meg a megosztási jelszót."];
-    [_window makeFirstResponder:_password.field];
+    [_window makeFirstResponder:_password];
     return;
   }
   if (_displays.empty()) {
     [self setError:_shareError text:@"Nem találok képernyőt."];
     return;
   }
+  NSInteger quality = std::max<NSInteger>(_qualityPopup.indexOfSelectedItem, 0);
+  NSInteger monitor = std::max<NSInteger>(_displayPopup.indexOfSelectedItem, 0);
   NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
-  [ud setInteger:_quality forKey:@"quality"];
+  [ud setInteger:quality forKey:@"quality"];
   [ud setBool:_audio.state == NSControlStateValueOn forKey:@"audio"];
-  [ud setObject:S([self serverUrl]) forKey:@"server"];
   savePassword(_remember.state == NSControlStateValueOn ? pw : @"");
-  [self setError:_shareError text:@""];
+  _shareError.hidden = YES;
   [self endSession];
   int session = ++_session;
   EngineConfig cfg;
-  cfg.server = [self serverUrl];
+  cfg.server = kServer;
   cfg.webSocket = openMacWebSocket;
   cfg.encoderName = "VideoToolbox";
   EngineCallbacks cb = [self callbacks:session];
@@ -1517,9 +1042,9 @@ static NSView* pill(NSString* text, NSColor* color) {
   _engine.reset(new Engine(cfg, cb));
   _hostPipe.reset(new MacHost(*_engine));
   *host = _hostPipe.get();
-  const Quality& q = kQualities[_quality];
+  const Quality& q = kQualities[quality];
   MacHost::Options o;
-  if (_monitor >= 0 && _monitor < int(_displays.size())) o.display = _displays[size_t(_monitor)].id;
+  if (monitor < NSInteger(_displays.size())) o.display = _displays[size_t(monitor)].id;
   o.maxWidth = q.w;
   o.maxHeight = q.h;
   o.fps = q.fps;
@@ -1530,13 +1055,13 @@ static NSView* pill(NSString* text, NSColor* color) {
   _statusKind.clear();
   _roomCode.stringValue = @"······";
   _link.stringValue = @"A link a kapcsolódás után jelenik meg…";
-  _link.textColor = faintColor();
   _copyButton.enabled = NO;
-  _info.stringValue = @"";
+  _info.stringValue = @"A kép indul…";
   [self setStatus:@"Kapcsolódás a szerverhez…" kind:""];
   [self updateBadge];
   [self updateViewers:Json::array()];
-  [_pauseButton setTitle:@"Szünet" symbol:@"pause.fill"];
+  _pauseButton.title = @"Szünet";
+  _pauseButton.image = symbol(@"pause.fill", 13);
   [self show:_host];
   _engine->host(U(pw));
 }
@@ -1552,21 +1077,20 @@ static std::string parseCode(NSString* text) {
 }
 
 - (void)join {
-  [self watch:parseCode(_code.field.stringValue)];
+  [self watch:parseCode(_code.stringValue)];
 }
 
 - (void)watch:(const std::string&)code {
   if (code.size() < 4) {
     [self setError:_joinError text:@"Érvénytelen szobakód – írd be a 6 jelű kódot, vagy illeszd be a teljes linket."];
-    [_window makeFirstResponder:_code.field];
+    [_window makeFirstResponder:_code];
     return;
   }
-  [NSUserDefaults.standardUserDefaults setObject:S([self serverUrl]) forKey:@"server"];
-  [self setError:_joinError text:@""];
+  _joinError.hidden = YES;
   [self endSession];
   int session = ++_session;
   EngineConfig cfg;
-  cfg.server = [self serverUrl];
+  cfg.server = kServer;
   cfg.webSocket = openMacWebSocket;
   _player.reset(new MacPlayer(_video.layer));
   _audioOut.reset(new MacAudioOut());
@@ -1585,17 +1109,22 @@ static std::string parseCode(NSString* text) {
   _picture = false;
   _overlayText.stringValue = @"Csatlakozás a szobához…";
   _overlay.alphaValue = 1;
-  _overlay.hidden = NO;
+  [_overlaySpinner startAnimation:nil];
   _viewTitle.stringValue = S("Szoba: " + code);
   _viewInfo.stringValue = @"";
-  setDotColor(_viewDot, rgb(kWarn));
+  setDotColor(_viewDot, NSColor.systemOrangeColor);
   [self show:_viewer];
   engine->join(code);
 }
 
 - (void)stopToHome {
-  if (_window.styleMask & NSWindowStyleMaskFullScreen) [_window toggleFullScreen:nil];
   [self endSession];
+  [_overlaySpinner stopAnimation:nil];
+  if (_window.styleMask & NSWindowStyleMaskFullScreen) {
+    _homeAfterFullScreen = true; // the window first leaves full screen, then shrinks
+    [_window toggleFullScreen:nil];
+    return;
+  }
   [self show:_home];
 }
 
@@ -1609,27 +1138,29 @@ static std::string parseCode(NSString* text) {
 - (void)togglePause {
   _live = !_live;
   if (_engine) _engine->setLive(_live);
-  [_pauseButton setTitle:_live ? @"Szünet" : @"Folytatás" symbol:_live ? @"pause.fill" : @"play.fill"];
+  _pauseButton.title = _live ? @"Szünet" : @"Folytatás";
+  _pauseButton.image = symbol(_live ? @"pause.fill" : @"play.fill", 13);
   [self updateBadge];
 }
 
 - (void)updateBadge {
-  _badgeText.stringValue = _live ? @"ÉLŐ" : @"SZÜNETEL";
-  _badgeText.textColor = _live ? rgb(0xFFB3BF) : mutedColor();
-  setDotColor(_badgeDot, _live ? rgb(kAccent) : mutedColor());
-  _badge.layer.backgroundColor = (_live ? rgb(kAccent, 0.18) : rgb(0xFFFFFF, 0.08)).CGColor;
+  NSColor* c = _live ? NSColor.systemRedColor : NSColor.secondaryLabelColor;
+  _liveText.stringValue = _live ? @"ÉLŐ" : @"SZÜNETEL";
+  _liveText.textColor = c;
+  setDotColor(_liveDot, c);
+  _livePill.layer.backgroundColor = [c colorWithAlphaComponent:0.15].CGColor;
 }
 
 - (void)copyLink {
   if (_roomLink.empty()) return;
   [NSPasteboard.generalPasteboard clearContents];
   [NSPasteboard.generalPasteboard setString:S(_roomLink) forType:NSPasteboardTypeString];
-  [_copyButton setTitle:@"Kimásolva" symbol:@"checkmark"];
-  _copyButton.style = SSSuccess;
-  __weak SSButton* b = _copyButton;
+  _copyButton.title = @"Kimásolva";
+  _copyButton.image = symbol(@"checkmark", 13, NSFontWeightSemibold);
+  __weak NSButton* b = _copyButton;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-    [b setTitle:@"Link másolása" symbol:@"doc.on.doc"];
-    b.style = SSPrimary;
+    b.title = @"Link másolása";
+    b.image = symbol(@"doc.on.doc", 13);
   });
 }
 
@@ -1648,7 +1179,7 @@ static std::string parseCode(NSString* text) {
 - (void)setMuted:(bool)m {
   _muted = m;
   if (_audioOut) _audioOut->setVolume(m ? 0.0f : float(_volume.doubleValue / 100));
-  [_muteButton setTitle:@"" symbol:m ? @"speaker.slash.fill" : @"speaker.wave.2.fill"];
+  _muteButton.image = symbol(m ? @"speaker.slash.fill" : @"speaker.wave.2.fill", 15);
 }
 
 /* ---- engine events (main thread) */
@@ -1657,48 +1188,42 @@ static std::string parseCode(NSString* text) {
   _statusKind = kind;
   _status.stringValue = text ?: @"";
   bool connecting = kind.empty();
+  if (connecting) [_statusSpinner startAnimation:nil];
+  else [_statusSpinner stopAnimation:nil];
   _statusSpinner.hidden = !connecting;
   _statusDot.hidden = connecting;
-  NSColor* c = kind == "ok" ? rgb(kOk) : kind == "warn" ? rgb(kWarn) : kind == "error" ? rgb(kErr) : textColor();
-  _status.textColor = c;
+  NSColor* c = kind == "ok" ? NSColor.systemGreenColor : kind == "warn" ? NSColor.systemOrangeColor : kind == "error" ? NSColor.systemRedColor : NSColor.labelColor;
+  _status.textColor = kind == "error" ? NSColor.systemRedColor : NSColor.labelColor;
   if (!connecting) setDotColor(_statusDot, c);
+  [self fitWindow:YES];
 }
 
 - (void)updateViewers:(const Json&)list {
   std::vector<Json> items = list.items();
   std::sort(items.begin(), items.end(), [](const Json& a, const Json& b) { return a["n"].num() < b["n"].num(); });
-  std::map<std::string, bool> present;
-  for (const Json& v : items) present[v["id"].str("")] = true;
-  // the ones gone: out
-  for (auto it = _rows.begin(); it != _rows.end();) {
-    if (!present.count(it->first)) {
-      SSViewerRow* row = it->second;
-      [row removeFromSuperview];
-      it = _rows.erase(it);
-    } else {
-      ++it;
-    }
-  }
-  // the new ones fade in; all in their order
-  NSUInteger index = 0;
+  std::vector<std::string> order;
+  for (const Json& v : items) order.push_back(v["id"].str(""));
+  for (auto it = _rows.begin(); it != _rows.end();)
+    it = std::find(order.begin(), order.end(), it->first) == order.end() ? _rows.erase(it) : std::next(it);
+  NSMutableArray<NSView*>* rows = [NSMutableArray array];
   for (const Json& v : items) {
     std::string id = v["id"].str("");
     SSViewerRow* row = _rows.count(id) ? _rows[id] : nil;
     if (!row) {
       row = [SSViewerRow new];
       row.alphaValue = 0;
-      _rows[id] = row;
-      [_viewerList insertArrangedSubview:row atIndex:index];
-      stretch(row, _viewerList);
       animateAlpha(row, 1, 0.3);
+      _rows[id] = row;
     }
     [row update:v];
-    index++;
+    [rows addObject:row];
   }
-  _emptyViewers.hidden = !items.empty();
-  _viewerCount.stringValue = [NSString stringWithFormat:@"%d", int(items.size())];
-  _viewerCount.textColor = items.empty() ? mutedColor() : rgb(0xFFB3BF);
-  _viewerCount.superview.layer.backgroundColor = (items.empty() ? rgb(0xFFFFFF, 0.08) : rgb(kAccent, 0.2)).CGColor;
+  if (order != _order) { // someone came or went: the list anew, the window as tall as it
+    _order = order;
+    [_viewersGroup setRows:rows.count ? rows : @[ _noViewers ]];
+    [self fitWindow:YES];
+  }
+  _viewerCount.stringValue = items.empty() ? @"" : [NSString stringWithFormat:@"%d", int(items.size())];
 }
 
 - (void)onEvent:(const Json&)e {
@@ -1706,15 +1231,13 @@ static std::string parseCode(NSString* text) {
   if (type == "status") {
     [self setStatus:S(e["text"].str()) kind:e["kind"].str()];
   } else if (type == "hosted") {
-    NSMutableAttributedString* code = [[NSMutableAttributedString alloc] initWithString:S(e["code"].str()) attributes:@{
-      NSFontAttributeName : [NSFont systemFontOfSize:46 weight:NSFontWeightBold],
-      NSForegroundColorAttributeName : rgb(0xFF8DA0),
-      NSKernAttributeName : @6
+    _roomCode.attributedStringValue = [[NSAttributedString alloc] initWithString:S(e["code"].str()) attributes:@{
+      NSFontAttributeName : [NSFont monospacedSystemFontOfSize:40 weight:NSFontWeightBold],
+      NSForegroundColorAttributeName : NSColor.labelColor,
+      NSKernAttributeName : @5
     }];
-    _roomCode.attributedStringValue = code;
     _roomLink = e["link"].str();
     _link.stringValue = S(_roomLink);
-    _link.textColor = textColor();
     _copyButton.enabled = YES;
     if (e["changed"].b())
       [self ask:@"Új link készült" text:@"A korábbi szoba lejárt, ezért új kód és link készült – küldd el újra a nézőknek." ok:@"Rendben" cancel:nil danger:NO action:nil];
@@ -1729,19 +1252,20 @@ static std::string parseCode(NSString* text) {
     [self updateViewers:e["list"]];
   } else if (type == "closed" && _current == _host) {
     [self stopToHome];
-    [self setError:_joinError text:@"A szobát egy másik ablak vette át."];
+    [self setError:_shareError text:@"A szobát egy másik ablak vette át."];
   } else if (type == "view-state" && _current == _viewer) {
     bool picture = e["picture"].b();
     if (picture != _picture) {
       _picture = picture;
-      setDotColor(_viewDot, rgb(picture ? kOk : kWarn));
+      setDotColor(_viewDot, picture ? NSColor.systemGreenColor : NSColor.systemOrangeColor);
       if (picture) {
         animateAlpha(_overlay, 0, 0.25);
+        [_overlaySpinner stopAnimation:nil];
         _lastMove = nowMs();
       } else {
-        _overlay.hidden = NO;
+        [_overlaySpinner startAnimation:nil];
         animateAlpha(_overlay, 1, 0.25);
-        animateAlpha(_bar, 1, 0.2);
+        [self moved];
       }
     }
     if (!picture) _overlayText.stringValue = S(e["text"].str());
@@ -1769,7 +1293,12 @@ static std::string parseCode(NSString* text) {
       s = "A kép indul…";
     }
     s += i.audioLayout.empty() ? " · hang nélkül" : " · hang: " + i.audioLayout;
-    _info.stringValue = S(s);
+    NSString* text = S(s);
+    if (![text isEqualToString:_info.stringValue]) {
+      _info.stringValue = text;
+      _info.textColor = i.error.empty() ? NSColor.secondaryLabelColor : NSColor.systemRedColor;
+      [self fitWindow:YES];
+    }
   } else if (_current == _viewer && _player) {
     MacPlayer::Stats st = _player->stats();
     if (_engine && st.latencyMs >= 0) _engine->reportLatency(st.latencyMs, st.fps);
@@ -1789,8 +1318,6 @@ static std::string parseCode(NSString* text) {
         if (v["rtt"].isNumber()) s += " · RTT " + std::to_string(int(std::lround(v["rtt"].num()))) + " ms";
         if (v["encoder"].isString()) s += " · küldő: " + v["encoder"].str();
         s += std::string(" · dekódolás: ") + (st.hardware ? "hardveres" : "szoftveres");
-      } else {
-        s += " · S: részletek";
       }
     } else {
       s = "Várakozás a képre…";
@@ -1808,18 +1335,12 @@ static std::string parseCode(NSString* text) {
 }
 
 - (void)checkUpdatesNow {
-  [self show:_about];
   [self checkUpdates:YES];
 }
 
 - (void)checkUpdates:(BOOL)asked {
   if (_checking) return;
   _checking = true;
-  if (asked) {
-    _checkSpinner.hidden = NO;
-    _updateNote.stringValue = @"";
-    _checkButton.enabled = NO;
-  }
   NSURL* url = [NSURL URLWithString:[kFeed stringByAppendingString:@"/native-latest.json"]];
   NSURLRequest* req = [NSURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:20];
   [[NSURLSession.sharedSession dataTaskWithRequest:req
@@ -1842,34 +1363,39 @@ static std::string parseCode(NSString* text) {
 
 - (void)updateChecked:(NSString*)version file:(NSString*)file failed:(BOOL)failed asked:(BOOL)asked {
   _checking = false;
-  _checkSpinner.hidden = YES;
-  _checkButton.enabled = YES;
   if (version) {
     _updateVersion = version;
     _updateFile = file;
-    NSString* title = [NSString stringWithFormat:@"Frissítés: %@", version];
-    [_updateButton setTitle:title symbol:@"arrow.down.circle"];
-    [_aboutUpdate setTitle:title symbol:@"arrow.down.circle"];
-    _updateButton.alphaValue = 0;
-    _updateButton.hidden = NO;
-    animateAlpha(_updateButton, 1, 0.3);
-    _aboutUpdate.hidden = NO;
-    _checkButton.hidden = YES;
-    _updateNote.stringValue = @"Új verzió érhető el.";
-    _updateNote.textColor = rgb(kOk);
-  } else if (asked) {
-    _updateNote.stringValue = failed ? @"Nem érem el a frissítéseket – próbáld később." : @"Ez a legújabb verzió.";
-    _updateNote.textColor = mutedColor();
+    _updateButton.title = [NSString stringWithFormat:@"Frissítés: %@", version];
+    if (_updateButton.hidden) {
+      _updateButton.alphaValue = 0;
+      _updateButton.hidden = NO;
+      animateAlpha(_updateButton, 1, 0.3);
+      [self fitWindow:YES];
+    }
   }
+  if (!asked) return;
+  __weak SSApp* weak = self;
+  if (version)
+    [self ask:[NSString stringWithFormat:@"Elérhető a Screen Share %@", version]
+         text:[NSString stringWithFormat:@"A telepített verzió: %@. A frissítés letöltődik, majd a Screen Share újraindul.", @SS_VERSION]
+           ok:@"Frissítés"
+       cancel:@"Később"
+       danger:NO
+       action:^{
+         [weak installUpdate];
+       }];
+  else if (failed)
+    [self ask:@"Nem érem el a frissítéseket" text:@"Ellenőrizd az internetkapcsolatot, és próbáld újra később." ok:@"OK" cancel:nil danger:NO action:nil];
+  else
+    [self ask:@"Ez a legújabb verzió" text:[NSString stringWithFormat:@"A Screen Share %@ a legfrissebb.", @SS_VERSION] ok:@"OK" cancel:nil danger:NO action:nil];
 }
 
 - (void)installUpdate {
   NSString* file = _updateFile;
   if (!file) return;
-  for (SSButton* b in @[ _updateButton, _aboutUpdate ]) {
-    [b setTitle:@"Letöltés…" symbol:@"arrow.down.circle"];
-    b.enabled = NO;
-  }
+  _updateButton.title = @"Letöltés…";
+  _updateButton.enabled = NO;
   NSURL* url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/%@", kFeed, file]];
   [[NSURLSession.sharedSession downloadTaskWithURL:url
                                   completionHandler:^(NSURL* location, NSURLResponse* response, NSError* error) {
@@ -1887,10 +1413,9 @@ static std::string parseCode(NSString* text) {
                                     ok = ok && [NSFileManager.defaultManager fileExistsAtPath:fresh];
                                     dispatch_async(dispatch_get_main_queue(), ^{
                                       if (!ok) {
-                                        for (SSButton* b in @[ self->_updateButton, self->_aboutUpdate ]) {
-                                          [b setTitle:@"Frissítés sikertelen – újra" symbol:@"arrow.clockwise"];
-                                          b.enabled = YES;
-                                        }
+                                        self->_updateButton.title = @"Frissítés sikertelen – újra";
+                                        self->_updateButton.enabled = YES;
+                                        [self ask:@"A frissítés nem sikerült" text:@"Nem tudtam letölteni az új verziót. Próbáld újra később." ok:@"OK" cancel:nil danger:NO action:nil];
                                         return;
                                       }
                                       // after we quit: the new app in place of this one, then start it
@@ -1909,18 +1434,25 @@ static std::string parseCode(NSString* text) {
 - (BOOL)windowShouldClose:(NSWindow*)w {
   if (_current != _host) return YES;
   __weak NSWindow* win = w;
+  __weak SSApp* weak = self;
   [self ask:@"Kilépsz?" text:@"A megosztás befejeződik: a nézőknél megáll a kép, és a szoba bezárul." ok:@"Kilépés" cancel:@"Mégse" danger:YES action:^{
-    [self endSession];
+    [weak endSession];
     [win close];
   }];
   return NO;
 }
 
 - (void)windowDidExitFullScreen:(NSNotification*)n {
+  if (_homeAfterFullScreen) {
+    _homeAfterFullScreen = false;
+    if (!_engine) [self show:_home];
+    return;
+  }
   [self moved];
 }
 
 @end
+
 
 /* ------------------------------------------------ smoke tests (CI): the real pipeline, no UI */
 

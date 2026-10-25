@@ -20,6 +20,7 @@ BEGIN
       VALUE "FileVersion", SS_VERSION_TEXT
       VALUE "ProductName", "Screen Share"
       VALUE "ProductVersion", SS_VERSION_TEXT
+      VALUE "LegalCopyright", "Copyright (C) 2026 mozizas.hu"
       VALUE "OriginalFilename", "ScreenShare.exe"
     END
   END

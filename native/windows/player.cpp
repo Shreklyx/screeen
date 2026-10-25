@@ -73,7 +73,6 @@ struct VideoPlayer::Impl {
   ComPtr<ID3D11Device> dev;
   ComPtr<ID3D11DeviceContext> ctx;
   ComPtr<IDXGISwapChain1> swap;
-  HANDLE waitable = nullptr;
   bool tearing = false;
   ComPtr<ID3D11RenderTargetView> rtv;
   ComPtr<ID3D11VertexShader> vs;
@@ -136,16 +135,13 @@ struct VideoPlayer::Impl {
     sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = 2;
+    sd.BufferCount = 3; // one on the screen, one waiting for it, one being drawn: a present never waits
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | (tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
     if (FAILED(factory->CreateSwapChainForHwnd(dev.Get(), window, &sd, nullptr, nullptr, &swap))) return false;
     factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
     ComPtr<IDXGISwapChain2> sc2;
-    if (SUCCEEDED(swap.As(&sc2))) {
-      sc2->SetMaximumFrameLatency(1);
-      waitable = sc2->GetFrameLatencyWaitableObject();
-    }
+    if (SUCCEEDED(swap.As(&sc2))) sc2->SetMaximumFrameLatency(2);
     ComPtr<ID3DBlob> vsb, psb;
     if (!compileShader(kShader, "vs", "vs_4_0", vsb) || !compileShader(kShader, "ps", "ps_4_0", psb)) return false;
     dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
@@ -393,8 +389,8 @@ struct VideoPlayer::Impl {
 
   void draw() {
     if (!rtv) return;
-    // the frame-latency object says when a present will not wait (≤ 1 frame queued)
-    if (waitable) WaitForSingleObjectEx(waitable, 16, TRUE);
+    // no waiting for the screen: the newest picture is presented at once (sync interval 0) and the
+    // compositor shows it at the next refresh – one still waiting for that refresh is replaced
     const float black[4] = {0, 0, 0, 1};
     ctx->ClearRenderTargetView(rtv.Get(), black);
     if (lumSrv && chromaSrv && frameW && frameH) {

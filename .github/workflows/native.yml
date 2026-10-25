@@ -62,7 +62,7 @@ jobs:
           call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
           set GEN=NMake Makefiles
           where ninja >nul 2>nul && set GEN=Ninja
-          cmake -S native -B build -G "%GEN%" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DSS_VERSION=2.0.${{ github.run_number }} || exit /b 1
+          cmake -S native -B build -G "%GEN%" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DSS_VERSION=2.0.${{ github.run_number }} -DSS_BUILD=${{ github.run_number }} || exit /b 1
           cmake --build build || exit /b 1
           dir build\windows
       - name: Core tests
@@ -126,7 +126,7 @@ jobs:
   # this machine it watches (decodes with VideoToolbox) a native sharer, and shares its screen to a
   # native viewer when the runner lets it record the screen. Published as ScreenShare-Native-Mac.zip.
   mac:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -148,7 +148,7 @@ jobs:
           set -e
           for arch in arm64 x86_64; do
             cmake -S native -B build-$arch -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=$arch \
-              -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 -DSS_VERSION=2.0.${{ github.run_number }}
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 -DSS_VERSION=2.0.${{ github.run_number }} -DSS_BUILD=${{ github.run_number }}
             cmake --build build-$arch -j4
           done
           mkdir -p dist

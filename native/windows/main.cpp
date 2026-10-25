@@ -3,7 +3,8 @@
 // Home: share the screen (sharing password, which screen, quality, system sound) or watch a room
 // (code or link). Sharing: the room code and link, the viewers with their connection and latency.
 // Watching: the picture fills the window (F / double click: full screen, S: statistics, M: mute).
-// About: version, what the app does, updates, the open-source parts.
+// About: a small window of its own, as on a Mac – the icon, the name, the version (build), the
+// copyright, updates. The server is always mozizas.hu.
 //
 // The look is drawn with Direct2D (ui.cpp) – cards, chips, switches, a spinner – and moves smoothly:
 // screens cross-fade, buttons and switches ease. Only the text boxes are Windows controls, and the
@@ -47,6 +48,9 @@
 #ifndef SS_VERSION
 #define SS_VERSION "2.0.0"
 #endif
+#ifndef SS_BUILD
+#define SS_BUILD "0"
+#endif
 #define WIDEN2(x) L##x
 #define WIDEN(x) WIDEN2(x)
 
@@ -66,9 +70,12 @@ const UINT WM_UPDATE_DONE = WM_APP + 4; // wParam: ok
 
 const UINT_PTR TIMER_TICK = 1, TIMER_ANIM = 3;
 
+const char* kServer = "https://mozizas.hu";
 const wchar_t* kSite = L"https://mozizas.hu";
-const wchar_t* kReleases = L"https://github.com/Shreklyx/screeen/releases/tag/desktop-latest";
 const wchar_t* kVersion = WIDEN(SS_VERSION);
+const wchar_t* kBuild = WIDEN(SS_BUILD);
+const wchar_t* kCopyright = L"Copyright © 2026 mozizas.hu.\nMinden jog fenntartva.";
+const UINT kSysAbout = 0x1010; // "About" in the window menu (Alt+Space)
 
 // the palette
 const Color cBg1 = rgb(0x0D0D18), cBg2 = rgb(0x06060B), cCard = rgb(0x1A1A26), cCardHi = rgb(0x242434), cBorder = rgb(0xFFFFFF, 0.09f),
@@ -76,14 +83,14 @@ const Color cBg1 = rgb(0x0D0D18), cBg2 = rgb(0x06060B), cCard = rgb(0x1A1A26), c
             cField = rgb(0x10101A), cOk = rgb(0x4ADE80), cWarn = rgb(0xFBBF24), cErr = rgb(0xFF6B7A), cWhite = rgb(0xFFFFFF);
 const COLORREF kFieldGdi = RGB(0x10, 0x10, 0x1A), kTextGdi = RGB(0xEF, 0xEF, 0xF6), kBgGdi = RGB(0x0D, 0x0D, 0x18);
 
-enum class Screen { Home, Hosting, Viewing, About };
+enum class Screen { Home, Hosting, Viewing };
 
 // what can be clicked (and the text boxes)
 enum Id {
   ID_NONE = 0,
-  ID_PASSWORD = 100, ID_CODE, ID_SERVER,
-  B_SHARE = 200, B_JOIN, B_REMEMBER, B_AUDIO, B_UPDATE, B_ABOUT, B_BACK, B_COPY, B_PAUSE, B_STOP, B_FULL, B_LEAVE, B_VOLUME, B_MUTE,
-  B_CHECK, B_SITE, B_RELEASES, B_MODAL_OK, B_MODAL_CANCEL,
+  ID_PASSWORD = 100, ID_CODE,
+  B_SHARE = 200, B_JOIN, B_REMEMBER, B_AUDIO, B_UPDATE, B_ABOUT, B_COPY, B_PAUSE, B_STOP, B_FULL, B_LEAVE, B_VOLUME, B_MUTE,
+  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL,
   B_MONITOR0 = 300, B_QUALITY0 = 400,
 };
 
@@ -117,7 +124,7 @@ struct App {
   bool transitioning = false;
   double transitionStart = 0;
 
-  HWND pass = nullptr, code = nullptr, server = nullptr, video = nullptr;
+  HWND pass = nullptr, code = nullptr, video = nullptr;
   std::map<int, Rect> fieldRects; // where the text boxes go (DIPs, in the scrolled content)
   std::map<int, RECT> placed;     // where they are (pixels)
   int focus = ID_NONE;
@@ -161,6 +168,14 @@ struct App {
   bool updating = false, checking = false;
   int updateProgress = -1;
   std::wstring updateNote;
+
+  // the About window: its own canvas, animations and buttons; while it paints, the widgets draw there
+  HWND about = nullptr;
+  Canvas aboutCanvas;
+  Anims aboutAnim;
+  std::vector<Hit> aboutHits;
+  int aboutHover = ID_NONE, aboutPressed = ID_NONE;
+  bool aboutTimer = false, aboutTracking = false, paintingAbout = false;
 };
 
 App g;
@@ -189,24 +204,18 @@ void animate() {
   invalidate();
 }
 
+/** The About window shows the update state too: it is drawn anew when that changes. */
+void refreshAbout() {
+  if (g.about) InvalidateRect(g.about, nullptr, FALSE);
+}
+
 /* ------------------------------------------------ settings (HKCU\Software\ScreenShare) */
 
 const wchar_t* kKey = L"Software\\ScreenShare";
 
-std::wstring loadString(const wchar_t* name, const std::wstring& fallback) {
-  wchar_t buf[1024];
-  DWORD size = sizeof buf;
-  if (RegGetValueW(HKEY_CURRENT_USER, kKey, name, RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS) return buf;
-  return fallback;
-}
-
 DWORD loadDword(const wchar_t* name, DWORD fallback) {
   DWORD v = 0, size = sizeof v;
   return RegGetValueW(HKEY_CURRENT_USER, kKey, name, RRF_RT_REG_DWORD, nullptr, &v, &size) == ERROR_SUCCESS ? v : fallback;
-}
-
-void saveString(const wchar_t* name, const std::wstring& v) {
-  RegSetKeyValueW(HKEY_CURRENT_USER, kKey, name, REG_SZ, v.c_str(), DWORD((v.size() + 1) * sizeof(wchar_t)));
 }
 
 void saveDword(const wchar_t* name, DWORD v) { RegSetKeyValueW(HKEY_CURRENT_USER, kKey, name, REG_DWORD, &v, sizeof v); }
@@ -237,10 +246,12 @@ std::wstring loadPassword() {
 
 /* ------------------------------------------------ widgets (drawn; while measuring only laid out) */
 
-Canvas& C() { return g.canvas; }
+Canvas& C() { return g.paintingAbout ? g.aboutCanvas : g.canvas; }
+Anims& A() { return g.paintingAbout ? g.aboutAnim : g.anim; }
 
 void hit(int id, const Rect& r) {
-  if (!g.measuring && !g.transitioning) g.hits.push_back({r, id});
+  if (g.paintingAbout) g.aboutHits.push_back({r, id});
+  else if (!g.measuring && !g.transitioning) g.hits.push_back({r, id});
 }
 
 std::string key(const char* what, int id) { return std::string(what) + std::to_string(id); }
@@ -264,8 +275,8 @@ enum class Style { Primary, Secondary, Danger, Ghost, Success };
 void button(int id, const Rect& r, const std::wstring& label, Style style, bool hasIcon = false, Icon icon = Icon::Play, bool enabled = true) {
   if (g.measuring) return;
   if (enabled) hit(id, r);
-  float hov = g.anim.to(key("h", id), enabled && g.hover == id ? 1.0f : 0.0f, 130);
-  float prs = g.anim.to(key("p", id), enabled && g.pressed == id && g.hover == id ? 1.0f : 0.0f, 70);
+  float hov = A().to(key("h", id), enabled && g.hover == id ? 1.0f : 0.0f, 130);
+  float prs = A().to(key("p", id), enabled && g.pressed == id && g.hover == id ? 1.0f : 0.0f, 70);
   Canvas& c = C();
   c.pushScale(1.0f - 0.03f * prs, r.cx(), r.cy());
   float radius = std::min(12.0f, r.h / 2);
@@ -314,8 +325,8 @@ void toggle(int id, const Rect& row, const std::wstring& label, bool on) {
   if (g.measuring) return;
   hit(id, row);
   Canvas& c = C();
-  float k = g.anim.to(key("t", id), on ? 1.0f : 0.0f, 170);
-  float hov = g.anim.to(key("h", id), g.hover == id ? 1.0f : 0.0f, 130);
+  float k = A().to(key("t", id), on ? 1.0f : 0.0f, 170);
+  float hov = A().to(key("h", id), g.hover == id ? 1.0f : 0.0f, 130);
   Rect track{row.x, row.cy() - 11, 40, 22};
   c.fillRound(track, 11, mix(rgb(0xFFFFFF, 0.10f + 0.05f * hov), mix(cAccent, cAccent2, 0.35f), k));
   c.strokeRoundGradient(track, 11, rgb(0xFFFFFF, 0.30f), rgb(0xFFFFFF, 0.05f), 1);
@@ -329,8 +340,8 @@ void chip(int id, const Rect& r, const std::wstring& label, bool selected) {
   if (g.measuring) return;
   hit(id, r);
   Canvas& c = C();
-  float s = g.anim.to(key("s", id), selected ? 1.0f : 0.0f, 160);
-  float hov = g.anim.to(key("h", id), g.hover == id ? 1.0f : 0.0f, 120);
+  float s = A().to(key("s", id), selected ? 1.0f : 0.0f, 160);
+  float hov = A().to(key("h", id), g.hover == id ? 1.0f : 0.0f, 120);
   c.fillRound(r, 10, mix(rgb(0xFFFFFF, 0.045f + 0.05f * hov), withAlpha(mix(cAccent, cAccent2, 0.3f), 0.26f), s));
   c.fillRoundStops(r, 10, {{0, rgb(0xFFFFFF, 0.07f)}, {0.6f, rgb(0xFFFFFF, 0)}});
   c.strokeRoundGradient(r, 10, mix(rgb(0xFFFFFF, 0.22f + 0.12f * hov), withAlpha(rgb(0xFF8DA0), 0.95f), s), mix(rgb(0xFFFFFF, 0.04f), withAlpha(cAccent2, 0.5f), s),
@@ -343,13 +354,13 @@ void field(int id, const Rect& r, Icon icon) {
   if (!g.transitioning || !g.measuring) g.fieldRects[id] = r;
   if (g.measuring) return;
   Canvas& c = C();
-  float f = g.anim.to(key("f", id), g.focus == id ? 1.0f : 0.0f, 150);
+  float f = A().to(key("f", id), g.focus == id ? 1.0f : 0.0f, 150);
   if (f > 0.01f) c.fillRound({r.x - 3, r.y - 3, r.w + 6, r.h + 6}, 13, withAlpha(cAccent, 0.16f * f));
   c.fillRound(r, 10, cField);
   c.strokeRoundGradient(r, 10, mix(rgb(0xFFFFFF, 0.16f), withAlpha(rgb(0xFF8DA0), 0.95f), f), mix(rgb(0xFFFFFF, 0.06f), withAlpha(cAccent2, 0.7f), f), 1 + 0.5f * f);
   c.icon(icon, r.x + 20, r.cy(), 16, mix(cFaint, cAccent, f), 1.6f);
   // while the screens cross-fade the edit control is hidden: its text is drawn instead
-  HWND h = id == ID_PASSWORD ? g.pass : id == ID_CODE ? g.code : g.server;
+  HWND h = id == ID_PASSWORD ? g.pass : g.code;
   if (g.transitioning && h) {
     std::wstring t = getText(h);
     if (id == ID_PASSWORD) t = std::wstring(t.size(), L'\x25CF');
@@ -379,12 +390,12 @@ float card(float x, float y, float w, float minH, Fn fn) {
 void spinner(float cx, float cy, float radius, const Color& col) {
   if (g.measuring) return;
   Canvas& c = C();
-  double t = g.anim.now();
+  double t = A().now();
   float spin = float(std::fmod(t * 0.40, 360.0));
   float sweep = 70 + 110 * float(0.5 + 0.5 * std::sin(t / 420.0));
   c.strokeCircle(cx, cy, radius, withAlpha(col, 0.15f), 3);
   c.arc(cx, cy, radius, spin, sweep, col, 3);
-  g.anim.keepGoing();
+  A().keepGoing();
 }
 
 void dot(float cx, float cy, const Color& col, float r = 4.5f) {
@@ -458,7 +469,7 @@ float homeShare(float x, float y, float w) {
   button(B_SHARE, {cx, cy, iw, 48}, L"Megosztás indítása", Style::Primary, true, Icon::Play);
   cy += 48;
   if (!g.shareErr.empty()) {
-    float a = g.anim.to("shareErr", 1, 220);
+    float a = A().to("shareErr", 1, 220);
     if (!g.measuring) {
       c.pushAlpha(a);
       c.text(g.shareErr, {cx, cy + 12, iw, 40}, 13, Medium, cErr, Left, false, true);
@@ -486,7 +497,7 @@ float homeJoin(float x, float y, float w) {
   button(B_JOIN, {cx, cy, iw, 48}, L"Csatlakozás", Style::Primary, true, Icon::Eye);
   cy += 48;
   if (!g.joinErr.empty()) {
-    float a = g.anim.to("joinErr", 1, 220);
+    float a = A().to("joinErr", 1, 220);
     if (!g.measuring) {
       c.pushAlpha(a);
       c.text(g.joinErr, {cx, cy + 12, iw, 40}, 13, Medium, cErr, Left, false, true);
@@ -494,14 +505,8 @@ float homeJoin(float x, float y, float w) {
     }
     cy += 40;
   }
-  cy += 26;
-  if (!g.measuring) c.line(cx, cy, cx + iw, cy, cBorder, 1);
-  cy += 22;
-  label(L"Szerver", {cx, cy, iw, 18});
-  cy += 24;
-  field(ID_SERVER, {cx, cy, iw, 40}, Icon::Bolt);
-  cy += 48;
-  if (!g.measuring) c.text(L"Csak akkor írd át, ha saját szervered van.", {cx, cy, iw, 18}, 12, Regular, cFaint);
+  cy += 18;
+  if (!g.measuring) c.text(L"A megosztótól kapott 6 jelű kód, vagy a teljes link.", {cx, cy, iw, 18}, 12, Regular, cFaint);
   cy += 18;
   return cy + p;
 }
@@ -540,7 +545,7 @@ float drawHome(float W, float) {
   if (!g.update.version.empty()) {
     Rect r{x0 + cw - 230, y, 230, 36};
     if (g.updating && g.updateProgress >= 0 && !g.measuring) {
-      float k = g.anim.to("updateBar", float(g.updateProgress) / 100.0f, 250);
+      float k = A().to("updateBar", float(g.updateProgress) / 100.0f, 250);
       c.fillRound(r, 12, cCardHi);
       c.fillRoundGradient({r.x, r.y, std::max(24.0f, r.w * k), r.h}, 12, cAccent, cAccent2);
       c.text(L"Letöltés… " + std::to_wstring(g.updateProgress) + L"%", r, 13.5f, Semibold, cWhite, Center);
@@ -564,7 +569,7 @@ Color statusColor() { return g.statusKind == "ok" ? cOk : g.statusKind == "warn"
 void viewerRow(const Json& v, const Rect& r) {
   Canvas& c = C();
   std::string id = v["id"].str(""), state = v["state"].str("");
-  float a = g.anim.to("v" + id, 1, 260);
+  float a = A().to("v" + id, 1, 260);
   c.pushAlpha(a);
   c.pushTranslate(0, (1 - a) * 10);
   glass(r, 16, 0.85f, false);
@@ -641,8 +646,8 @@ float drawHosting(float W, float) {
       c.text(g.roomLink.empty() ? L"A link a kapcsolódás után jelenik meg…" : toW(g.roomLink), {lr.x + 42, lr.y, lr.w - 56, lr.h}, 14, Regular,
              g.roomLink.empty() ? cFaint : cText);
     }
-    bool copied = g.anim.now() - g.copiedAt < 2000;
-    if (copied) g.anim.keepGoing();
+    bool copied = A().now() - g.copiedAt < 2000;
+    if (copied) A().keepGoing();
     button(B_COPY, {cx + iw - bw, cy, bw, 46}, copied ? L"Kimásolva" : L"Link másolása", copied ? Style::Success : Style::Primary, true, copied ? Icon::Check : Icon::Copy,
            !g.roomLink.empty());
     cy += 62;
@@ -722,8 +727,8 @@ float drawViewing(float W, float H) {
     button(B_FULL, b.full, L"", Style::Ghost, true, Icon::FullScreen);
     // volume: the icon mutes, the bar sets it
     hit(B_VOLUME, {b.volume.x - 8, 12, b.volume.w + 16, 32});
-    float vol = g.anim.to("vol", g.muted ? 0.0f : g.volume, 90);
-    float vh = g.anim.to(key("h", B_VOLUME), g.hover == B_VOLUME || g.draggingVolume ? 1.0f : 0.0f, 120);
+    float vol = A().to("vol", g.muted ? 0.0f : g.volume, 90);
+    float vh = A().to(key("h", B_VOLUME), g.hover == B_VOLUME || g.draggingVolume ? 1.0f : 0.0f, 120);
     c.fillRound(b.volume, 3, rgb(0xFFFFFF, 0.12f));
     c.fillRoundGradient({b.volume.x, b.volume.y, std::max(6.0f, b.volume.w * vol), b.volume.h}, 3, cAccent, cAccent2);
     c.fillCircle(b.volume.x + b.volume.w * vol, b.volume.cy(), 6 + 1.5f * vh, cWhite);
@@ -741,73 +746,48 @@ float drawViewing(float W, float H) {
   return H;
 }
 
-void aboutFeature(float x, float y, float w, Icon icon, const std::wstring& title, const std::wstring& text) {
-  if (g.measuring) return;
+/** The About window, like a Mac's: the icon, the name, the version (build), the copyright; updates
+ *  and the site under them. */
+void drawAboutWindow(float W, float H) {
   Canvas& c = C();
-  c.fillRound({x, y, 36, 36}, 10, rgb(0xFFFFFF, 0.06f));
-  c.icon(icon, x + 18, y + 18, 18, rgb(0xC9B8FF), 1.7f);
-  c.text(title, {x + 50, y - 1, w - 50, 20}, 14, Semibold, cText);
-  c.text(text, {x + 50, y + 19, w - 50, 18}, 12.5f, Regular, cMuted);
-}
-
-float drawAbout(float W, float) {
-  Canvas& c = C();
-  float m = 36, cw = std::min(W - 2 * m, 760.0f), x0 = std::floor((W - cw) / 2), y = 26;
-  button(B_BACK, {x0 - 8, y, 112, 38}, L"Vissza", Style::Ghost, true, Icon::Back);
-  y += 56;
-  float h = card(x0, y, cw, 0, [&](float yy) {
-    float p = 30, cx = x0 + p, iw = cw - 2 * p, cy = yy + p;
-    logo(cx, cy, 64);
-    if (!g.measuring) {
-      c.gradientText(L"Screen Share", {cx + 82, cy + 2, 400, 36}, 30, Bold, cText, rgb(0xD9D2FF));
-      c.text(std::wstring(L"Verzió ") + kVersion + L" · natív Windows-alkalmazás (64 bites)", {cx + 82, cy + 38, iw - 82, 20}, 13, Regular, cMuted);
-    }
-    cy += 88;
-    const std::wstring about =
-        L"Képernyőmegosztás hanggal, a lehető legkisebb késéssel. A képet a videókártya kódolja, és saját, végig titkosított "
-        L"átvitellel megy a nézőkhöz – két alkalmazás között közvetlenül, puffer nélkül. Böngésző, Electron és Chromium nélkül.";
-    float th = 0;
-    c.measure(about, 14, Regular, iw, &th);
-    if (!g.measuring) c.text(about, {cx, cy, iw, th + 4}, 14, Regular, cText, Left, false, true);
-    cy += std::max(th, 20.0f) + 24;
-    bool two = iw > 560;
-    float colW = two ? (iw - 20) / 2 : iw;
-    aboutFeature(cx, cy, colW, Icon::Bolt, L"Kis késés", L"Közvetlen UDP-kapcsolat, pufferek nélkül");
-    aboutFeature(two ? cx + colW + 20 : cx, two ? cy : cy + 52, colW, Icon::Monitor, L"Akár 4K 60 / 1080p 120", L"NVENC, Intel, AMD hardveres kódolás");
-    cy += two ? 56 : 108;
-    aboutFeature(cx, cy, colW, Icon::Sound, L"A gép hangja", L"Sztereó, 5.1 és 7.1 térhang");
-    aboutFeature(two ? cx + colW + 20 : cx, two ? cy : cy + 52, colW, Icon::Lock, L"Végig titkosítva", L"X25519 + AES-GCM – a szerver sem látja a képet");
-    cy += two ? 66 : 118;
-    if (!g.measuring) c.line(cx, cy, cx + iw, cy, cBorder, 1);
-    cy += 22;
-    // updates
-    if (!g.update.version.empty()) {
-      button(B_UPDATE, {cx, cy, 230, 42}, g.updating ? L"Telepítés…" : L"Frissítés: " + toW(g.update.version), Style::Primary, true, Icon::Download, !g.updating);
-    } else {
-      button(B_CHECK, {cx, cy, 230, 42}, g.checking ? L"Keresés…" : L"Frissítések keresése", Style::Secondary, true, Icon::Refresh, !g.checking);
-    }
-    if (!g.measuring) {
-      if (g.checking) spinner(cx + 254, cy + 21, 8, cMuted);
-      c.text(g.updateNote, {cx + 248, cy, iw - 250, 42}, 13, Medium, g.update.version.empty() ? cMuted : cOk);
-    }
-    cy += 62;
-    // links
-    button(B_SITE, {cx - 10, cy, 150, 34}, L"mozizas.hu", Style::Ghost, true, Icon::Link);
-    button(B_RELEASES, {cx + 150, cy, 200, 34}, L"Letöltések (GitHub)", Style::Ghost, true, Icon::Download);
-    cy += 50;
-    const std::wstring credits = L"Nyílt forrású részek: BearSSL (MIT) – titkosítás · Opus (BSD) – hang · NVIDIA Video Codec SDK fejlécek (MIT).";
-    float ch = 0;
-    c.measure(credits, 12, Regular, iw, &ch);
-    if (!g.measuring) c.text(credits, {cx, cy, iw, ch + 4}, 12, Regular, cFaint, Left, false, true);
-    cy += ch + 6;
-    return cy + p - 6;
-  });
-  return y + h + 30;
+  c.verticalGradient({0, 0, W, H}, cBg1, cBg2);
+  c.glow(W * 0.18f, H * 0.05f, 240, withAlpha(cAccent, 0.34f));
+  c.glow(W * 0.92f, H * 0.42f, 260, withAlpha(cAccent2, 0.30f));
+  float y = 28;
+  logo(std::floor(W / 2 - 38), y, 76);
+  y += 76 + 18;
+  c.text(L"Screen Share", {0, y, W, 26}, 17, Bold, cText, Center);
+  y += 27;
+  c.text(std::wstring(L"Verzió ") + kVersion + L" (" + kBuild + L")", {0, y, W, 18}, 12, Regular, cMuted, Center);
+  y += 30;
+  float th = 0;
+  c.measure(kCopyright, 11.5f, Regular, W - 56, &th);
+  c.text(kCopyright, {28, y, W - 56, th + 4}, 11.5f, Regular, cFaint, Center, false, true);
+  y += th + 22;
+  Rect r{std::floor(W / 2 - 112), y, 224, 36};
+  if (g.updating && g.updateProgress >= 0) {
+    float k = A().to("updateBar", float(g.updateProgress) / 100.0f, 250);
+    c.fillRound(r, 12, cCardHi);
+    c.fillRoundGradient({r.x, r.y, std::max(24.0f, r.w * k), r.h}, 12, cAccent, cAccent2);
+    c.text(L"Letöltés… " + std::to_wstring(g.updateProgress) + L"%", r, 13, Semibold, cWhite, Center);
+  } else if (!g.update.version.empty()) {
+    button(B_UPDATE, r, g.updating ? L"Telepítés…" : L"Frissítés: " + toW(g.update.version), Style::Primary, true, Icon::Download, !g.updating);
+  } else {
+    button(B_CHECK, r, g.checking ? L"Keresés…" : L"Frissítések keresése", Style::Secondary, true, Icon::Refresh, !g.checking);
+  }
+  y += 36 + 8;
+  c.text(g.updateNote, {0, y, W, 18}, 12, Regular, g.update.version.empty() ? cMuted : cOk, Center);
+  y += 24;
+  button(B_SITE, {std::floor(W / 2 - 74), y, 148, 30}, L"mozizas.hu", Style::Ghost, true, Icon::Link);
+  y += 40;
+  const wchar_t* credits = L"BearSSL (MIT) · Opus (BSD) · NVIDIA Video Codec SDK (MIT)";
+  c.measure(credits, 10.5f, Regular, W - 40, &th);
+  c.text(credits, {20, y, W - 40, th + 4}, 10.5f, Regular, cFaint, Center, false, true);
 }
 
 void drawModal(float W, float H) {
   Canvas& c = C();
-  float k = g.anim.to("modal", g.modal.open ? 1.0f : 0.0f, 170);
+  float k = A().to("modal", g.modal.open ? 1.0f : 0.0f, 170);
   if (k < 0.005f) return;
   if (g.modal.open) g.hits.clear(); // only the dialog answers
   c.pushAlpha(k);
@@ -836,7 +816,7 @@ void drawModal(float W, float H) {
 }
 
 void ask(const std::wstring& title, const std::wstring& text, const std::wstring& ok, const std::wstring& cancel, bool danger, std::function<void()> action) {
-  if (!g.modal.open) g.anim.set("modal", 0); // it comes up from nothing
+  if (!g.modal.open) A().set("modal", 0); // it comes up from nothing
   g.modal.open = true;
   g.modal.title = title;
   g.modal.text = text;
@@ -863,7 +843,6 @@ float drawScreen(Screen s, float W, float H) {
     case Screen::Home: return drawHome(W, H);
     case Screen::Hosting: return drawHosting(W, H);
     case Screen::Viewing: return drawViewing(W, H);
-    case Screen::About: return drawAbout(W, H);
   }
   return H;
 }
@@ -897,7 +876,6 @@ void updateChildren() {
   bool home = g.screen == Screen::Home && !g.transitioning;
   placeChild(ID_PASSWORD, g.pass, home);
   placeChild(ID_CODE, g.code, home);
-  placeChild(ID_SERVER, g.server, home);
   // (the window only once a frame is on it: before that a new swap chain shows whatever was there)
   bool video = g.screen == Screen::Viewing && g.picture && !g.transitioning && g.player && g.player->hasPicture();
   if (video) {
@@ -920,12 +898,12 @@ void updateChildren() {
 void paint() {
   Canvas& c = C();
   if (!c.begin(g.wnd, float(g.dpi))) return;
-  g.anim.frame(nowMs());
+  A().frame(nowMs());
   g.hits.clear();
   float W = c.width(), H = c.height();
   float t = 1;
   if (g.transitioning) {
-    t = easeOut(float((g.anim.now() - g.transitionStart) / 240.0));
+    t = easeOut(float((A().now() - g.transitionStart) / 240.0));
     if (t >= 1.0f) g.transitioning = false;
   }
   // the background: dark, with two soft glows
@@ -950,12 +928,12 @@ void paint() {
     g.contentHeight = drawScreen(g.screen, W, H);
     c.popTranslate();
     c.popAlpha();
-    g.anim.keepGoing();
+    A().keepGoing();
   } else {
     // the scroll position: eased, kept within the content
     float maxScroll = std::max(0.0f, g.contentHeight - H);
     g.scrollTarget = std::clamp(g.scrollTarget, 0.0f, maxScroll);
-    g.scroll = g.anim.to("scroll", g.scrollTarget, 120);
+    g.scroll = A().to("scroll", g.scrollTarget, 120);
     c.pushTranslate(0, -g.scroll);
     g.contentHeight = drawScreen(g.screen, W, H);
     c.popTranslate();
@@ -963,10 +941,10 @@ void paint() {
       for (Hit& hh : g.hits) hh.r.y -= g.scroll;
   }
   drawModal(W, H);
-  if (g.screen == Screen::Viewing && g.picture && g.player && !g.player->hasPicture()) g.anim.keepGoing(); // until the first frame shows
+  if (g.screen == Screen::Viewing && g.picture && g.player && !g.player->hasPicture()) A().keepGoing(); // until the first frame shows
   c.end();
   updateChildren();
-  if (g.anim.active()) {
+  if (A().active()) {
     animate();
   } else if (g.animTimer) {
     KillTimer(g.wnd, TIMER_ANIM);
@@ -981,7 +959,7 @@ void show(Screen s) {
   g.transitioning = true;
   g.transitionStart = nowMs();
   g.scrollTarget = 0;
-  g.anim.set("scroll", 0);
+  A().set("scroll", 0);
   g.scroll = 0;
   g.hover = g.pressed = ID_NONE;
   updateChildren(); // the text boxes and the picture hide while the screens cross-fade
@@ -990,14 +968,6 @@ void show(Screen s) {
 }
 
 /* ------------------------------------------------ sessions */
-
-std::string serverUrl() {
-  std::string s = narrow(getText(g.server).c_str());
-  while (!s.empty() && (s.back() == '/' || s.back() == ' ')) s.pop_back();
-  if (s.empty()) s = "https://mozizas.hu";
-  if (s.find("://") == std::string::npos) s = "https://" + s;
-  return s;
-}
 
 EngineCallbacks callbacks(int session) {
   EngineCallbacks cb;
@@ -1018,7 +988,7 @@ void endSession() {
 
 void setError(std::wstring& where, const std::wstring& text, const char* animKey) {
   where = text;
-  g.anim.set(animKey, 0);
+  A().set(animKey, 0);
   animate();
 }
 
@@ -1036,13 +1006,12 @@ void startSharing() {
   saveDword(L"Quality", DWORD(g.quality));
   saveDword(L"Monitor", DWORD(g.monitor));
   saveDword(L"Audio", g.audio);
-  saveString(L"Server", toW(serverUrl()));
   savePassword(g.remember ? pw : L"");
   g.shareErr.clear();
   endSession();
   int session = ++g.session;
   EngineConfig cfg;
-  cfg.server = serverUrl();
+  cfg.server = kServer;
   cfg.webSocket = openWinHttpWebSocket;
   EngineCallbacks cb = callbacks(session);
   // the pipeline exists before the engine can call it
@@ -1089,12 +1058,11 @@ void startWatching(const std::string& code) {
     SetFocus(g.code);
     return;
   }
-  saveString(L"Server", toW(serverUrl()));
   g.joinErr.clear();
   endSession();
   int session = ++g.session;
   EngineConfig cfg;
-  cfg.server = serverUrl();
+  cfg.server = kServer;
   cfg.webSocket = openWinHttpWebSocket;
   g.player.reset(new VideoPlayer(g.video));
   g.audioOut.reset(new AudioPlayer());
@@ -1148,7 +1116,7 @@ void onEngineEvent(const Json& e) {
   } else if (type == "viewers") {
     for (const Json& v : e["list"].items()) {
       std::string id = "v" + v["id"].str("");
-      if (g.anim.get(id, -1) < 0) g.anim.set(id, 0); // a new viewer fades in
+      if (A().get(id, -1) < 0) A().set(id, 0); // a new viewer fades in
     }
     std::vector<Json> list = e["list"].items();
     std::sort(list.begin(), list.end(), [](const Json& a, const Json& b) { return a["n"].num() < b["n"].num(); });
@@ -1279,6 +1247,7 @@ void checkUpdatesNow() {
   if (g.checking) return;
   g.checking = true;
   g.updateNote.clear();
+  refreshAbout();
   HWND wnd = g.wnd;
   std::thread([wnd] {
     UpdateInfo u;
@@ -1298,7 +1267,155 @@ void installUpdate() {
     bool ok = downloadAndInstall(u, [wnd](int pct) { PostMessageW(wnd, WM_UPDATE_PROGRESS, WPARAM(pct), 0); });
     PostMessageW(wnd, WM_UPDATE_DONE, ok, 0);
   }).detach();
+  refreshAbout();
   animate();
+}
+
+/* ------------------------------------------------ the title bar, the About window */
+
+/** The title bar in the app's colours (Windows 10 2004+ dark mode; Windows 11 caption colour, round corners). */
+void styleTitleBar(HWND wnd) {
+  typedef HRESULT(WINAPI * SetAttr)(HWND, DWORD, LPCVOID, DWORD);
+  static SetAttr set = [] {
+    SetAttr f = nullptr;
+    if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) {
+      FARPROC p = GetProcAddress(dwm, "DwmSetWindowAttribute");
+      std::memcpy(&f, &p, sizeof f);
+    }
+    return f;
+  }();
+  if (!set) return;
+  BOOL dark = TRUE;
+  set(wnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
+  COLORREF caption = kBgGdi, text = kTextGdi;
+  set(wnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof caption);
+  set(wnd, 36 /* DWMWA_TEXT_COLOR */, &text, sizeof text);
+  DWORD round = 2; // DWMWCP_ROUND
+  set(wnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &round, sizeof round);
+}
+
+const float kAboutW = 320, kAboutH = 384;
+
+void showAbout() {
+  if (g.about) {
+    SetForegroundWindow(g.about);
+    return;
+  }
+  UINT dpi = GetDpiForWindow(g.wnd);
+  DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+  RECT r{0, 0, MulDiv(int(kAboutW), int(dpi), 96), MulDiv(int(kAboutH), int(dpi), 96)};
+  AdjustWindowRectExForDpi(&r, style, FALSE, WS_EX_DLGMODALFRAME, dpi);
+  int w = r.right - r.left, h = r.bottom - r.top;
+  RECT owner;
+  GetWindowRect(g.wnd, &owner);
+  int x = (owner.left + owner.right) / 2 - w / 2, y = owner.top + (owner.bottom - owner.top) * 2 / 5 - h / 2;
+  g.aboutAnim = Anims();
+  g.aboutHover = g.aboutPressed = ID_NONE;
+  g.about = CreateWindowExW(WS_EX_DLGMODALFRAME, L"SSAbout", L"A Screen Share névjegye", style, x, std::max<int>(int(owner.top), y), w, h, g.wnd, nullptr, g.inst, nullptr);
+  if (!g.about) return;
+  styleTitleBar(g.about);
+  ShowWindow(g.about, SW_SHOW);
+}
+
+void paintAbout() {
+  Canvas& c = g.aboutCanvas;
+  if (!c.begin(g.about, float(GetDpiForWindow(g.about)))) return;
+  // the widgets draw into this window: its canvas, its animations, its buttons, its hover
+  int hover = g.hover, pressed = g.pressed;
+  g.hover = g.aboutHover;
+  g.pressed = g.aboutPressed;
+  g.paintingAbout = true;
+  g.aboutAnim.frame(nowMs());
+  g.aboutHits.clear();
+  drawAboutWindow(c.width(), c.height());
+  c.end();
+  g.paintingAbout = false;
+  g.hover = hover;
+  g.pressed = pressed;
+  if (g.aboutAnim.active() != g.aboutTimer) {
+    g.aboutTimer = g.aboutAnim.active();
+    if (g.aboutTimer) SetTimer(g.about, TIMER_ANIM, 15, nullptr);
+    else KillTimer(g.about, TIMER_ANIM);
+  }
+}
+
+int aboutHitAt(LPARAM lp) {
+  float k = 96.0f / float(GetDpiForWindow(g.about));
+  float x = float(GET_X_LPARAM(lp)) * k, y = float(GET_Y_LPARAM(lp)) * k;
+  for (auto it = g.aboutHits.rbegin(); it != g.aboutHits.rend(); ++it)
+    if (it->r.contains(x, y)) return it->id;
+  return ID_NONE;
+}
+
+LRESULT CALLBACK aboutProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+  switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      BeginPaint(h, &ps);
+      paintAbout();
+      EndPaint(h, &ps);
+      return 0;
+    }
+    case WM_TIMER: InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_MOUSEMOVE: {
+      if (!g.aboutTracking) {
+        TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, h, 0};
+        TrackMouseEvent(&t);
+        g.aboutTracking = true;
+      }
+      int id = aboutHitAt(lp);
+      if (id != g.aboutHover) {
+        g.aboutHover = id;
+        InvalidateRect(h, nullptr, FALSE);
+      }
+      return 0;
+    }
+    case WM_MOUSELEAVE:
+      g.aboutTracking = false;
+      g.aboutHover = ID_NONE;
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    case WM_SETCURSOR:
+      if (LOWORD(lp) == HTCLIENT) {
+        SetCursor(LoadCursorW(nullptr, g.aboutHover != ID_NONE ? IDC_HAND : IDC_ARROW));
+        return TRUE;
+      }
+      return DefWindowProcW(h, msg, wp, lp);
+    case WM_LBUTTONDOWN:
+      g.aboutPressed = aboutHitAt(lp);
+      SetCapture(h);
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    case WM_LBUTTONUP: {
+      ReleaseCapture();
+      int id = aboutHitAt(lp), was = g.aboutPressed;
+      g.aboutPressed = ID_NONE;
+      if (id != ID_NONE && id == was) {
+        if (id == B_CHECK) checkUpdatesNow();
+        else if (id == B_UPDATE) installUpdate();
+        else if (id == B_SITE) ShellExecuteW(h, L"open", kSite, nullptr, nullptr, SW_SHOWNORMAL);
+      }
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    }
+    case WM_KEYDOWN:
+      if (wp == VK_ESCAPE || wp == VK_RETURN) DestroyWindow(h);
+      return 0;
+    case WM_DPICHANGED: {
+      const RECT* r = reinterpret_cast<const RECT*>(lp);
+      SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    }
+    case WM_DESTROY:
+      g.about = nullptr;
+      g.aboutTimer = g.aboutTracking = false;
+      g.aboutHits.clear();
+      return 0;
+    default:
+      return DefWindowProcW(h, msg, wp, lp);
+  }
 }
 
 /* ------------------------------------------------ input */
@@ -1324,8 +1441,7 @@ void onClick(int id) {
     case B_JOIN: startWatching(parseCode(getText(g.code))); break;
     case B_REMEMBER: g.remember = !g.remember; break;
     case B_AUDIO: g.audio = !g.audio; break;
-    case B_ABOUT: show(Screen::About); break;
-    case B_BACK: show(Screen::Home); break;
+    case B_ABOUT: showAbout(); break;
     case B_COPY: copyLink(); break;
     case B_PAUSE:
       g.live = !g.live;
@@ -1342,7 +1458,6 @@ void onClick(int id) {
     case B_UPDATE: installUpdate(); break;
     case B_CHECK: checkUpdatesNow(); break;
     case B_SITE: ShellExecuteW(g.wnd, L"open", kSite, nullptr, nullptr, SW_SHOWNORMAL); break;
-    case B_RELEASES: ShellExecuteW(g.wnd, L"open", kReleases, nullptr, nullptr, SW_SHOWNORMAL); break;
     default: break;
   }
   animate();
@@ -1397,7 +1512,7 @@ void makeEditFont() {
   HFONT old = g.editFont;
   g.editFont = CreateFontW(-px(14.5f), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
                            L"Segoe UI");
-  for (HWND h : {g.pass, g.code, g.server})
+  for (HWND h : {g.pass, g.code})
     if (h) SendMessageW(h, WM_SETFONT, WPARAM(g.editFont), TRUE);
   if (old) DeleteObject(old);
   g.placed.clear();
@@ -1409,7 +1524,6 @@ void createControls() {
   std::wstring pw = loadPassword();
   g.pass = makeEdit(ID_PASSWORD, ES_PASSWORD, pw, L"jelszó");
   g.code = makeEdit(ID_CODE, 0, L"", L"pl. abc123 vagy https://mozizas.hu/#abc123");
-  g.server = makeEdit(ID_SERVER, 0, loadString(L"Server", L"https://mozizas.hu"), nullptr);
   g.video = CreateWindowExW(0, L"SSVideo", L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, g.wnd, nullptr, g.inst, nullptr);
   g.remember = !pw.empty();
   g.audio = loadDword(L"Audio", 1) != 0;
@@ -1425,6 +1539,10 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       g.wnd = h;
       g.dpi = GetDpiForWindow(h);
       createControls();
+      if (HMENU sys = GetSystemMenu(h, FALSE)) {
+        AppendMenuW(sys, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(sys, MF_STRING, kSysAbout, L"A Screen Share névjegye");
+      }
       SetTimer(h, TIMER_TICK, 1000, nullptr);
       checkUpdatesLater();
       return 0;
@@ -1523,8 +1641,6 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           g.stats = !g.stats;
           tick();
         } else if (wp == 'M') setMuted(!g.muted);
-      } else if (g.screen == Screen::About && (wp == VK_ESCAPE || wp == VK_BACK)) {
-        show(Screen::Home);
       }
       return 0;
     case WM_TIMER:
@@ -1545,11 +1661,13 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       } else {
         g.updateNote = L"Ez a legújabb verzió.";
       }
+      refreshAbout();
       animate();
       return 0;
     }
     case WM_UPDATE_PROGRESS:
       g.updateProgress = int(wp);
+      refreshAbout();
       animate();
       return 0;
     case WM_UPDATE_DONE:
@@ -1559,9 +1677,16 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         g.updating = false;
         g.updateProgress = -1;
         g.updateNote = L"A frissítés nem sikerült – próbáld újra.";
+        refreshAbout();
         animate();
       }
       return 0;
+    case WM_SYSCOMMAND:
+      if ((wp & 0xFFF0) == kSysAbout) {
+        showAbout();
+        return 0;
+      }
+      return DefWindowProcW(h, msg, wp, lp);
     case WM_CLOSE:
       if (g.screen == Screen::Hosting) {
         ask(L"Kilépsz?", L"A megosztás befejeződik: a nézőknél megáll a kép, és a szoba bezárul.", L"Kilépés", L"Mégse", true, [h] { DestroyWindow(h); });
@@ -1688,25 +1813,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
   vc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   vc.lpszClassName = L"SSVideo";
   RegisterClassExW(&vc);
+  WNDCLASSEXW ac{sizeof ac};
+  ac.lpfnWndProc = aboutProc;
+  ac.hInstance = inst;
+  ac.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  ac.hbrBackground = CreateSolidBrush(kBgGdi);
+  ac.lpszClassName = L"SSAbout";
+  RegisterClassExW(&ac);
   if (argc == 6 && (std::wstring(argv[1]) == L"--smoke-host" || std::wstring(argv[1]) == L"--smoke-view")) return smoke(argc, argv);
   HWND wnd = CreateWindowExW(0, L"ScreenShare", L"Screen Share", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1120, 800, nullptr, nullptr, inst,
                              nullptr);
-  // the title bar in the app's colours (Windows 10 2004+ dark mode; Windows 11 caption colour, round corners)
-  typedef HRESULT(WINAPI * SetAttr)(HWND, DWORD, LPCVOID, DWORD);
-  if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) {
-    FARPROC f = GetProcAddress(dwm, "DwmSetWindowAttribute");
-    SetAttr set;
-    std::memcpy(&set, &f, sizeof set);
-    if (set) {
-      BOOL dark = TRUE;
-      set(wnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
-      COLORREF caption = kBgGdi, text = kTextGdi;
-      set(wnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof caption);
-      set(wnd, 36 /* DWMWA_TEXT_COLOR */, &text, sizeof text);
-      DWORD round = 2; // DWMWCP_ROUND
-      set(wnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &round, sizeof round);
-    }
-  }
+  styleTitleBar(wnd);
   // a room link given on the command line (screenshare://abc123 or the code)
   std::wstring arg = cmd ? cmd : L"";
   ShowWindow(wnd, showCmd);
@@ -1717,7 +1834,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
   }
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0)) {
-    if (msg.message == WM_KEYDOWN && (g.modal.open || g.screen == Screen::Viewing || g.screen == Screen::About)) {
+    if (msg.message == WM_KEYDOWN && msg.hwnd != g.about && (g.modal.open || g.screen == Screen::Viewing)) {
       // keys in the viewer go to the window, whichever child has the focus
       SendMessageW(g.wnd, WM_KEYDOWN, msg.wParam, msg.lParam);
       continue;
