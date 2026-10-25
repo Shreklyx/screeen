@@ -26,7 +26,7 @@ identity() {
   rm -rf "$DIR"
   mkdir -p "$DIR" && chmod 700 "$DIR" || return 1
   local pw tmp list ok=1
-  pw=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
+  pw=$(/usr/bin/openssl rand -hex 16) || return 1 # (no "tr </dev/urandom | head": the app ignores SIGPIPE, and so would tr)
   tmp=$(mktemp -d) || return 1
   cat >"$tmp/c.cnf" <<EOF
 [req]
