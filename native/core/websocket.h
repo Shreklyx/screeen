@@ -26,6 +26,7 @@ class WebSocket {
   /** Bytes handed to send() that have not left yet (as the browsers' bufferedAmount). */
   virtual size_t bufferedAmount() const = 0;
   virtual bool isOpen() const = 0;
+  /** After it returns no callback runs any more (one under way on another thread is waited for). */
   virtual void close() = 0;
 };
 

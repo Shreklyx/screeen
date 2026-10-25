@@ -36,8 +36,9 @@ class MacWebSocket : public WebSocket, public std::enable_shared_from_this<MacWe
       if (!self) return;
       if (error) return self->finish();
       self->open_ = true;
-      WebSocketEvents ev = self->events();
-      if (ev.open) ev.open();
+      self->fire([](const WebSocketEvents& ev) {
+        if (ev.open) ev.open();
+      });
     }];
     receive();
   }
@@ -54,12 +55,17 @@ class MacWebSocket : public WebSocket, public std::enable_shared_from_this<MacWe
   bool isOpen() const override { return open_; }
 
   void close() override {
+    bool first;
     {
       std::lock_guard<std::mutex> l(mu_);
-      if (closed_) return;
+      first = !closed_;
       closed_ = true;
       ev_ = WebSocketEvents{};
     }
+    {
+      std::lock_guard<std::recursive_mutex> gate(gate_); // nor one still running
+    }
+    if (!first) return;
     // what was sent still goes: cancel after the queue is empty (or a moment)
     NSURLSessionWebSocketTask* task = task_;
     NSURLSession* session = session_;
@@ -70,9 +76,17 @@ class MacWebSocket : public WebSocket, public std::enable_shared_from_this<MacWe
   }
 
  private:
-  WebSocketEvents events() {
-    std::lock_guard<std::mutex> l(mu_);
-    return ev_;
+  /** Calls fn with the events as they are now: nothing once close() has been called (and close()
+   *  waits for a call already under way, so that after it nothing runs). */
+  template <typename Fn>
+  void fire(Fn fn) {
+    std::lock_guard<std::recursive_mutex> gate(gate_);
+    WebSocketEvents ev;
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      ev = ev_;
+    }
+    fn(ev);
   }
 
   void send(NSURLSessionWebSocketMessage* m, size_t n) {
@@ -93,17 +107,19 @@ class MacWebSocket : public WebSocket, public std::enable_shared_from_this<MacWe
       auto self = weak.lock();
       if (!self) return;
       if (error || !m) return self->finish();
-      WebSocketEvents ev = self->events();
-      if (m.type == NSURLSessionWebSocketMessageTypeString) {
-        if (ev.text) ev.text(std::string(m.string.UTF8String ?: ""));
-      } else if (ev.binary) {
-        ev.binary(static_cast<const uint8_t*>(m.data.bytes), m.data.length);
-      }
+      self->fire([m](const WebSocketEvents& ev) {
+        if (m.type == NSURLSessionWebSocketMessageTypeString) {
+          if (ev.text) ev.text(std::string(m.string.UTF8String ?: ""));
+        } else if (ev.binary) {
+          ev.binary(static_cast<const uint8_t*>(m.data.bytes), m.data.length);
+        }
+      });
       self->receive();
     }];
   }
 
   void finish() {
+    std::lock_guard<std::recursive_mutex> gate(gate_);
     std::function<void()> closed;
     {
       std::lock_guard<std::mutex> l(mu_);
@@ -119,6 +135,7 @@ class MacWebSocket : public WebSocket, public std::enable_shared_from_this<MacWe
 
   WebSocketEvents ev_;
   std::mutex mu_;
+  std::recursive_mutex gate_; // held while a callback runs
   bool closed_ = false, finished_ = false;
   std::atomic<bool> open_{false};
   std::atomic<size_t> queued_{0};

@@ -63,14 +63,16 @@ class WinHttpSocket : public std::enable_shared_from_this<WinHttpSocket> {
 
   /** What is queued still goes (a goodbye to the server), then the socket closes. */
   void close() {
+    bool first;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      if (closeRequested_) return;
+      first = !closeRequested_;
       closeRequested_ = true;
       ev_ = WebSocketEvents{}; // no callbacks after close()
-      if (!open_) closing_ = true; // still connecting: the reader stops once the handshake is over
+      if (first && !open_) closing_ = true; // still connecting: the reader stops once the handshake is over
     }
-    cv_.notify_all();
+    if (first) cv_.notify_all();
+    std::lock_guard<std::recursive_mutex> gate(gate_); // nor one still running on the reader
   }
 
  private:
@@ -79,17 +81,30 @@ class WinHttpSocket : public std::enable_shared_from_this<WinHttpSocket> {
     std::vector<uint8_t> data;
   };
 
-  void finish() {
-    open_ = false;
-    std::function<void()> closed;
+  /** Calls fn with the events as they are now: nothing once close() has been called (and close()
+   *  waits for a call already under way, so that after it nothing runs). */
+  template <typename Fn>
+  void fire(Fn fn) {
+    std::lock_guard<std::recursive_mutex> gate(gate_);
+    WebSocketEvents ev;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      closed = ev_.closed;
-      closing_ = true;
-      ev_ = WebSocketEvents{};
+      ev = ev_;
     }
-    cv_.notify_all();
-    if (closed) closed();
+    fn(ev);
+  }
+
+  void finish() {
+    open_ = false;
+    fire([this](const WebSocketEvents& ev) {
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        closing_ = true;
+        ev_ = WebSocketEvents{};
+      }
+      cv_.notify_all();
+      if (ev.closed) ev.closed();
+    });
   }
 
   void readLoop() {
@@ -135,14 +150,9 @@ class WinHttpSocket : public std::enable_shared_from_this<WinHttpSocket> {
     WinHttpCloseHandle(std::exchange(request_, nullptr));
     open_ = true;
     cv_.notify_all();
-    {
-      std::function<void()> opened;
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        opened = ev_.open;
-      }
-      if (opened) opened();
-    }
+    fire([](const WebSocketEvents& ev) {
+      if (ev.open) ev.open();
+    });
     std::vector<uint8_t> message;
     std::vector<uint8_t> buf(64 * 1024);
     for (;;) {
@@ -153,16 +163,13 @@ class WinHttpSocket : public std::enable_shared_from_this<WinHttpSocket> {
       message.insert(message.end(), buf.begin(), buf.begin() + read);
       if (message.size() > (64u << 20)) break;
       if (type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE || type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE) continue;
-      WebSocketEvents ev;
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        ev = ev_;
-      }
-      if (type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
-        if (ev.text) ev.text(std::string(message.begin(), message.end()));
-      } else if (ev.binary) {
-        ev.binary(message.data(), message.size());
-      }
+      fire([&](const WebSocketEvents& ev) {
+        if (type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
+          if (ev.text) ev.text(std::string(message.begin(), message.end()));
+        } else if (ev.binary) {
+          ev.binary(message.data(), message.size());
+        }
+      });
       message.clear();
     }
     finish();
@@ -199,6 +206,7 @@ class WinHttpSocket : public std::enable_shared_from_this<WinHttpSocket> {
   std::string url_;
   WebSocketEvents ev_;
   mutable std::mutex mu_;
+  std::recursive_mutex gate_; // held while a callback runs
   std::condition_variable cv_;
   std::deque<Out> out_;
   size_t queued_ = 0;

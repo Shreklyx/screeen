@@ -57,7 +57,7 @@ class Loop {
   void start();
   void stop();
   void post(std::function<void()> fn);
-  bool onLoopThread() const { return std::this_thread::get_id() == threadId_; }
+  bool onLoopThread() const { return std::this_thread::get_id() == threadId_.load(); }
   /** Calls fn after ms (repeating every ms when repeat); returns an id for cancel(). */
   int setTimer(double ms, std::function<void()> fn, bool repeat = false);
   void cancel(int id);
@@ -73,7 +73,7 @@ class Loop {
     std::function<void()> fn;
   };
   std::thread thread_;
-  std::thread::id threadId_;
+  std::atomic<std::thread::id> threadId_{}; // read from any thread
   std::atomic<bool> running_{false};
   std::mutex mu_;
   std::vector<std::function<void()>> posted_;

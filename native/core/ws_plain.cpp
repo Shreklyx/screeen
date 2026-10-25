@@ -73,14 +73,18 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
   bool isOpen() const override { return open_; }
 
   void close() override {
+    bool first;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      if (closing_) return;
+      first = !closing_;
       closing_ = true;
       ev_ = WebSocketEvents{}; // no more callbacks after close()
     }
-    cv_.notify_all();
-    if (sock_ != kNoSock) shutdownSock(sock_);
+    if (first) {
+      cv_.notify_all();
+      if (sock_ != kNoSock) shutdownSock(sock_);
+    }
+    std::lock_guard<std::recursive_mutex> gate(gate_); // nor one still running on the reader
   }
 
  private:
@@ -156,19 +160,30 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
     return len;
   }
 
-  void finish() {
-    bool wasOpen = open_;
-    open_ = false;
-    std::function<void()> closed;
+  /** Calls fn with the events as they are now: nothing once close() has been called (and close()
+   *  waits for a call already under way, so that after it nothing runs). */
+  template <typename Fn>
+  void fire(Fn fn) {
+    std::lock_guard<std::recursive_mutex> gate(gate_);
+    WebSocketEvents ev;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      closed = ev_.closed;
-      closing_ = true;
+      ev = ev_;
     }
-    cv_.notify_all();
-    if (sock_ != kNoSock) shutdownSock(sock_); // closed when both threads are done (destructor)
-    (void)wasOpen;
-    if (closed) closed();
+    fn(ev);
+  }
+
+  void finish() {
+    open_ = false;
+    fire([this](const WebSocketEvents& ev) {
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        closing_ = true;
+      }
+      cv_.notify_all();
+      if (sock_ != kNoSock) shutdownSock(sock_); // closed when both threads are done (destructor)
+      if (ev.closed) ev.closed();
+    });
   }
 
   void readLoop() {
@@ -223,14 +238,9 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
     if (head.compare(0, 12, "HTTP/1.1 101") != 0 || head.find(base64Encode(digest, 20)) == std::string::npos) return finish();
     open_ = true;
     cv_.notify_all();
-    {
-      std::function<void()> opened;
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        opened = ev_.open;
-      }
-      if (opened) opened();
-    }
+    fire([](const WebSocketEvents& ev) {
+      if (ev.open) ev.open();
+    });
     Bytes message;
     uint8_t messageOp = 0;
     for (;;) {
@@ -259,13 +269,10 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
       else if (op == 0) message.insert(message.end(), payload.begin(), payload.end());
       else continue;
       if (!fin) continue;
-      WebSocketEvents ev;
-      {
-        std::lock_guard<std::mutex> lock(mu_);
-        ev = ev_;
-      }
-      if (messageOp == 1 && ev.text) ev.text(std::string(message.begin(), message.end()));
-      else if (messageOp == 2 && ev.binary) ev.binary(message.data(), message.size());
+      fire([&](const WebSocketEvents& ev) {
+        if (messageOp == 1 && ev.text) ev.text(std::string(message.begin(), message.end()));
+        else if (messageOp == 2 && ev.binary) ev.binary(message.data(), message.size());
+      });
       message.clear();
     }
     finish();
@@ -274,6 +281,7 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
   std::string url_;
   WebSocketEvents ev_;
   mutable std::mutex mu_;
+  std::recursive_mutex gate_; // held while a callback runs
   std::condition_variable cv_;
   std::deque<Bytes> out_;
   size_t queued_ = 0;

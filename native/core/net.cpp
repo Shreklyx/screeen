@@ -182,7 +182,7 @@ void Loop::start() {
   wakeSock_.open(true);
   running_ = true;
   thread_ = std::thread([this] { run(); });
-  threadId_ = thread_.get_id();
+  threadId_ = thread_.get_id(); // (run() sets the same: whichever comes first)
 }
 
 void Loop::stop() {
