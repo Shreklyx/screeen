@@ -118,8 +118,12 @@ struct HostPipeline::Impl {
           have = true;
           pending = true;
         }
-        // a keyframe asked for while the screen stands still: the last image again
-        if (have && !pending && wantKey && nowMs() - lastEncode >= interval) pending = true;
+        // a keyframe asked for while the screen stands still: the last image again – still what the
+        // screen shows, so captured now (its old time would count the still seconds as delay)
+        if (have && !pending && wantKey && nowMs() - lastEncode >= interval) {
+          pending = true;
+          captureMs = nowMs();
+        }
         if (!pending || !streaming || nowMs() < nextAt - slack) continue;
         double started = nowMs();
         nextAt = std::max(nextAt, started) + interval; // (late, or after a still screen: from now)

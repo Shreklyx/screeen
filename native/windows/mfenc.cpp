@@ -81,7 +81,10 @@ class MfEncoder : public VideoEncoder {
       setBool(codec.Get(), CODECAPI_AVLowLatencyMode, true); // one frame in, one frame out
       setUInt(codec.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
       setUInt(codec.Get(), CODECAPI_AVEncMPVGOPSize, ULONG(fps * 600)); // keyframes when a viewer needs one
-      setUInt(codec.Get(), CODECAPI_AVEncCommonQualityVsSpeed, 100);
+      // speed over the last bit of quality, as real-time streaming does (the encode time is delay):
+      // a GPU's encoder at its balanced setting (Intel: target usage 4, AMD: balanced), the
+      // processor at a fast one (it is the fallback); 100 was the slowest, best-quality setting
+      setUInt(codec.Get(), CODECAPI_AVEncCommonQualityVsSpeed, hardware_ ? 50 : 33);
     }
     ComPtr<IMFMediaType> out;
     MFCreateMediaType(&out);
