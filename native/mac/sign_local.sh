@@ -102,7 +102,8 @@ case "${1:-}" in
       log "not signed, the app stays as it was"
     fi
     [ -n "$tmp" ] && rm -rf "$tmp"
-    [ "$start" = 1 ] && open "$app"
+    if [ "$start" = 1 ]; then open "$app"; fi
+    [ $ok = 0 ]
     ;;
   *)
     echo "usage: $0 sign <app> | swap <pid> <app> <new app|-> <0|1>" >&2
