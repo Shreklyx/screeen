@@ -312,6 +312,53 @@ test('TCP fallback: through the server\'s WebSocket when no UDP gets through', a
   }
 });
 
+test('WebSocket path: the server does not queue more than ~150 ms towards a viewer that is too slow', async () => {
+  const { WebSocket: WsClient } = await import('ws');
+  const { TCP_MAX_WAIT_MS } = await import('../server/direct-relay.js');
+  const { createApp } = await import('../server/server.js');
+  const app = createApp({ port: 0, host: '127.0.0.1', hostPassword: 'x', turnSecret: '', directPort: 0 });
+  await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
+  const url = `ws://127.0.0.1:${app.server.address().port}/direct`;
+  const { session, secret } = app.relay.create({ room: 'r', viewer: 'v1' });
+  const join = (role) => new Promise((resolve, reject) => {
+    const ws = new WsClient(url);
+    ws.on('open', () => {
+      const nonce = crypto.randomBytes(8).toString('hex');
+      const mac = crypto.createHmac('sha256', Buffer.from(secret, 'base64')).update(`tcp:${session}:${role}:${nonce}`).digest().subarray(0, 16);
+      ws.send(JSON.stringify({ session, role, nonce, mac: mac.toString('base64') }));
+    });
+    ws.once('message', (m) => (String(m) === 'ok' ? resolve(ws) : reject(new Error(String(m)))));
+    ws.on('error', reject);
+  });
+  const host = await join(1);
+  const viewer = await join(2);
+  try {
+    const towardsViewer = [...app.relay.sessions.values()][0].tcp[2];
+    viewer._socket.pause(); // a viewer whose line does not keep up
+    const packet = Buffer.alloc(64 * 1024, 7);
+    // the system's socket buffers fill first; then packets wait in the server's own queue
+    for (let i = 0; i < 1000 && towardsViewer.bufferedAmount === 0; i++) {
+      host.send(packet);
+      await sleep(i % 20 === 19 ? 5 : 0);
+    }
+    assert.ok(towardsViewer.bufferedAmount > 0, 'the queue did not fill');
+    // 30 ms apart for 1.5 s: without a limit in time 2 MB would wait (~0.8 s at 20 Mbit/s)
+    let most = 0;
+    for (let i = 0; i < 50; i++) {
+      host.send(packet);
+      await sleep(30);
+      most = Math.max(most, towardsViewer.bufferedAmount);
+    }
+    const perPacket = packet.length + 10;
+    assert.ok(most <= perPacket * (Math.ceil(TCP_MAX_WAIT_MS / 30) + 3), `queued ${most} bytes`);
+  } finally {
+    viewer._socket.resume();
+    host.terminate();
+    viewer.terminate();
+    await app.close();
+  }
+});
+
 /* ---- the browser's transport (public/direct-web.js) against the app's ---- */
 
 async function loadWebDirect() {

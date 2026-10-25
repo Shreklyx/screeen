@@ -22,6 +22,27 @@ const END_TTL_MS = 90 * 1000; // a registration (or relayed packet) keeps an end
 
 const hmac16 = (secret, data) => crypto.createHmac('sha256', secret).update(data).digest().subarray(0, 16);
 
+// The WebSocket path: the longest a packet may wait in the server's queue towards a peer.
+export const TCP_MAX_WAIT_MS = 150;
+
+/** Sends a packet and notes when it was queued (what queuedFor reads). */
+function sendTimed(ws, packet) {
+  const q = (ws.ssQueue ||= { sent: 0, marks: [] });
+  // (bufferedAmount counts the frame header too: 2, 4 or 10 bytes from the server)
+  q.sent += packet.length + (packet.length < 126 ? 2 : packet.length < 65536 ? 4 : 10);
+  q.marks.push({ end: q.sent, at: Date.now() });
+  ws.send(packet, { binary: true });
+}
+
+/** How long the oldest packet still in the queue towards `ws` has waited (ms; 0: none waits). */
+export function queuedFor(ws, now) {
+  const q = ws.ssQueue;
+  if (!q) return 0;
+  const left = q.sent - ws.bufferedAmount; // what has gone out of the queue
+  while (q.marks.length && q.marks[0].end <= left) q.marks.shift();
+  return q.marks.length ? now - q.marks[0].at : 0;
+}
+
 export function createRelay({ port = 0, host } = {}) {
   const sessions = new Map(); // id → { secret, room, viewer, ends: { 1: end, 2: end } }
   const socket = dgram.createSocket({ type: 'udp4' });
@@ -71,10 +92,13 @@ export function createRelay({ port = 0, host } = {}) {
       s.tcp[role] = ws;
       ws.on('message', (packet, binary) => {
         const other = s.tcp?.[role === 1 ? 2 : 1];
-        // late frames are worth nothing: a peer that does not keep up loses them (it asks for a keyframe)
-        if (!binary || !other || other.readyState !== other.OPEN || other.bufferedAmount > 2 << 20) return;
+        if (!binary || !other || other.readyState !== other.OPEN) return;
+        // late frames are worth nothing: what would wait behind more than TCP_MAX_WAIT_MS of
+        // others (a viewer whose line is slower than the picture) is dropped, so the delay stays
+        // small; the viewer asks for a keyframe and the sharer sends less
+        if (other.bufferedAmount > 2 << 20 || queuedFor(other, Date.now()) > TCP_MAX_WAIT_MS) return;
         s.relayed += packet.length;
-        other.send(packet, { binary: true });
+        sendTimed(other, packet);
       });
       ws.on('close', () => { if (s.tcp?.[role] === ws) delete s.tcp[role]; });
       ws.send('ok');
