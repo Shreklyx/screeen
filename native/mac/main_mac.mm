@@ -82,6 +82,49 @@ static NSString* loadPassword() {
   return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
 }
 
+/* ------------------------------------------------ this Mac's own signature (sign_local.sh) */
+
+// macOS keeps what was allowed (screen and sound recording, the keychain, the local network) for the
+// app's signing identity. The builds are signed ad hoc – another identity for every version – so the
+// app signs itself, and each update, with an identity of this Mac's own: asked once, remembered.
+static NSString* const kSigningName = @"Screen Share Local Signing";
+
+static bool signedLocally() {
+  SecStaticCodeRef code = nullptr;
+  if (SecStaticCodeCreateWithPath((__bridge CFURLRef)NSBundle.mainBundle.bundleURL, kSecCSDefaultFlags, &code) != errSecSuccess || !code) return false;
+  bool mine = false;
+  CFDictionaryRef info = nullptr;
+  if (SecCodeCopySigningInformation(code, kSecCSSigningInformation, &info) == errSecSuccess && info) {
+    NSArray* certs = ((__bridge NSDictionary*)info)[(__bridge id)kSecCodeInfoCertificates];
+    CFStringRef name = nullptr;
+    if (certs.count && SecCertificateCopyCommonName((__bridge SecCertificateRef)certs[0], &name) == errSecSuccess && name) {
+      mine = [(__bridge NSString*)name isEqualToString:kSigningName];
+      CFRelease(name);
+    }
+    CFRelease(info);
+  }
+  CFRelease(code);
+  return mine;
+}
+
+/** The helper, copied out of the app first: the app it is in gets replaced while it runs. */
+static NSString* signingHelper() {
+  NSString* src = [NSBundle.mainBundle pathForResource:@"sign_local" ofType:@"sh"];
+  NSString* dst = [NSTemporaryDirectory() stringByAppendingPathComponent:@"screenshare-sign.sh"];
+  [NSFileManager.defaultManager removeItemAtPath:dst error:nil];
+  return src && [NSFileManager.defaultManager copyItemAtPath:src toPath:dst error:nil] ? dst : nil;
+}
+
+/** Once the app has quit: `fresh` (an update; nil: a signed copy of this one) in its place, signed with
+ *  this Mac's identity; then started again. */
+static bool swapAfterQuit(NSString* fresh) {
+  NSString* helper = signingHelper();
+  if (!helper) return false;
+  NSString* pid = [NSString stringWithFormat:@"%d", NSProcessInfo.processInfo.processIdentifier];
+  [NSTask launchedTaskWithLaunchPath:@"/bin/bash" arguments:@[ helper, @"swap", pid, NSBundle.mainBundle.bundlePath, fresh ?: @"-", @"1" ]];
+  return true;
+}
+
 /* ------------------------------------------------ small helpers */
 
 static NSImage* symbol(NSString* name, CGFloat size, NSFontWeight weight = NSFontWeightRegular) {
@@ -452,10 +495,11 @@ static NSColor* latencyColor(double ms) {
   bool _live, _picture, _stats, _muted, _checking, _barHidden;
   std::string _roomLink, _statusKind;
   Json _viewStats;
-  NSString *_updateFile, *_updateVersion;
+  NSString *_updateFile, *_updateVersion, *_savedPassword;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification*)n {
+  if ([self signLocallyFirst]) return;
   [self makeMenu];
   _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, kHomeWidth + 2 * kSide, 560)
                                         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView
@@ -495,6 +539,21 @@ static NSColor* latencyColor(double ms) {
                                           SSApp* s = weak;
                                           return s ? [s key:e] : e;
                                         }];
+}
+
+/** Not yet signed with this Mac's own identity (a new install, or an update the old way): before
+ *  anything is asked, the app signs itself and starts again – a second. Tried once per build. */
+- (BOOL)signLocallyFirst {
+  NSString* app = NSBundle.mainBundle.bundlePath;
+  NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
+  NSString* build = [NSString stringWithFormat:@"%s-%s", SS_VERSION, SS_BUILD];
+  if ([app hasPrefix:@"/Volumes/"] || [app containsString:@"/AppTranslocation/"] || [[ud stringForKey:@"signTried"] isEqualToString:build]) return NO;
+  if (![NSFileManager.defaultManager isWritableFileAtPath:app.stringByDeletingLastPathComponent] || signedLocally()) return NO;
+  [ud setObject:build forKey:@"signTried"];
+  [ud synchronize];
+  if (!swapAfterQuit(nil)) return NO;
+  [NSApp terminate:nil];
+  return YES;
 }
 
 - (NSEvent*)key:(NSEvent*)e {
@@ -719,7 +778,8 @@ static NSColor* latencyColor(double ms) {
   _password = [NSSecureTextField new];
   _password.placeholderString = @"megosztási jelszó";
   _password.bezelStyle = NSTextFieldRoundedBezel;
-  _password.stringValue = loadPassword();
+  _savedPassword = loadPassword();
+  _password.stringValue = _savedPassword;
   sizeTo(_password, 210, 0);
   _remember = makeSwitch(_password.stringValue.length > 0);
   SSGroup* access = [SSGroup new];
@@ -1026,7 +1086,11 @@ static NSColor* latencyColor(double ms) {
   NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
   [ud setInteger:quality forKey:@"quality"];
   [ud setBool:_audio.state == NSControlStateValueOn forKey:@"audio"];
-  savePassword(_remember.state == NSControlStateValueOn ? pw : @"");
+  NSString* keep = _remember.state == NSControlStateValueOn ? pw : @"";
+  if (![keep isEqualToString:_savedPassword]) { // the keychain only when it changes
+    savePassword(keep);
+    _savedPassword = keep;
+  }
   _shareError.hidden = YES;
   [self endSession];
   int session = ++_session;
@@ -1418,7 +1482,11 @@ static std::string parseCode(NSString* text) {
                                         [self ask:@"A frissítés nem sikerült" text:@"Nem tudtam letölteni az új verziót. Próbáld újra később." ok:@"OK" cancel:nil danger:NO action:nil];
                                         return;
                                       }
-                                      // after we quit: the new app in place of this one, then start it
+                                      // after we quit: the new app (signed with this Mac's identity) in place of this one, then start it
+                                      if (swapAfterQuit(fresh)) {
+                                        [NSApp terminate:nil];
+                                        return;
+                                      }
                                       NSString* target = NSBundle.mainBundle.bundlePath;
                                       NSString* script = [NSString
                                           stringWithFormat:@"while kill -0 %d 2>/dev/null; do sleep 0.2; done; rm -rf \"%@\" && mv \"%@\" \"%@\" && xattr -dr com.apple.quarantine \"%@\" 2>/dev/null; open \"%@\"",

@@ -40,6 +40,8 @@
   <true/>
   <key>NSScreenCaptureUsageDescription</key>
   <string>A képernyőd megosztásához kell.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Helyi hálózaton a nézők közvetlenül kapják a képet – így a legkisebb a késés.</string>
   <key>NSAudioCaptureUsageDescription</key>
   <string>A gép hangjának megosztásához kell.</string>
   <key>NSAppTransportSecurity</key>

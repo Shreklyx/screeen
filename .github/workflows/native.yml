@@ -160,6 +160,33 @@ jobs:
           codesign --verify --verbose "dist/Screen Share.app"
       - name: Core tests
         run: build-arm64/sscore_test
+      # the app signs itself and its updates with this Mac's own identity (sign_local.sh): two different
+      # builds must get the same designated requirement, so that macOS keeps the permissions it gave
+      - name: "Own signature: another build, the same identity"
+        timeout-minutes: 5
+        run: |
+          set -e
+          helper="dist/Screen Share.app/Contents/Resources/sign_local.sh"
+          lists=$(security list-keychains -d user | tr -d ' ')
+          for n in 1 2; do
+            rm -rf own$n && mkdir own$n && ditto "dist/Screen Share.app" "own$n/Screen Share.app"
+            echo "build $n" > "own$n/Screen Share.app/Contents/Resources/build.txt" # another build
+            bash "$helper" sign "own$n/Screen Share.app"
+            codesign -d -r- "own$n/Screen Share.app" 2>&1 | grep designated | tee req$n.txt
+          done
+          grep -q certificate req1.txt
+          cmp req1.txt req2.txt
+          [ "$lists" = "$(security list-keychains -d user | tr -d ' ')" ] # the user's keychain list as it was
+          # the way the app does it: after it quits, a signed copy in its place
+          rm -rf own3 && mkdir own3 && ditto "dist/Screen Share.app" "own3/Screen Share.app"
+          bash "$helper" swap 999999 "$PWD/own3/Screen Share.app" - 0
+          cat "$HOME/Library/Logs/Screen Share.log"
+          codesign -d -r- "own3/Screen Share.app" 2>&1 | grep designated | tee req3.txt
+          cmp req1.txt req3.txt
+          codesign --verify --deep --strict "own3/Screen Share.app"
+          # and the signed app runs
+          "own3/Screen Share.app/Contents/MacOS/Screen Share" --smoke-view http://127.0.0.1:9 none 1 own.log
+          cat own.log
       - name: "Smoke: the app watches a native sharer; shares the screen to a native viewer"
         run: |
           PORT=8090 HOST_PASSWORD=ci DIRECT_PORT=3479 node server/server.js &
