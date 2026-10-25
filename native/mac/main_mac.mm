@@ -64,28 +64,80 @@ static const Quality kQualities[] = {
 
 /* ------------------------------------------------ the password in the Keychain */
 
+// The keychain ties an item to the build that saved it: for an app signed without an Apple team its
+// "partition" is the code's hash, so after every update macOS asked for the login password. The item
+// is saved and read by Apple's security tool instead – one and the same program for every version of
+// this app, and so never asked about. (In it: the password's UTF-8 as hex – printable, no quoting.)
+static NSString* const kKeychainService = @"hu.mozizas.screenshare";
+
+/** /usr/bin/security with `args` (and `input` on its standard input): what it printed, and its exit
+ *  status in `status`. */
+static NSString* runSecurity(NSArray<NSString*>* args, NSString* input, int* status) {
+  *status = -1;
+  NSTask* t = [NSTask new];
+  t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/security"];
+  t.arguments = args;
+  NSPipe* out = [NSPipe pipe];
+  NSPipe* in = input ? [NSPipe pipe] : nil;
+  t.standardOutput = out;
+  t.standardError = NSFileHandle.fileHandleWithNullDevice;
+  if (in) t.standardInput = in;
+  else t.standardInput = NSFileHandle.fileHandleWithNullDevice;
+  if (![t launchAndReturnError:nil]) return @"";
+  if (in) {
+    [in.fileHandleForWriting writeData:[input dataUsingEncoding:NSUTF8StringEncoding]];
+    [in.fileHandleForWriting closeFile];
+  }
+  NSData* data = [out.fileHandleForReading readDataToEndOfFile];
+  [t waitUntilExit];
+  *status = t.terminationStatus;
+  return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+}
+
 static void savePassword(NSString* pw) {
-  NSDictionary* q = @{(__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword, (__bridge id)kSecAttrService : @"ScreenShare", (__bridge id)kSecAttrAccount : @"share"};
-  SecItemDelete((__bridge CFDictionaryRef)q);
-  if (!pw.length) return;
-  NSMutableDictionary* add = [q mutableCopy];
-  add[(__bridge id)kSecValueData] = [pw dataUsingEncoding:NSUTF8StringEncoding];
-  SecItemAdd((__bridge CFDictionaryRef)add, nullptr);
+  NSData* utf8 = [pw dataUsingEncoding:NSUTF8StringEncoding];
+  NSMutableString* hex = [NSMutableString stringWithCapacity:utf8.length * 2];
+  for (NSUInteger i = 0; i < utf8.length; i++) [hex appendFormat:@"%02x", ((const uint8_t*)utf8.bytes)[i]];
+  // on its standard input (`-i`), not on the command line, where other programs could see it
+  NSString* cmd = pw.length ? [NSString stringWithFormat:@"add-generic-password -U -s %@ -a share -T /usr/bin/security -w %@\n", kKeychainService, hex]
+                            : [NSString stringWithFormat:@"delete-generic-password -s %@ -a share\n", kKeychainService];
+  int status = 0;
+  runSecurity(@[ @"-i" ], cmd, &status);
 }
 
 static NSString* loadPassword() {
-  NSDictionary* q = @{(__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword, (__bridge id)kSecAttrService : @"ScreenShare", (__bridge id)kSecAttrAccount : @"share",
-                      (__bridge id)kSecReturnData : @YES, (__bridge id)kSecMatchLimit : (__bridge id)kSecMatchLimitOne};
-  CFTypeRef out = nullptr;
-  if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &out) != errSecSuccess || !out) return @"";
-  NSData* d = (__bridge_transfer NSData*)out;
-  return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+  int status = 0;
+  NSString* hex = [runSecurity(@[ @"find-generic-password", @"-s", kKeychainService, @"-a", @"share", @"-w" ], nil, &status)
+      stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (status != 0 || hex.length % 2) return @"";
+  NSMutableData* utf8 = [NSMutableData dataWithLength:hex.length / 2];
+  for (NSUInteger i = 0; i < utf8.length; i++) {
+    unsigned byte = 0;
+    if (sscanf([hex substringWithRange:NSMakeRange(i * 2, 2)].UTF8String, "%2x", &byte) != 1) return @"";
+    ((uint8_t*)utf8.mutableBytes)[i] = (uint8_t)byte;
+  }
+  return [[NSString alloc] initWithData:utf8 encoding:NSUTF8StringEncoding] ?: @"";
+}
+
+/** The item earlier versions saved themselves (each version in a partition of its own): removed –
+ *  never read, which is what asked for the login password. Without any question: where it would
+ *  take one, it stays. */
+static void dropOldPassword() {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  Boolean ui = true;
+  SecKeychainGetUserInteractionAllowed(&ui);
+  SecKeychainSetUserInteractionAllowed(false);
+  NSDictionary* q = @{(__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword, (__bridge id)kSecAttrService : @"ScreenShare", (__bridge id)kSecAttrAccount : @"share"};
+  SecItemDelete((__bridge CFDictionaryRef)q);
+  SecKeychainSetUserInteractionAllowed(ui);
+#pragma clang diagnostic pop
 }
 
 /* ------------------------------------------------ this Mac's own signature (sign_local.sh) */
 
-// macOS keeps what was allowed (screen and sound recording, the keychain, the local network) for the
-// app's signing identity. The builds are signed ad hoc – another identity for every version – so the
+// macOS keeps what was allowed (screen and sound recording, the local network) for the app's signing
+// identity. The builds are signed ad hoc – another identity for every version – so the
 // app signs itself, and each update, with an identity of this Mac's own: asked once, remembered.
 static NSString* const kSigningName = @"Screen Share Local Signing";
 
@@ -778,10 +830,11 @@ static NSColor* latencyColor(double ms) {
   _password = [NSSecureTextField new];
   _password.placeholderString = @"megosztási jelszó";
   _password.bezelStyle = NSTextFieldRoundedBezel;
+  dropOldPassword();
   _savedPassword = loadPassword();
   _password.stringValue = _savedPassword;
   sizeTo(_password, 210, 0);
-  _remember = makeSwitch(_password.stringValue.length > 0);
+  _remember = makeSwitch([ud objectForKey:@"rememberPassword"] ? [ud boolForKey:@"rememberPassword"] : YES);
   SSGroup* access = [SSGroup new];
   [access setRows:@[ formRow(@"Jelszó", nil, _password), formRow(@"Jelszó megjegyzése", nil, _remember) ]];
   _displays = listDisplays();
@@ -1086,6 +1139,7 @@ static NSColor* latencyColor(double ms) {
   NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
   [ud setInteger:quality forKey:@"quality"];
   [ud setBool:_audio.state == NSControlStateValueOn forKey:@"audio"];
+  [ud setBool:_remember.state == NSControlStateValueOn forKey:@"rememberPassword"];
   NSString* keep = _remember.state == NSControlStateValueOn ? pw : @"";
   if (![keep isEqualToString:_savedPassword]) { // the keychain only when it changes
     savePassword(keep);
@@ -1602,6 +1656,15 @@ int main(int argc, const char* argv[]) {
     netInit();
     NSArray<NSString*>* args = NSProcessInfo.processInfo.arguments;
     if (args.count == 6 && ([args[1] isEqualToString:@"--smoke-host"] || [args[1] isEqualToString:@"--smoke-view"])) return smoke(args);
+    if (args.count >= 3 && [args[1] isEqualToString:@"--keychain"]) { // CI: the saved password, from any build
+      if ([args[2] isEqualToString:@"save"] && args.count == 4) {
+        savePassword(args[3]);
+      } else {
+        dropOldPassword(); // (as the app starts)
+        printf("%s\n", loadPassword().UTF8String);
+      }
+      return 0;
+    }
     NSApplication* app = NSApplication.sharedApplication;
     app.activationPolicy = NSApplicationActivationPolicyRegular;
     SSApp* delegate = [SSApp new];

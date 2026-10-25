@@ -188,6 +188,52 @@ jobs:
           # and the signed app runs
           "own3/Screen Share.app/Contents/MacOS/Screen Share" --smoke-view http://127.0.0.1:9 none 1 own.log
           cat own.log
+      # the saved password: another build reads it without macOS asking for the login password (the
+      # keychain gives each build signed without an Apple team a partition of its own – the app saves
+      # and reads through security(1)); a question would hang here, so every call has 20 s
+      - name: "Keychain: another build reads the password, nothing asked"
+        timeout-minutes: 3
+        run: |
+          set -e
+          run() { perl -e 'alarm 20; exec @ARGV' "$@"; }
+          # a keychain of its own, unlocked, as the default for this test
+          kc="$RUNNER_TEMP/kc-test.keychain-db"
+          security create-keychain -p ci "$kc"
+          security unlock-keychain -p ci "$kc"
+          security set-keychain-settings "$kc"
+          oldDefault=$(security default-keychain -d user | tr -d ' "')
+          oldList=$(security list-keychains -d user | tr -d ' "')
+          trap 'security default-keychain -d user -s "$oldDefault"; security list-keychains -d user -s $oldList; security delete-keychain "$kc"' EXIT
+          security list-keychains -d user -s "$kc" $oldList
+          security default-keychain -d user -s "$kc"
+          # what earlier versions left: an item saved by a program signed ad hoc
+          cat > old.c <<'C'
+          #include <Security/Security.h>
+          int main(void) {
+            CFDataRef data = CFDataCreate(NULL, (const UInt8*)"old", 3);
+            const void* k[] = {kSecClass, kSecAttrService, kSecAttrAccount, kSecValueData};
+            const void* v[] = {kSecClassGenericPassword, CFSTR("ScreenShare"), CFSTR("share"), data};
+            CFDictionaryRef q = CFDictionaryCreate(NULL, k, v, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            return SecItemAdd(q, NULL) == errSecSuccess ? 0 : 1;
+          }
+          C
+          clang old.c -framework Security -framework CoreFoundation -o old-item && ./old-item
+          a="dist/Screen Share.app/Contents/MacOS/Screen Share"
+          rm -rf other && mkdir other && ditto "dist/Screen Share.app" "other/Screen Share.app"
+          echo other > "other/Screen Share.app/Contents/Resources/build.txt"
+          codesign --force --deep --sign - "other/Screen Share.app" # another build: another code hash
+          b="other/Screen Share.app/Contents/MacOS/Screen Share"
+          pw='jelszó ő "x" \ $HOME'
+          run "$a" --keychain save "$pw"
+          got=$(run "$b" --keychain load)
+          [ "$got" = "$pw" ] || { echo "read back: [$got]"; exit 1; }
+          run "$b" --keychain save "" # not remembered any more
+          [ -z "$(run "$a" --keychain load)" ]
+          if security find-generic-password -s ScreenShare -a share "$kc" >/dev/null 2>&1; then
+            echo "the old item stays (removing it would have taken a question)"
+          else
+            echo "the old item is gone"
+          fi
       - name: "Smoke: the app watches a native sharer; shares the screen to a native viewer"
         run: |
           PORT=8090 HOST_PASSWORD=ci DIRECT_PORT=3479 node server/server.js &
