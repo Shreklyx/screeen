@@ -16,7 +16,7 @@ target_compile_options(ScreenShareMac PRIVATE -Wall -Wno-missing-field-initializ
 target_link_libraries(ScreenShareMac PRIVATE sscore opus
   "-framework AppKit" "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
   "-framework VideoToolbox" "-framework ScreenCaptureKit" "-framework AudioToolbox" "-framework CoreAudio"
-  "-framework QuartzCore" "-framework IOSurface" "-framework Security")
+  "-framework QuartzCore" "-framework IOSurface" "-framework Metal" "-framework Security")
 
 # the icon (app.icns) when one was made beside the sources (CI: sips + iconutil from desktop/build/icon.png)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/app.icns)

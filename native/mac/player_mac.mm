@@ -2,7 +2,11 @@
 
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMedia/CoreMedia.h>
+#import <AppKit/AppKit.h>
 #import <CoreVideo/CoreVideo.h>
+#import <Metal/Metal.h>
+#import <CoreVideo/CVMetalTexture.h>
+#import <CoreVideo/CVMetalTextureCache.h>
 #import <QuartzCore/QuartzCore.h>
 #import <VideoToolbox/VideoToolbox.h>
 
@@ -18,6 +22,24 @@ namespace ss {
 
 /* ------------------------------------------------ picture */
 
+namespace {
+// the decoded frame (BGRA) letterboxed into the drawable; fades in from black at the start
+NSString* const kShader = @"#include <metal_stdlib>\n"
+                           "using namespace metal;\n"
+                           "struct V { float4 pos [[position]]; float2 uv; };\n"
+                           "vertex V vs(uint id [[vertex_id]], constant float4& rect [[buffer(0)]]) {\n"
+                           "  float2 c = float2(float(id & 1), float(id >> 1));\n"
+                           "  V o;\n"
+                           "  o.pos = float4(mix(rect.x, rect.z, c.x) * 2 - 1, 1 - mix(rect.y, rect.w, c.y) * 2, 0, 1);\n"
+                           "  o.uv = c;\n"
+                           "  return o;\n"
+                           "}\n"
+                           "fragment float4 fs(V i [[stage_in]], texture2d<float> tex [[texture(0)]], constant float& fade [[buffer(0)]]) {\n"
+                           "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+                           "  return float4(tex.sample(s, i.uv).rgb * fade, 1);\n"
+                           "}\n";
+}  // namespace
+
 struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
   MacPlayer* owner = nullptr;
   CALayer* layer = nil;
@@ -27,6 +49,14 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
   std::vector<uint8_t> sps, pps;
   bool needKey = true;
   CVPixelBufferRef shown = nullptr; // kept while it is on screen
+  // Metal: each frame goes to the screen at once – not held for the display's next refresh
+  // (in full screen that is up to a frame less delay); layer.contents when there is no Metal
+  id<MTLDevice> device = nil;
+  id<MTLCommandQueue> commands = nil;
+  id<MTLRenderPipelineState> pipeline = nil;
+  CAMetalLayer* metal = nil;
+  CVMetalTextureCacheRef cache = nullptr;
+  double firstAt = 0;
   // statistics
   mutable std::mutex mu;
   Stats stats;
@@ -42,6 +72,91 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
     }
     if (format) CFRelease(format);
     if (shown) CVPixelBufferRelease(shown);
+    if (cache) CFRelease(cache);
+  }
+
+  /** On the main thread, at the start. */
+  bool makeMetal(CALayer* host) {
+    device = MTLCreateSystemDefaultDevice();
+    if (!device) return false;
+    NSError* err = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:kShader options:nil error:&err];
+    if (!lib) return false;
+    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [lib newFunctionWithName:@"vs"];
+    d.fragmentFunction = [lib newFunctionWithName:@"fs"];
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pipeline = [device newRenderPipelineStateWithDescriptor:d error:&err];
+    commands = [device newCommandQueue];
+    if (!pipeline || !commands || CVMetalTextureCacheCreate(nullptr, nullptr, device, nullptr, &cache) != kCVReturnSuccess) return false;
+    metal = [CAMetalLayer layer];
+    metal.device = device;
+    metal.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metal.framebufferOnly = YES;
+    metal.opaque = YES;
+    metal.displaySyncEnabled = NO; // present now (it may tear rather than wait)
+    metal.maximumDrawableCount = 2;
+    metal.allowsNextDrawableTimeout = YES;
+    metal.contentsScale = NSScreen.mainScreen.backingScaleFactor ?: 2;
+    metal.actions = @{@"bounds" : NSNull.null, @"position" : NSNull.null, @"frame" : NSNull.null, @"contents" : NSNull.null};
+    metal.frame = host.bounds;
+    metal.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    [host addSublayer:metal];
+    return true;
+  }
+
+  bool drawMetal(CVPixelBufferRef image) {
+    if (!metal || !pipeline) return false;
+    CGSize size = metal.bounds.size;
+    CGFloat scale = metal.contentsScale;
+    CGSize px = CGSizeMake(std::max<CGFloat>(1, std::round(size.width * scale)), std::max<CGFloat>(1, std::round(size.height * scale)));
+    if (!CGSizeEqualToSize(metal.drawableSize, px)) metal.drawableSize = px;
+    size_t w = CVPixelBufferGetWidth(image), h = CVPixelBufferGetHeight(image);
+    CVMetalTextureRef ref = nullptr;
+    if (CVMetalTextureCacheCreateTextureFromImage(nullptr, cache, image, nullptr, MTLPixelFormatBGRA8Unorm, w, h, 0, &ref) != kCVReturnSuccess || !ref) return false;
+    id<MTLTexture> tex = CVMetalTextureGetTexture(ref);
+    id<CAMetalDrawable> drawable = tex ? [metal nextDrawable] : nil;
+    if (!drawable) {
+      CFRelease(ref);
+      return false;
+    }
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLCommandBuffer> cb = [commands commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:pass];
+    double k = std::min(px.width / double(w), px.height / double(h));
+    float rw = float(w * k / px.width), rh = float(h * k / px.height);
+    float rect[4] = {(1 - rw) / 2, (1 - rh) / 2, (1 + rw) / 2, (1 + rh) / 2};
+    if (firstAt == 0) firstAt = nowMs();
+    float t = float(std::min(1.0, (nowMs() - firstAt) / 220.0));
+    float fade = 1 - (1 - t) * (1 - t);
+    [enc setRenderPipelineState:pipeline];
+    [enc setVertexBytes:rect length:sizeof rect atIndex:0];
+    [enc setFragmentTexture:tex atIndex:0];
+    [enc setFragmentBytes:&fade length:sizeof fade atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    [enc endEncoding];
+    [cb presentDrawable:drawable];
+    CVMetalTextureRef keep = ref; // (the texture keeps the frame alive until the GPU is done)
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+      CFRelease(keep);
+    }];
+    [cb commit];
+    return true;
+  }
+
+  /** The fade-in goes on even if the picture stands still. */
+  void fadeTick() {
+    if (!metal || !shown || nowMs() - firstAt > 260) return;
+    drawMetal(shown);
+    std::weak_ptr<Impl> weak = shared_from_this();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC), queue, ^{
+      auto s = weak.lock();
+      if (s) s->fadeTick();
+    });
   }
 
   void keyframe() {
@@ -143,13 +258,17 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
     IOSurfaceRef surface = CVPixelBufferGetIOSurface(image);
     if (!surface) return;
     CVPixelBufferRetain(image);
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    layer.contents = (__bridge id)surface;
-    [CATransaction commit];
-    [CATransaction flush];
+    bool first = firstAt == 0;
+    if (!drawMetal(image)) {
+      [CATransaction begin];
+      [CATransaction setDisableActions:YES];
+      layer.contents = (__bridge id)surface;
+      [CATransaction commit];
+      [CATransaction flush];
+    }
     if (shown) CVPixelBufferRelease(shown);
     shown = image;
+    if (first && metal) fadeTick();
     double now = nowMs();
     std::lock_guard<std::mutex> l(mu);
     if (capture > 0) lat.push_back(now - capture);
@@ -174,9 +293,14 @@ MacPlayer::MacPlayer(CALayer* layer) : impl_(std::make_shared<Impl>()) {
   impl_->layer = layer;
   layer.contentsGravity = kCAGravityResizeAspect; // the whole picture, its aspect kept
   layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+  layer.contents = nil;
+  impl_->makeMetal(layer);
 }
 
-MacPlayer::~MacPlayer() { detach(); }
+MacPlayer::~MacPlayer() {
+  detach();
+  [impl_->metal removeFromSuperlayer];
+}
 
 void MacPlayer::detach() {
   // on the decoder's queue: whatever runs there now finishes first
