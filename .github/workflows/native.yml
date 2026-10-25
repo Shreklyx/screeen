@@ -224,7 +224,11 @@ jobs:
           codesign --force --deep --sign - "other/Screen Share.app" # another build: another code hash
           b="other/Screen Share.app/Contents/MacOS/Screen Share"
           pw='jelszó ő "x" \ $HOME'
-          run "$a" --keychain save "$pw"
+          run "$a" --keychain save elso
+          run "$b" --keychain save "$pw" # (one saved already: a new one in its place)
+          got=$(run "$a" --keychain load)
+          [ "$got" = "$pw" ] || { echo "read back: [$got]"; exit 1; }
+          run "$a" --keychain save "$pw" # (and once more, by the first build)
           got=$(run "$b" --keychain load)
           [ "$got" = "$pw" ] || { echo "read back: [$got]"; exit 1; }
           run "$b" --keychain save "" # not remembered any more

@@ -70,17 +70,18 @@ static const Quality kQualities[] = {
 // this app, and so never asked about. (In it: the password's UTF-8 as hex – printable, no quoting.)
 static NSString* const kKeychainService = @"hu.mozizas.screenshare";
 
-/** /usr/bin/security with `args` (and `input` on its standard input): what it printed, and its exit
- *  status in `status`. */
-static NSString* runSecurity(NSArray<NSString*>* args, NSString* input, int* status) {
+/** /usr/bin/security with `args` (and `input` on its standard input): what it printed, its exit
+ *  status in `status`, and in `errors` what it printed as errors. */
+static NSString* runSecurity(NSArray<NSString*>* args, NSString* input, int* status, NSString** errors = nullptr) {
   *status = -1;
   NSTask* t = [NSTask new];
   t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/security"];
   t.arguments = args;
   NSPipe* out = [NSPipe pipe];
+  NSPipe* err = [NSPipe pipe];
   NSPipe* in = input ? [NSPipe pipe] : nil;
   t.standardOutput = out;
-  t.standardError = NSFileHandle.fileHandleWithNullDevice;
+  t.standardError = err;
   if (in) t.standardInput = in;
   else t.standardInput = NSFileHandle.fileHandleWithNullDevice;
   if (![t launchAndReturnError:nil]) return @"";
@@ -88,21 +89,36 @@ static NSString* runSecurity(NSArray<NSString*>* args, NSString* input, int* sta
     [in.fileHandleForWriting writeData:[input dataUsingEncoding:NSUTF8StringEncoding]];
     [in.fileHandleForWriting closeFile];
   }
+  // (both read at once: a pipe that fills up would stop the tool)
+  __block NSData* errData = nil;
+  dispatch_group_t g = dispatch_group_create();
+  dispatch_group_async(g, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    errData = [err.fileHandleForReading readDataToEndOfFile];
+  });
   NSData* data = [out.fileHandleForReading readDataToEndOfFile];
+  dispatch_group_wait(g, DISPATCH_TIME_FOREVER);
   [t waitUntilExit];
   *status = t.terminationStatus;
+  if (errors) *errors = [[NSString alloc] initWithData:errData ?: [NSData data] encoding:NSUTF8StringEncoding] ?: @"";
   return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
 }
 
-static void savePassword(NSString* pw) {
+/** false (and why in `why`) when it could not be saved. */
+static bool savePassword(NSString* pw, NSString** why = nullptr) {
   NSData* utf8 = [pw dataUsingEncoding:NSUTF8StringEncoding];
   NSMutableString* hex = [NSMutableString stringWithCapacity:utf8.length * 2];
   for (NSUInteger i = 0; i < utf8.length; i++) [hex appendFormat:@"%02x", ((const uint8_t*)utf8.bytes)[i]];
-  // on its standard input (`-i`), not on the command line, where other programs could see it
-  NSString* cmd = pw.length ? [NSString stringWithFormat:@"add-generic-password -U -s %@ -a share -T /usr/bin/security -w %@\n", kKeychainService, hex]
+  // on its standard input (`-i`), not on the command line, where other programs could see it. (No -T:
+  // the item's access stays the tool's own – setting it on an existing item is what asks.)
+  NSString* cmd = pw.length ? [NSString stringWithFormat:@"add-generic-password -U -s %@ -a share -w %@\n", kKeychainService, hex]
                             : [NSString stringWithFormat:@"delete-generic-password -s %@ -a share\n", kKeychainService];
   int status = 0;
-  runSecurity(@[ @"-i" ], cmd, &status);
+  NSString* errors = @"";
+  runSecurity(@[ @"-i" ], cmd, &status, &errors);
+  // (-i ends well whatever a command did; a command that failed says so: "…: returned N")
+  bool ok = status == 0 && (!pw.length || ![errors containsString:@"returned"]); // (nothing to delete: fine)
+  if (why) *why = errors;
+  return ok;
 }
 
 static NSString* loadPassword() {
@@ -547,7 +563,7 @@ static NSColor* latencyColor(double ms) {
   bool _live, _picture, _stats, _muted, _checking, _barHidden;
   std::string _roomLink, _statusKind;
   Json _viewStats;
-  NSString *_updateFile, *_updateVersion, *_savedPassword;
+  NSString *_updateFile, *_updateVersion, *_savedPassword, *_passwordToSave;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification*)n {
@@ -1140,11 +1156,9 @@ static NSColor* latencyColor(double ms) {
   [ud setInteger:quality forKey:@"quality"];
   [ud setBool:_audio.state == NSControlStateValueOn forKey:@"audio"];
   [ud setBool:_remember.state == NSControlStateValueOn forKey:@"rememberPassword"];
-  NSString* keep = _remember.state == NSControlStateValueOn ? pw : @"";
-  if (![keep isEqualToString:_savedPassword]) { // the keychain only when it changes
-    savePassword(keep);
-    _savedPassword = keep;
-  }
+  // into the keychain once the server took it (a mistyped one is not remembered), only when it changes
+  _passwordToSave = _remember.state == NSControlStateValueOn ? pw : @"";
+  if (!_passwordToSave.length) [self savePasswordNow];
   _shareError.hidden = YES;
   [self endSession];
   int session = ++_session;
@@ -1344,11 +1358,20 @@ static std::string parseCode(NSString* text) {
   _viewerCount.stringValue = items.empty() ? @"" : [NSString stringWithFormat:@"%d", int(items.size())];
 }
 
+- (void)savePasswordNow {
+  NSString* keep = _passwordToSave;
+  _passwordToSave = nil;
+  if (!keep || [keep isEqualToString:_savedPassword]) return;
+  savePassword(keep);
+  _savedPassword = keep;
+}
+
 - (void)onEvent:(const Json&)e {
   const std::string& type = e["type"].str();
   if (type == "status") {
     [self setStatus:S(e["text"].str()) kind:e["kind"].str()];
   } else if (type == "hosted") {
+    [self savePasswordNow];
     _roomCode.attributedStringValue = [[NSAttributedString alloc] initWithString:S(e["code"].str()) attributes:@{
       NSFontAttributeName : [NSFont monospacedSystemFontOfSize:40 weight:NSFontWeightBold],
       NSForegroundColorAttributeName : NSColor.labelColor,
@@ -1658,7 +1681,11 @@ int main(int argc, const char* argv[]) {
     if (args.count == 6 && ([args[1] isEqualToString:@"--smoke-host"] || [args[1] isEqualToString:@"--smoke-view"])) return smoke(args);
     if (args.count >= 3 && [args[1] isEqualToString:@"--keychain"]) { // CI: the saved password, from any build
       if ([args[2] isEqualToString:@"save"] && args.count == 4) {
-        savePassword(args[3]);
+        NSString* why = @"";
+        if (!savePassword(args[3], &why)) {
+          fprintf(stderr, "not saved: %s\n", why.UTF8String);
+          return 1;
+        }
       } else {
         dropOldPassword(); // (as the app starts)
         printf("%s\n", loadPassword().UTF8String);
