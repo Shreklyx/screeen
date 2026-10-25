@@ -25,6 +25,7 @@
 #include "engine.h"
 #include "host_mac.h"
 #include "player_mac.h"
+#include "ws_bench.h"
 
 #ifndef SS_VERSION
 #define SS_VERSION "2.0.0"
@@ -1680,6 +1681,13 @@ int main(int argc, const char* argv[]) {
     netInit();
     NSArray<NSString*>* args = NSProcessInfo.processInfo.arguments;
     if (args.count == 6 && ([args[1] isEqualToString:@"--smoke-host"] || [args[1] isEqualToString:@"--smoke-view"])) return smoke(args);
+    if (args.count == 4 && [args[1] isEqualToString:@"--ws-bench"]) { // CI: round trips through this WebSocket
+      FILE* log = fopen(args[3].fileSystemRepresentation, "w");
+      if (!log) return 1;
+      fprintf(log, "BENCH %s\n", wsBench(openMacWebSocket, U(args[2]), 240).dump().c_str());
+      fclose(log);
+      return 0;
+    }
     if (args.count >= 3 && [args[1] isEqualToString:@"--keychain"]) { // CI: the saved password, from any build
       if ([args[2] isEqualToString:@"save"] && args.count == 4) {
         NSString* why = @"";

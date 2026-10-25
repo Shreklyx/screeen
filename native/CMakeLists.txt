@@ -23,7 +23,7 @@ else()
 endif()
 
 add_library(sscore STATIC
-  core/clock.cpp core/crypto.cpp core/json.cpp core/net.cpp core/ws_plain.cpp core/direct.cpp core/engine.cpp)
+  core/clock.cpp core/crypto.cpp core/json.cpp core/net.cpp core/ws_plain.cpp core/ws_bench.cpp core/direct.cpp core/engine.cpp)
 target_include_directories(sscore PUBLIC core)
 target_link_libraries(sscore PUBLIC bearssl)
 if(WIN32)

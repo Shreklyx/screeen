@@ -44,6 +44,7 @@
 #include "player.h"
 #include "ui.h"
 #include "update.h"
+#include "ws_bench.h"
 
 #ifndef SS_VERSION
 #define SS_VERSION "2.0.0"
@@ -1822,6 +1823,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
   ac.lpszClassName = L"SSAbout";
   RegisterClassExW(&ac);
   if (argc == 6 && (std::wstring(argv[1]) == L"--smoke-host" || std::wstring(argv[1]) == L"--smoke-view")) return smoke(argc, argv);
+  if (argc == 4 && std::wstring(argv[1]) == L"--ws-bench") { // CI: round trips through this WebSocket (WinHTTP)
+    FILE* log = _wfopen(argv[3], L"w");
+    if (!log) return 1;
+    std::fprintf(log, "BENCH %s\n", wsBench(openWinHttpWebSocket, narrow(argv[2]), 240).dump().c_str());
+    std::fclose(log);
+    return 0;
+  }
   HWND wnd = CreateWindowExW(0, L"ScreenShare", L"Screen Share", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1120, 800, nullptr, nullptr, inst,
                              nullptr);
   styleTitleBar(wnd);

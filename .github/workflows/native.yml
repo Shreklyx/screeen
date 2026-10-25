@@ -112,6 +112,17 @@ jobs:
             if (!(view.shownFps > 10)) problems.push('the app did not decode / show the picture');
             if (problems.length) { console.error(problems.join('\n')); process.exit(1); }
           "
+      # Round trips through a WebSocket and an echo server: the platform's (WinHTTP, what the app uses
+      # towards browsers) next to our own (Nagle off). A platform one that holds the end of a message
+      # back shows here as long round trips for the big messages.
+      - name: "WebSocket round trips: WinHTTP and ours"
+        shell: bash
+        run: |
+          node -e "const {WebSocketServer}=require('ws'); const s=new WebSocketServer({port:8095}); s.on('connection',w=>w.on('message',(d,b)=>w.send(d,{binary:b})));" &
+          sleep 2
+          build/windows/ScreenShare.exe --ws-bench ws://127.0.0.1:8095 bench-app.log || true
+          echo "WinHTTP: $(cat bench-app.log)"
+          echo "ours:    $(build/ss-cli.exe ws-bench --url ws://127.0.0.1:8095)"
       - name: Installer
         shell: bash
         run: |
@@ -295,6 +306,13 @@ jobs:
             if (problems.length) { console.error(problems.join('\n')); process.exit(1); }
           "
       # the zip for the in-app update, the disk image for people (drag to Applications)
+      - name: "WebSocket round trips: NSURLSession and ours"
+        run: |
+          node -e "const {WebSocketServer}=require('ws'); const s=new WebSocketServer({port:8095}); s.on('connection',w=>w.on('message',(d,b)=>w.send(d,{binary:b})));" &
+          sleep 2
+          "dist/Screen Share.app/Contents/MacOS/Screen Share" --ws-bench ws://127.0.0.1:8095 bench-app.log || true
+          echo "NSURLSession: $(cat bench-app.log)"
+          echo "ours:         $(build-arm64/ss-cli ws-bench --url ws://127.0.0.1:8095)"
       - name: Package
         run: |
           cd dist

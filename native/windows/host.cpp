@@ -90,6 +90,12 @@ struct HostPipeline::Impl {
       wantKey = true;
       lastBitrate = bitrate;
       double interval = 1000.0 / fps, lastEncode = -1e9, captureMs = nowMs(), encSum = 0, statsAt = nowMs();
+      // The frame rate: a new image is encoded the moment it comes if its turn is near (within a
+      // quarter frame), and the turns are one interval apart on average – counted from when the
+      // last one was due, not from when its encoding ended, which held back an image that came in
+      // time (a 60 Hz screen at 60 FPS waited part of a frame, and every few frames one was lost).
+      const double slack = interval / 4;
+      double nextAt = -1e9;
       int encoded = 0;
       bool pending = false, have = false;
       uint64_t frameNo = 0;
@@ -99,9 +105,8 @@ struct HostPipeline::Impl {
           lastBitrate = bitrate;
           enc->setBitrate(int(lastBitrate));
         }
-        double since = nowMs() - lastEncode;
-        // waiting for the next image; with one pending, only until it may be sent
-        unsigned timeout = pending ? unsigned(std::max(0.0, interval - since)) : 50;
+        // waiting for the next image; with one pending (and someone to send it to), only until its turn
+        unsigned timeout = pending && streaming ? unsigned(std::max(0.0, std::ceil(nextAt - slack - nowMs()))) : 50;
         double t = 0;
         int r = cap.acquire(timeout, t);
         if (r < 0) {
@@ -115,8 +120,9 @@ struct HostPipeline::Impl {
         }
         // a keyframe asked for while the screen stands still: the last image again
         if (have && !pending && wantKey && nowMs() - lastEncode >= interval) pending = true;
-        if (!pending || !streaming || nowMs() - lastEncode < interval * 0.95) continue;
+        if (!pending || !streaming || nowMs() < nextAt - slack) continue;
         double started = nowMs();
+        nextAt = std::max(nextAt, started) + interval; // (late, or after a still screen: from now)
         cap.render();
         bool key = wantKey.exchange(false);
         bool ok = enc->encode(key, captureMs, [&](const uint8_t* d, size_t n, bool isKey, double capture) {

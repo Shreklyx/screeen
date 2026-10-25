@@ -238,7 +238,9 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     SCStreamConfiguration* cfg = [SCStreamConfiguration new];
     cfg.width = size_t(w); // scaled on the GPU
     cfg.height = size_t(h);
-    cfg.minimumFrameInterval = CMTimeMake(1, opts.fps);
+    // a bit under the frame time, so that a screen frame that comes a hair early (timing jitter) is
+    // not left out – that would be a gap, and the next image a frame late
+    cfg.minimumFrameInterval = CMTimeMake(9, opts.fps * 10);
     cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange; // what the encoder takes as it is
     cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
     cfg.showsCursor = YES;

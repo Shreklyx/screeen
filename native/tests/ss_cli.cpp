@@ -3,6 +3,7 @@
 //
 //   ss-cli host --server http://127.0.0.1:8090 --password titok123 --h264 file.h264 [--fps 60] [--seconds 30]
 //   ss-cli view --server http://127.0.0.1:8090 --code abc123 [--seconds 10] [--out received.h264]
+//   ss-cli ws-bench --url ws://127.0.0.1:8095 [--count 240]   (round trips through an echo server)
 //
 // Prints the engine's events as JSON lines; "host" prints "CODE <code>" once the room is open,
 // "view" ends with "RESULT {…}" (frames, keyframes, bytes, latency).
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -20,6 +22,7 @@
 
 #include "clock.h"
 #include "engine.h"
+#include "ws_bench.h"
 
 using namespace ss;
 
@@ -159,5 +162,9 @@ int main(int argc, char** argv) {
   std::string mode = argv[1];
   if (mode == "host") return host(argc, argv);
   if (mode == "view") return view(argc, argv);
+  if (mode == "ws-bench") {
+    line("BENCH " + wsBench(openPlainWebSocket, arg(argc, argv, "--url"), std::atoi(arg(argc, argv, "--count", "240").c_str())).dump());
+    return 0;
+  }
   return 2;
 }
