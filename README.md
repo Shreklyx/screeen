@@ -179,7 +179,8 @@ Direct3D 11, Media Foundation, WASAPI), Macen egy ~2 MB-os alkalmazás (AppKit, 
 Audio). A két alkalmazás közös C++ magja (`native/core`) végzi a kapcsolódást a szerverhez és a közvetlen mód
 átvitelét (lásd lent). A szervert (mindig `https://mozizas.hu`, az alkalmazásban nem írható át) csak a
 kapcsolódáshoz, a relékhez és a nézőknek küldött linkhez használja. Macen a rendszer saját vezérlőivel (macOS 26-on
-Liquid Glass) és a szokásos Névjegy panellel, Windowson saját rajzolású üveges felülettel és kis Névjegy ablakkal.
+Liquid Glass) és a szokásos Névjegy panellel; Windowson ugyanez az elrendezés (Direct2D-vel rajzolva, a Windows saját,
+sötét menüivel): kompakt ablak, Megosztás / Nézés kapcsoló, csoportosított beállítások, kis Névjegy ablak.
 
 - **Megosztás:** jelszó (Windowson DPAPI-val, Macen a Kulcskarikában megjegyezve), képernyő, minőség (4K 60 FPS-ig,
   1080p 120 FPS), a gép hangja. A szobakód és a link után a nézőlista: ki milyen úton (helyi hálózat / internet /
