@@ -196,7 +196,14 @@ sötét menüivel): kompakt ablak, Megosztás / Nézés kapcsoló, csoportosíto
 - **Nézés:** kód vagy link; a képkockákat a videókártya dekódolja (Windowson Media Foundation alacsony késleltetésű
   módban + flip-model swap chain, ami minden képet azonnal kirak; Macen VideoToolbox → IOSurface közvetlenül a
   rétegre), a hang Opus → 5–100 ms-os, magától igazodó puffer. **F** / dupla kattintás: teljes képernyő, **S**:
-  statisztika, **M**: némítás.
+  statisztika, **M**: némítás. Ha a gép lemarad (elfoglalt processzor), mindig a legfrissebb kép kerül ki, nem gyűlik
+  késés; ha a videókártyás dekódolás egy gépen nem ad képet, a lejátszó magától a processzorra vált.
+- **Több ablak – több szoba egyszerre** (akár hat vagy több): Windowson a **＋** gomb (a kezdőképernyőn és a nézés
+  sávjában), **Ctrl+N**, vagy a tálcán az ikon jobb gombos menüje → *Új ablak*; Macen *Fájl → Új ablak* (**⌘N**),
+  a Dock ikonjának menüje, vagy a nézés sávjának **＋** gombja. Minden ablak külön néz (vagy oszt meg), saját
+  hanggal és hangerővel; a címsorban (Macen az *Ablak* menüben) a szoba kódja.
+- **Hang:** ha menet közben más lesz a gép hangeszköze (fülhallgató, Bluetooth, elalvó monitorhangszóró), a
+  megosztás és a nézés is magától átvált rá.
 - **Frissítés:** induláskor megnézi (`native-latest.json`), van-e új verzió; Windowson letölti és csendben telepíti,
   majd újraindul; Macen letölti, kicseréli magát és újraindul. A korábbi (Electron) alkalmazás is erre frissül:
   Windowson magától (a telepítő eltávolítja az Electron-os változatot), Macen a *Letöltés* gombbal a DMG-t kapod –

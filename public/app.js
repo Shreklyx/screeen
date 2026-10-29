@@ -1770,6 +1770,13 @@ function decodeDirectVideo(d, meta, data) {
     DIRECT.keyframe();
     return;
   }
+  // the decoder falls behind (a slow computer, a picture too big for it): the frames up to the next
+  // keyframe are left out – the picture stays live instead of the delay growing
+  if (d.decoder.decodeQueueSize > 6 && !meta.key) {
+    d.needKey = true;
+    DIRECT.keyframe();
+    return;
+  }
   d.needKey = false;
   d.pending.set(meta.ts, meta.capture);
   if (d.pending.size > 60) d.pending.delete(d.pending.keys().next().value);

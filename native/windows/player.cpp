@@ -102,7 +102,7 @@ struct VideoPlayer::Impl {
   std::mutex mu;
   std::condition_variable cv;
   std::deque<Frame> queue;
-  bool quit = false, resize = false, resetPending = false;
+  bool quit = false, resize = false, resetPending = false, askedKey = false;
 
   // Direct3D
   ComPtr<ID3D11Device> dev;
@@ -581,13 +581,20 @@ VideoPlayer::~VideoPlayer() {
 }
 
 void VideoPlayer::push(const uint8_t* data, size_t n, bool key, double captureMs) {
+  bool ask = false;
   {
     std::lock_guard<std::mutex> l(impl_->mu);
-    // the decoder fell behind badly (a slow computer): drop to the next keyframe
-    if (impl_->queue.size() > 30 && key) impl_->queue.clear();
+    // the decoder fell behind (a slow computer): what waits is dropped at the next keyframe – asked
+    // for at once (the sharer sends one only when asked), so the lag does not stay
+    if (impl_->queue.size() > 12) {
+      if (key) impl_->queue.clear();
+      else if (!impl_->askedKey) ask = impl_->askedKey = true;
+    }
+    if (key) impl_->askedKey = false;
     impl_->queue.push_back(Frame{std::vector<uint8_t>(data, data + n), key, captureMs});
   }
   impl_->cv.notify_all();
+  if (ask && needKeyframe) needKeyframe();
 }
 
 void VideoPlayer::resized() {
