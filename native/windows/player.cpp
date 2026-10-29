@@ -474,7 +474,10 @@ struct VideoPlayer::Impl {
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
       ctx->IASetInputLayout(nullptr);
       ctx->VSSetShader(vs.Get(), nullptr, 0);
-      ctx->VSSetConstantBuffers(0, 1, quad.GetAddressOf());
+      // (both: the vertex shader reads the picture's edge from the second – unbound, it read zeros and
+      // every pixel showed the picture's top left corner)
+      ID3D11Buffer* constants[2] = {quad.Get(), fadeBuf.Get()};
+      ctx->VSSetConstantBuffers(0, 2, constants);
       // the first picture comes up from black (~0.2 s) instead of popping in
       if (firstAt == 0) firstAt = nowMs();
       float k = float(std::min(1.0, (nowMs() - firstAt) / 220.0));

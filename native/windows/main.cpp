@@ -2130,7 +2130,7 @@ bool grabScreen(const RECT& r, std::vector<BYTE>& pixels) {
 
 /** --ui-watch <server> <code> <folder> (CI): the app watches a room as a person would – its window,
  *  the video in it – and the screen there is looked at: the exit code says whether the picture
- *  shows (the test stream is colour bars: most of it bright), the window is saved to look at. */
+ *  shows (the test stream's colour bars, each where it belongs), the window is saved to look at. */
 int uiWatch(const std::string& server, const std::string& code, const std::wstring& dir) {
   CreateDirectoryW(dir.c_str(), nullptr);
   g.server = server;
@@ -2154,18 +2154,48 @@ int uiWatch(const std::string& server, const std::string& code, const std::wstri
   size_t bright = 0, total = pixels.size() / 4;
   for (size_t i = 0; i < pixels.size(); i += 4) bright += std::max({pixels[i], pixels[i + 1], pixels[i + 2]}) > 60 ? 1 : 0;
   double share = total ? double(bright) / double(total) : 0;
+  // bright is not enough (one colour all over passed): the test stream's six bars – red, green, yellow,
+  // blue, magenta, cyan – must be there, each by the median of its column's lower part (things move
+  // over them), found in the picture's box (around it the letterbox's black)
+  int bars = 0;
+  int w = area.right - area.left, h = area.bottom - area.top;
+  if (grabbed && w > 0 && h > 0) {
+    auto at = [&](int x, int y) { return &pixels[(size_t(y) * size_t(w) + size_t(x)) * 4]; }; // B, G, R, A
+    auto lit = [&](int x, int y) { const BYTE* p = at(x, y); return std::max({p[0], p[1], p[2]}) > 40; };
+    int x0 = 0, x1 = w - 1, y0 = 0, y1 = h - 1;
+    while (x0 < x1 && !lit(x0, h / 2)) x0++;
+    while (x1 > x0 && !lit(x1, h / 2)) x1--;
+    while (y0 < y1 && !lit(w / 2, y0)) y0++;
+    while (y1 > y0 && !lit(w / 2, y1)) y1--;
+    static const int kBars[6][3] = {{255, 0, 0}, {0, 255, 0}, {255, 255, 0}, {0, 0, 255}, {255, 0, 255}, {0, 255, 255}};
+    for (int b = 0; b < 6; b++) {
+      int x = x0 + (x1 - x0) * (2 * b + 1) / 12, c[3][28];
+      for (int k = 0; k < 28; k++) {
+        const BYTE* p = at(x, y0 + (y1 - y0) * (k + 12) / 40);
+        c[0][k] = p[2];
+        c[1][k] = p[1];
+        c[2][k] = p[0];
+      }
+      int off = 0;
+      for (int i = 0; i < 3; i++) {
+        std::nth_element(c[i], c[i] + 14, c[i] + 28);
+        off = std::max(off, std::abs(c[i][14] - kBars[b][i]));
+      }
+      if (off < 80) bars++;
+    }
+  }
   shoot(g.wnd, dir + L"\\watch.png");
   VideoPlayer::Stats st = g.player ? g.player->stats() : VideoPlayer::Stats{};
   char report[400];
-  std::snprintf(report, sizeof report, "picture %d, shown %d, grabbed %d, bright %.3f, %dx%d, %.0f FPS, decoding %s, latency %.1f ms\n", g.picture ? 1 : 0, pictured ? 1 : 0,
-                grabbed ? 1 : 0, share, st.width, st.height, st.fps, st.hardware ? "GPU" : "CPU", st.latencyMs);
+  std::snprintf(report, sizeof report, "picture %d, shown %d, grabbed %d, bright %.3f, bars %d/6, %dx%d, %.0f FPS, decoding %s, latency %.1f ms\n", g.picture ? 1 : 0,
+                pictured ? 1 : 0, grabbed ? 1 : 0, share, bars, st.width, st.height, st.fps, st.hardware ? "GPU" : "CPU", st.latencyMs);
   if (FILE* f = _wfopen((dir + L"\\ui-watch.txt").c_str(), L"w")) {
     std::fputs(report, f);
     std::fclose(f);
   }
   endSession();
   DestroyWindow(g.wnd);
-  return pictured && share > 0.3 ? 0 : 1;
+  return pictured && share > 0.3 && bars >= 5 ? 0 : 1;
 }
 
 /* ------------------------------------------------ smoke tests (CI): the real pipeline, no UI */
