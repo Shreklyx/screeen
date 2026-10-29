@@ -15,10 +15,13 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <dpapi.h>
+#include <dwmapi.h>
 #include <mfapi.h>
 #include <shellapi.h>
 #include <uxtheme.h>
+#include <wincodec.h>
 #include <windowsx.h>
+#include <wrl/client.h>
 
 #include <timeapi.h>
 
@@ -26,6 +29,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -78,11 +82,14 @@ const wchar_t* kBuild = WIDEN(SS_BUILD);
 const wchar_t* kCopyright = L"Copyright © 2026 mozizas.hu.\nMinden jog fenntartva.";
 const UINT kSysAbout = 0x1010; // "About" in the window menu (Alt+Space)
 
-// the palette
-const Color cBg1 = rgb(0x0D0D18), cBg2 = rgb(0x06060B), cCard = rgb(0x1A1A26), cCardHi = rgb(0x242434), cBorder = rgb(0xFFFFFF, 0.09f),
-            cText = rgb(0xEFEFF6), cMuted = rgb(0xA0A0B6), cFaint = rgb(0x6E6E86), cAccent = rgb(0xFF4D6A), cAccent2 = rgb(0x8B5CF6),
-            cField = rgb(0x10101A), cOk = rgb(0x4ADE80), cWarn = rgb(0xFBBF24), cErr = rgb(0xFF6B7A), cWhite = rgb(0xFFFFFF);
-const COLORREF kFieldGdi = RGB(0x10, 0x10, 0x1A), kTextGdi = RGB(0xEF, 0xEF, 0xF6), kBgGdi = RGB(0x0D, 0x0D, 0x18);
+// the palette: the Mac app's (macOS in its dark appearance), with the app's pink
+const Color cWin1 = rgb(0x323237), cWin2 = rgb(0x29292E), cText = rgb(0xEDEDF0), cMuted = rgb(0xA3A3AB), cFaint = rgb(0x77777F),
+            cAccent = rgb(0xF74F9F), cField = rgb(0x1E1E21), cOk = rgb(0x32D74B), cWarn = rgb(0xFF9F0A), cErr = rgb(0xFF6961),
+            cWhite = rgb(0xFFFFFF);
+const COLORREF kFieldGdi = RGB(0x1E, 0x1E, 0x21), kTextGdi = RGB(0xED, 0xED, 0xF0), kBgGdi = RGB(0x32, 0x32, 0x37);
+
+// the compact screens (home, sharing): their content's width, and the space around it
+const float kHomeW = 420, kHostW = 440, kSide = 30, kTopPad = 24, kBottomPad = 26;
 
 enum class Screen { Home, Hosting, Viewing };
 
@@ -91,21 +98,21 @@ enum Id {
   ID_NONE = 0,
   ID_PASSWORD = 100, ID_CODE,
   B_SHARE = 200, B_JOIN, B_REMEMBER, B_AUDIO, B_UPDATE, B_ABOUT, B_COPY, B_PAUSE, B_STOP, B_FULL, B_LEAVE, B_VOLUME, B_MUTE,
-  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL,
-  B_MONITOR0 = 300, B_QUALITY0 = 400,
+  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL, B_TAB0, B_TAB1, B_MONITOR, B_QUALITY,
 };
+const UINT kMenuMonitor0 = 1000, kMenuQuality0 = 2000; // the pop-up menus' items
 
 struct Quality {
-  const wchar_t* name;  // on the chip
-  const wchar_t* hint;  // under the chips
+  const wchar_t* name;  // in the pop-up
+  const wchar_t* hint;  // under the settings
   int w, h, fps;
 };
 const Quality kQualities[] = {
     {L"Automatikus", L"A legszebb, amit a gép és a hálózat bír: akár 4K, 60 FPS.", 3840, 2160, 60},
-    {L"1440p · 60", L"2560×1440, 60 FPS.", 2560, 1440, 60},
-    {L"1080p · 60", L"1920×1080, 60 FPS.", 1920, 1080, 60},
-    {L"1080p · 120", L"1920×1080, 120 FPS – játékhoz, gyors mozgáshoz.", 1920, 1080, 120},
-    {L"720p · 60", L"1280×720, 60 FPS – gyenge internetre.", 1280, 720, 60},
+    {L"1440p · 60 FPS", L"2560×1440, 60 FPS.", 2560, 1440, 60},
+    {L"1080p · 60 FPS", L"1920×1080, 60 FPS.", 1920, 1080, 60},
+    {L"1080p · 120 FPS", L"1920×1080, 120 FPS – játékhoz, gyors mozgáshoz.", 1920, 1080, 120},
+    {L"720p · 60 FPS", L"1280×720, 60 FPS – gyenge internetre.", 1280, 720, 60},
     {L"Eredeti", L"A képernyő saját felbontása, 60 FPS.", 0, 0, 60},
 };
 
@@ -124,10 +131,12 @@ struct App {
   Screen screen = Screen::Home, prev = Screen::Home;
   bool transitioning = false;
   double transitionStart = 0;
+  int tab = 0; // home: 0 sharing, 1 watching
 
   HWND pass = nullptr, code = nullptr, video = nullptr;
-  std::map<int, Rect> fieldRects; // where the text boxes go (DIPs, in the scrolled content)
-  std::map<int, RECT> placed;     // where they are (pixels)
+  std::map<int, Rect> fieldRects;   // where the text boxes go (DIPs, in the scrolled content)
+  std::map<int, Rect> controlRects; // where the pop-ups are (their menus open under them)
+  std::map<int, RECT> placed;       // where the text boxes are (pixels)
   int focus = ID_NONE;
 
   Canvas canvas;
@@ -137,6 +146,9 @@ struct App {
   int hover = ID_NONE, pressed = ID_NONE;
   bool tracking = false, measuring = false;
   float scroll = 0, scrollTarget = 0, contentHeight = 0;
+  bool fitPosted = false;
+  POINT anchor{}; // the compact window's top centre, where it goes back to after watching
+  bool anchored = false;
 
   std::vector<Monitor> monitors;
   int monitor = 0, quality = 0;
@@ -177,6 +189,8 @@ struct App {
   std::vector<Hit> aboutHits;
   int aboutHover = ID_NONE, aboutPressed = ID_NONE;
   bool aboutTimer = false, aboutTracking = false, paintingAbout = false;
+
+  bool shots = false; // --ui-shot (CI): no update check
 };
 
 App g;
@@ -257,135 +271,146 @@ void hit(int id, const Rect& r) {
 
 std::string key(const char* what, int id) { return std::string(what) + std::to_string(id); }
 
-/** Frosted glass: a dark veil and a faint white sheen over the coloured light behind, a border
- *  that catches the light at the top left, a highlight along the top edge, a soft shadow. */
-void glass(const Rect& r, float radius, float strength = 1, bool shadow = true) {
+/** A settings group, as in the Mac app (and System Settings): a faint panel, its rows split by lines. */
+void group(const Rect& r, std::initializer_list<float> lines = {}) {
+  if (g.measuring) return;
   Canvas& c = C();
-  if (shadow) c.shadow(r, radius, 1.3f * strength);
-  c.fillRound(r, radius, rgb(0x0A0A14, 0.48f));
-  c.fillRoundStops(r, radius, {{0, rgb(0xFFFFFF, 0.10f * strength)}, {0.35f, rgb(0xFFFFFF, 0.05f * strength)}, {1, rgb(0xFFFFFF, 0.025f * strength)}});
-  c.strokeRoundGradient(r, radius, rgb(0xFFFFFF, 0.30f * strength), rgb(0xFFFFFF, 0.05f), 1);
-  float inset = std::max(radius, 10.0f);
-  if (r.w > 2 * inset + 10)
-    c.fillRoundStops({r.x + inset, r.y + 0.5f, r.w - 2 * inset, 1.2f}, 0.6f,
-                     {{0, rgb(0xFFFFFF, 0)}, {0.5f, rgb(0xFFFFFF, 0.45f * strength)}, {1, rgb(0xFFFFFF, 0)}}, true);
+  c.fillRound(r, 11, rgb(0xFFFFFF, 0.055f));
+  c.strokeRound(r, 11, rgb(0xFFFFFF, 0.085f), 1);
+  for (float y : lines) c.fillRect({r.x + 12, std::floor(y), r.w - 24, 1}, rgb(0xFFFFFF, 0.09f));
+}
+
+/** A row's title on the left (with a smaller second line under it). */
+void rowTitle(const Rect& row, const std::wstring& title, const std::wstring& sub = L"") {
+  if (g.measuring) return;
+  Canvas& c = C();
+  if (sub.empty()) {
+    c.text(title, {row.x + 12, row.y, row.w * 0.5f, row.h}, 13, Regular, cText);
+    return;
+  }
+  c.text(title, {row.x + 12, row.cy() - 17, row.w * 0.5f, 18}, 13, Regular, cText);
+  c.text(sub, {row.x + 12, row.cy() + 1, row.w * 0.5f, 15}, 11, Regular, cMuted);
 }
 
 enum class Style { Primary, Secondary, Danger, Ghost, Success };
 
+/** A button: a capsule, as on macOS 26 (the pink one is the screen's main action). */
 void button(int id, const Rect& r, const std::wstring& label, Style style, bool hasIcon = false, Icon icon = Icon::Play, bool enabled = true) {
   if (g.measuring) return;
   if (enabled) hit(id, r);
-  float hov = A().to(key("h", id), enabled && g.hover == id ? 1.0f : 0.0f, 130);
+  float hov = A().to(key("h", id), enabled && g.hover == id ? 1.0f : 0.0f, 120);
   float prs = A().to(key("p", id), enabled && g.pressed == id && g.hover == id ? 1.0f : 0.0f, 70);
   Canvas& c = C();
-  c.pushScale(1.0f - 0.03f * prs, r.cx(), r.cy());
-  float radius = std::min(12.0f, r.h / 2);
+  float radius = r.h / 2;
   Color text = cText;
   switch (style) {
     case Style::Primary:
-      c.glow(r.cx(), r.bottom(), r.w * 0.55f, withAlpha(cAccent, 0.12f + 0.20f * hov));
-      c.fillRoundGradient(r, radius, mix(cAccent, cWhite, 0.10f * hov), mix(cAccent2, cWhite, 0.10f * hov));
-      // the gloss: light on the upper half
-      c.fillRoundStops(r, radius, {{0, rgb(0xFFFFFF, 0.26f + 0.08f * hov)}, {0.5f, rgb(0xFFFFFF, 0.04f)}, {1, rgb(0xFFFFFF, 0)}});
-      c.strokeRoundGradient(r, radius, rgb(0xFFFFFF, 0.55f), rgb(0xFFFFFF, 0.08f), 1);
+      c.fillRound(r, radius, mix(mix(cAccent, cWhite, 0.10f * hov), rgb(0x000000), 0.14f * prs));
       text = cWhite;
       break;
-    case Style::Success:
-      c.fillRound(r, radius, mix(rgb(0x123222, 0.85f), rgb(0x174A30, 0.9f), hov));
-      c.strokeRoundGradient(r, radius, withAlpha(cOk, 0.7f), withAlpha(cOk, 0.2f), 1);
-      text = cOk;
+    case Style::Secondary:
+      c.fillRound(r, radius, rgb(0xFFFFFF, 0.12f + 0.05f * hov + 0.05f * prs));
       break;
     case Style::Danger:
-      c.fillRound(r, radius, mix(rgb(0x3A0F1C, 0.55f), rgb(0x5A1426, 0.7f), hov));
-      c.fillRoundStops(r, radius, {{0, rgb(0xFFFFFF, 0.08f)}, {0.6f, rgb(0xFFFFFF, 0.0f)}});
-      c.strokeRoundGradient(r, radius, withAlpha(cErr, 0.55f + 0.3f * hov), withAlpha(cErr, 0.12f), 1);
-      text = rgb(0xFFC9D0);
+      c.fillRound(r, radius, rgb(0xFFFFFF, 0.12f + 0.05f * hov + 0.05f * prs));
+      text = cErr;
       break;
-    case Style::Secondary:
-      c.fillRound(r, radius, rgb(0xFFFFFF, 0.07f + 0.06f * hov));
-      c.fillRoundStops(r, radius, {{0, rgb(0xFFFFFF, 0.08f)}, {0.6f, rgb(0xFFFFFF, 0.0f)}});
-      c.strokeRoundGradient(r, radius, rgb(0xFFFFFF, 0.28f + 0.12f * hov), rgb(0xFFFFFF, 0.05f), 1);
+    case Style::Success:
+      c.fillRound(r, radius, withAlpha(cOk, 0.16f + 0.05f * hov));
+      text = cOk;
       break;
     case Style::Ghost:
-      c.fillRound(r, radius, rgb(0xFFFFFF, 0.08f * hov));
-      if (hov > 0.01f) c.strokeRoundGradient(r, radius, rgb(0xFFFFFF, 0.22f * hov), rgb(0xFFFFFF, 0.03f * hov), 1);
+      c.fillRound(r, radius, rgb(0xFFFFFF, 0.08f * hov + 0.05f * prs));
       text = mix(cMuted, cText, hov);
       break;
   }
-  if (!enabled) text = withAlpha(text, 0.55f);
-  float tw = label.empty() ? 0 : c.measure(label, 14, Semibold);
-  float iw = hasIcon ? 18 : 0, gap = hasIcon && !label.empty() ? 9 : 0;
+  if (!enabled) text = withAlpha(text, 0.5f);
+  float tw = label.empty() ? 0 : c.measure(label, 13, Semibold);
+  float iw = hasIcon ? 15 : 0, gap = hasIcon && !label.empty() ? 7 : 0;
   float x = r.cx() - (tw + iw + gap) / 2;
-  if (hasIcon) c.icon(icon, x + iw / 2, r.cy(), 18, text, 1.8f);
-  if (!label.empty()) c.text(label, {x + iw + gap, r.y, tw + 4, r.h}, 14, Semibold, text);
-  c.popScale();
+  if (hasIcon) c.icon(icon, x + iw / 2, r.cy(), 15, text, 1.7f);
+  if (!label.empty()) c.text(label, {x + iw + gap, r.y, tw + 4, r.h}, 13, Semibold, text);
 }
 
-void toggle(int id, const Rect& row, const std::wstring& label, bool on) {
+/** An on/off switch (the Mac's) at the right of its row; the whole row toggles it. */
+void toggleSwitch(int id, const Rect& row, bool on) {
   if (g.measuring) return;
   hit(id, row);
   Canvas& c = C();
   float k = A().to(key("t", id), on ? 1.0f : 0.0f, 170);
-  float hov = A().to(key("h", id), g.hover == id ? 1.0f : 0.0f, 130);
-  Rect track{row.x, row.cy() - 11, 40, 22};
-  c.fillRound(track, 11, mix(rgb(0xFFFFFF, 0.10f + 0.05f * hov), mix(cAccent, cAccent2, 0.35f), k));
-  c.strokeRoundGradient(track, 11, rgb(0xFFFFFF, 0.30f), rgb(0xFFFFFF, 0.05f), 1);
-  float kx = track.x + 11 + k * 18;
-  c.fillCircle(kx, track.cy() + 0.6f, 8.6f, rgb(0x000000, 0.25f));
-  c.fillCircle(kx, track.cy(), 8, cWhite);
-  c.text(label, {row.x + 52, row.y, row.w - 52, row.h}, 13.5f, Regular, mix(cMuted, cText, std::max(k, hov)));
-}
-
-void chip(int id, const Rect& r, const std::wstring& label, bool selected) {
-  if (g.measuring) return;
-  hit(id, r);
-  Canvas& c = C();
-  float s = A().to(key("s", id), selected ? 1.0f : 0.0f, 160);
   float hov = A().to(key("h", id), g.hover == id ? 1.0f : 0.0f, 120);
-  c.fillRound(r, 10, mix(rgb(0xFFFFFF, 0.045f + 0.05f * hov), withAlpha(mix(cAccent, cAccent2, 0.3f), 0.26f), s));
-  c.fillRoundStops(r, 10, {{0, rgb(0xFFFFFF, 0.07f)}, {0.6f, rgb(0xFFFFFF, 0)}});
-  c.strokeRoundGradient(r, 10, mix(rgb(0xFFFFFF, 0.22f + 0.12f * hov), withAlpha(rgb(0xFF8DA0), 0.95f), s), mix(rgb(0xFFFFFF, 0.04f), withAlpha(cAccent2, 0.5f), s),
-                        1 + 0.3f * s);
-  c.text(label, r.inset(8, 0), 13, s > 0.5f ? Semibold : Medium, mix(cMuted, cText, std::max(s, hov * 0.7f)), Center);
+  Rect track{row.right() - 12 - 42, row.cy() - 11, 42, 22};
+  c.fillRound(track, 11, mix(rgb(0xFFFFFF, 0.16f + 0.05f * hov), cAccent, k));
+  float kw = 25, kx = track.x + 2 + k * (track.w - 4 - kw);
+  Rect knob{kx, track.y + 2, kw, track.h - 4};
+  c.fillRound(knob.offset(0, 0.7f), knob.h / 2, rgb(0x000000, 0.25f));
+  c.fillRound(knob, knob.h / 2, cWhite);
 }
 
 /** A text box: drawn here, the Windows edit control sits inside it. */
-void field(int id, const Rect& r, Icon icon) {
-  if (!g.transitioning || !g.measuring) g.fieldRects[id] = r;
+void field(int id, const Rect& r) {
+  g.fieldRects[id] = r;
   if (g.measuring) return;
   Canvas& c = C();
   float f = A().to(key("f", id), g.focus == id ? 1.0f : 0.0f, 150);
-  if (f > 0.01f) c.fillRound({r.x - 3, r.y - 3, r.w + 6, r.h + 6}, 13, withAlpha(cAccent, 0.16f * f));
-  c.fillRound(r, 10, cField);
-  c.strokeRoundGradient(r, 10, mix(rgb(0xFFFFFF, 0.16f), withAlpha(rgb(0xFF8DA0), 0.95f), f), mix(rgb(0xFFFFFF, 0.06f), withAlpha(cAccent2, 0.7f), f), 1 + 0.5f * f);
-  c.icon(icon, r.x + 20, r.cy(), 16, mix(cFaint, cAccent, f), 1.6f);
+  if (f > 0.01f) c.strokeRound({r.x - 3, r.y - 3, r.w + 6, r.h + 6}, 9, withAlpha(cAccent, 0.6f * f), 3); // the focus ring
+  c.fillRound(r, 6, cField);
+  c.strokeRound(r, 6, rgb(0xFFFFFF, 0.14f), 1);
   // while the screens cross-fade the edit control is hidden: its text is drawn instead
   HWND h = id == ID_PASSWORD ? g.pass : g.code;
   if (g.transitioning && h) {
     std::wstring t = getText(h);
     if (id == ID_PASSWORD) t = std::wstring(t.size(), L'\x25CF');
-    c.text(t, {r.x + 40, r.y, r.w - 52, r.h}, 14, Regular, cText);
+    c.text(t, {r.x + 8, r.y, r.w - 16, r.h}, 13, Regular, cText);
   }
 }
 
-void label(const std::wstring& s, const Rect& r) {
-  if (!g.measuring) C().text(s, r, 12.5f, Medium, cMuted);
-}
-
-/** A card behind content laid out by fn(y) → its bottom. */
+/** How wide a pop-up is for these choices (as wide as the longest, as the Mac's). */
 template <typename Fn>
-float card(float x, float y, float w, float minH, Fn fn) {
-  bool was = g.measuring;
-  g.measuring = true;
-  float bottom = fn(y);
-  g.measuring = was;
-  float h = std::max(minH, bottom - y);
-  if (!g.measuring) {
-    glass({x, y, w, h}, 20);
-    fn(y);
+float popupWidth(size_t n, Fn name, float most) {
+  float w = 60;
+  for (size_t i = 0; i < n; i++) w = std::max(w, C().measure(name(i), 13, Regular));
+  return std::min(most, std::ceil(w) + 10 + 30);
+}
+
+/** A pop-up button (the Mac's): the choice and the up-down arrows; a click opens its menu. */
+void popup(int id, const Rect& r, const std::wstring& label, bool enabled = true) {
+  g.controlRects[id] = r;
+  if (g.measuring) return;
+  if (enabled) hit(id, r);
+  Canvas& c = C();
+  float hov = A().to(key("h", id), enabled && g.hover == id ? 1.0f : 0.0f, 120);
+  float prs = A().to(key("p", id), enabled && g.pressed == id ? 1.0f : 0.0f, 70);
+  c.fillRound(r, 6, rgb(0xFFFFFF, 0.165f + 0.05f * hov + 0.06f * prs));
+  c.strokeRound(r, 6, rgb(0xFFFFFF, 0.05f), 1);
+  Color tc = enabled ? cText : cFaint;
+  c.text(label, {r.x + 10, r.y, r.w - 34, r.h}, 13, Regular, tc);
+  float ax = r.right() - 14, ay = r.cy();
+  c.line(ax - 3, ay - 2, ax, ay - 5, tc, 1.4f);
+  c.line(ax, ay - 5, ax + 3, ay - 2, tc, 1.4f);
+  c.line(ax - 3, ay + 2, ax, ay + 5, tc, 1.4f);
+  c.line(ax, ay + 5, ax + 3, ay + 2, tc, 1.4f);
+}
+
+/** Megosztás | Nézés (the Mac's segmented control): the pink one slides to the chosen side. */
+void segmented(const Rect& r, int selected) {
+  if (g.measuring) return;
+  Canvas& c = C();
+  const wchar_t* labels[2] = {L"Megosztás", L"Nézés"};
+  float sw = r.w / 2;
+  float pos = A().to("tabpos", float(selected), 190);
+  c.fillRound(r, r.h / 2, rgb(0xFFFFFF, 0.12f));
+  Rect pill{r.x + 2 + pos * sw, r.y + 2, sw - 4, r.h - 4};
+  c.fillRound(pill, pill.h / 2, cAccent);
+  for (int i = 0; i < 2; i++) {
+    Rect seg{r.x + float(i) * sw, r.y, sw, r.h};
+    int id = B_TAB0 + i;
+    if (i != selected) hit(id, seg);
+    float hov = A().to(key("h", id), g.hover == id ? 1.0f : 0.0f, 120);
+    if (hov > 0.01f) c.fillRound(seg.inset(2, 2), (r.h - 4) / 2, rgb(0xFFFFFF, 0.07f * hov));
+    float on = std::clamp(1 - std::fabs(pos - float(i)), 0.0f, 1.0f);
+    c.text(labels[i], seg, 13, Semibold, mix(cText, cWhite, on), Center);
   }
-  return h;
 }
 
 void spinner(float cx, float cy, float radius, const Color& col) {
@@ -394,167 +419,106 @@ void spinner(float cx, float cy, float radius, const Color& col) {
   double t = A().now();
   float spin = float(std::fmod(t * 0.40, 360.0));
   float sweep = 70 + 110 * float(0.5 + 0.5 * std::sin(t / 420.0));
-  c.strokeCircle(cx, cy, radius, withAlpha(col, 0.15f), 3);
-  c.arc(cx, cy, radius, spin, sweep, col, 3);
+  c.strokeCircle(cx, cy, radius, withAlpha(col, 0.18f), 2.2f);
+  c.arc(cx, cy, radius, spin, sweep, col, 2.2f);
   A().keepGoing();
 }
 
-void dot(float cx, float cy, const Color& col, float r = 4.5f) {
+void dot(float cx, float cy, const Color& col, float r = 4) {
   if (g.measuring) return;
-  C().fillCircle(cx, cy, r * 2.4f, withAlpha(col, 0.14f));
   C().fillCircle(cx, cy, r, col);
 }
 
-void logo(float x, float y, float size) {
-  if (g.measuring) return;
-  Canvas& c = C();
-  Rect r{x, y, size, size};
-  c.glow(r.cx(), r.cy(), size * 1.1f, withAlpha(cAccent, 0.16f));
-  c.fillRoundGradient(r, size * 0.3f, cAccent, cAccent2);
-  c.fillRoundStops(r, size * 0.3f, {{0, rgb(0xFFFFFF, 0.35f)}, {0.5f, rgb(0xFFFFFF, 0.05f)}, {1, rgb(0xFFFFFF, 0)}});
-  c.strokeRoundGradient(r, size * 0.3f, rgb(0xFFFFFF, 0.6f), rgb(0xFFFFFF, 0.1f), 1);
-  c.icon(Icon::Monitor, r.cx(), r.cy() - size * 0.02f, size * 0.56f, cWhite, std::max(1.8f, size / 20));
+/** Wrapped text under something (the hints); returns its height. */
+float note(const std::wstring& s, float x, float y, float w, float size, const Color& col, Align align = Left) {
+  float h = 0;
+  C().measure(s, size, Regular, w, &h);
+  if (!g.measuring) C().text(s, {x, y, w, h + 2}, size, Regular, col, align, false, true);
+  return h;
+}
+
+/** An error under a button (fades in); returns where it ends. */
+float errorText(const std::wstring& s, const char* animKey, float x, float y, float w) {
+  if (s.empty()) return y;
+  y += 12;
+  float a = g.measuring ? 1.0f : A().to(animKey, 1, 220);
+  C().pushAlpha(a);
+  y += note(s, x, y, w, 12, cErr, Center);
+  C().popAlpha();
+  return y;
 }
 
 /* ------------------------------------------------ the screens (each returns its content's bottom) */
 
-float homeShare(float x, float y, float w) {
-  Canvas& c = C();
-  float p = 24, cx = x + p, iw = w - 2 * p, cy = y + p;
-  if (!g.measuring) {
-    c.fillRound({cx, cy, 38, 38}, 11, withAlpha(cAccent, 0.15f));
-    c.icon(Icon::Monitor, cx + 19, cy + 19, 20, cAccent, 1.8f);
-    c.text(L"Képernyő megosztása", {cx + 52, cy - 1, iw - 52, 22}, 17, Semibold, cText);
-    c.text(L"A képernyőd és a gép hangja – a lehető legkisebb késéssel.", {cx + 52, cy + 21, iw - 52, 18}, 12.5f, Regular, cMuted);
-  }
-  cy += 58;
-  label(L"Megosztási jelszó", {cx, cy, iw, 18});
-  cy += 24;
-  field(ID_PASSWORD, {cx, cy, iw, 42}, Icon::Lock);
-  cy += 52;
-  toggle(B_REMEMBER, {cx, cy, iw, 26}, L"Jelszó megjegyzése", g.remember);
-  cy += 40;
-  label(L"Képernyő", {cx, cy, iw, 18});
-  cy += 24;
-  {
-    float xx = cx, h = 36;
-    for (size_t i = 0; i < g.monitors.size(); i++) {
-      const std::wstring& name = g.monitors[i].name;
-      float cw = std::min(iw, c.measure(name, 13, Semibold) + 32);
-      if (xx > cx && xx + cw > cx + iw) {
-        xx = cx;
-        cy += h + 8;
-      }
-      chip(B_MONITOR0 + int(i), {xx, cy, cw, h}, name, int(i) == g.monitor);
-      xx += cw + 8;
-    }
-    if (g.monitors.empty() && !g.measuring) c.text(L"Nem találok képernyőt.", {cx, cy, iw, h}, 13, Regular, cErr);
-    cy += h + 18;
-  }
-  label(L"Minőség", {cx, cy, iw, 18});
-  cy += 24;
-  {
-    int cols = iw > 420 ? 3 : 2;
-    float gap = 8, cw = (iw - gap * float(cols - 1)) / float(cols), h = 36;
-    int n = int(std::size(kQualities));
-    for (int i = 0; i < n; i++) {
-      int col = i % cols, rowi = i / cols;
-      chip(B_QUALITY0 + i, {cx + float(col) * (cw + gap), cy + float(rowi) * (h + gap), cw, h}, kQualities[i].name, i == g.quality);
-    }
-    cy += float((n + cols - 1) / cols) * (h + gap);
-    if (!g.measuring) c.text(kQualities[g.quality].hint, {cx, cy, iw, 18}, 12, Regular, cFaint);
-    cy += 30;
-  }
-  toggle(B_AUDIO, {cx, cy, iw, 26}, L"A gép hangja is (5.1 / 7.1 térhang is)", g.audio);
-  cy += 44;
-  button(B_SHARE, {cx, cy, iw, 48}, L"Megosztás indítása", Style::Primary, true, Icon::Play);
-  cy += 48;
-  if (!g.shareErr.empty()) {
-    float a = A().to("shareErr", 1, 220);
-    if (!g.measuring) {
-      c.pushAlpha(a);
-      c.text(g.shareErr, {cx, cy + 12, iw, 40}, 13, Medium, cErr, Left, false, true);
-      c.popAlpha();
-    }
-    cy += 40;
-  }
-  return cy + p;
+float sharePane(float x0, float y, float cw) {
+  // the password
+  group({x0, y, cw, 80}, {y + 40});
+  rowTitle({x0, y, cw, 40}, L"Jelszó");
+  field(ID_PASSWORD, {x0 + cw - 12 - 210, y + 8, 210, 24});
+  rowTitle({x0, y + 40, cw, 40}, L"Jelszó megjegyzése");
+  toggleSwitch(B_REMEMBER, {x0, y + 40, cw, 40}, g.remember);
+  y += 80 + 14;
+  // what, how, with sound
+  group({x0, y, cw, 126}, {y + 40, y + 80});
+  rowTitle({x0, y, cw, 40}, L"Képernyő");
+  float mw = popupWidth(g.monitors.size(), [](size_t i) { return g.monitors[i].name; }, cw * 0.62f);
+  popup(B_MONITOR, {x0 + cw - 12 - mw, y + 9, mw, 22}, g.monitors.empty() ? L"Nem találok képernyőt" : g.monitors[size_t(g.monitor)].name, !g.monitors.empty());
+  rowTitle({x0, y + 40, cw, 40}, L"Minőség");
+  float qw = popupWidth(std::size(kQualities), [](size_t i) { return std::wstring(kQualities[i].name); }, cw * 0.5f);
+  popup(B_QUALITY, {x0 + cw - 12 - qw, y + 49, qw, 22}, kQualities[g.quality].name);
+  rowTitle({x0, y + 80, cw, 46}, L"A gép hangja", L"5.1 / 7.1 térhang is");
+  toggleSwitch(B_AUDIO, {x0, y + 80, cw, 46}, g.audio);
+  y += 126 + 6;
+  y += note(kQualities[g.quality].hint, x0 + 12, y, cw - 24, 11, cMuted) + 22;
+  button(B_SHARE, {std::floor(x0 + cw / 2 - 115), y, 230, 28}, L"Megosztás indítása", Style::Primary);
+  y += 28;
+  return errorText(g.shareErr, "shareErr", x0, y, cw);
 }
 
-float homeJoin(float x, float y, float w) {
-  Canvas& c = C();
-  float p = 24, cx = x + p, iw = w - 2 * p, cy = y + p;
-  if (!g.measuring) {
-    c.fillRound({cx, cy, 38, 38}, 11, withAlpha(cAccent2, 0.18f));
-    c.icon(Icon::Eye, cx + 19, cy + 19, 20, rgb(0xB49CFF), 1.8f);
-    c.text(L"Megosztás nézése", {cx + 52, cy - 1, iw - 52, 22}, 17, Semibold, cText);
-    c.text(L"Írd be a szobakódot, vagy illeszd be a kapott linket.", {cx + 52, cy + 21, iw - 52, 18}, 12.5f, Regular, cMuted);
-  }
-  cy += 58;
-  label(L"Szobakód vagy link", {cx, cy, iw, 18});
-  cy += 24;
-  field(ID_CODE, {cx, cy, iw, 42}, Icon::Link);
-  cy += 56;
-  button(B_JOIN, {cx, cy, iw, 48}, L"Csatlakozás", Style::Primary, true, Icon::Eye);
-  cy += 48;
-  if (!g.joinErr.empty()) {
-    float a = A().to("joinErr", 1, 220);
-    if (!g.measuring) {
-      c.pushAlpha(a);
-      c.text(g.joinErr, {cx, cy + 12, iw, 40}, 13, Medium, cErr, Left, false, true);
-      c.popAlpha();
-    }
-    cy += 40;
-  }
-  cy += 18;
-  if (!g.measuring) c.text(L"A megosztótól kapott 6 jelű kód, vagy a teljes link.", {cx, cy, iw, 18}, 12, Regular, cFaint);
-  cy += 18;
-  return cy + p;
+float watchPane(float x0, float y, float cw) {
+  group({x0, y, cw, 40});
+  rowTitle({x0, y, cw, 40}, L"Szobakód vagy link");
+  field(ID_CODE, {x0 + cw - 12 - 220, y + 8, 220, 24});
+  y += 40 + 6;
+  y += note(L"A megosztótól kapott 6 jelű kód, vagy a teljes link (pl. mozizas.hu/#abc123).", x0 + 12, y, cw - 24, 11, cMuted) + 22;
+  button(B_JOIN, {std::floor(x0 + cw / 2 - 115), y, 230, 28}, L"Csatlakozás", Style::Primary);
+  y += 28;
+  return errorText(g.joinErr, "joinErr", x0, y, cw);
 }
 
 float drawHome(float W, float) {
   Canvas& c = C();
-  float m = 36, cw = std::min(W - 2 * m, 1060.0f), x0 = std::floor((W - cw) / 2), y = 30;
-  // header
-  logo(x0, y, 44);
-  if (!g.measuring) {
-    c.gradientText(L"Screen Share", {x0 + 58, y - 3, 400, 30}, 25, Bold, cText, rgb(0xD9D2FF));
-    c.text(L"4K képernyőmegosztás hanggal · saját, titkosított átvitel", {x0 + 58, y + 25, cw - 200, 20}, 13, Regular, cMuted);
-  }
-  button(B_ABOUT, {x0 + cw - 124, y + 5, 124, 36}, L"Névjegy", Style::Ghost, true, Icon::Info);
-  y += 78;
-  // the two cards: side by side, or one under the other on a narrow window
-  float gap = 20;
-  bool wide = cw >= 700;
-  float colW = wide ? (cw - gap) / 2 : cw;
-  float hShare, hJoin;
-  {
-    bool was = g.measuring;
-    g.measuring = true;
-    hShare = homeShare(x0, y, colW) - y;
-    hJoin = homeJoin(x0, y, colW) - y;
-    g.measuring = was;
-  }
-  float h = wide ? std::max(hShare, hJoin) : 0;
-  card(x0, y, colW, h, [&](float yy) { return homeShare(x0, yy, colW); });
-  float y2 = wide ? y : y + hShare + gap;
-  float x2 = wide ? x0 + colW + gap : x0;
-  card(x2, y2, colW, h, [&](float yy) { return homeJoin(x2, yy, colW); });
-  y = (wide ? y + h : y2 + hJoin) + 18;
-  // footer: version, update
-  if (!g.measuring) c.text(std::wstring(L"Screen Share ") + kVersion + L" · natív alkalmazás", {x0 + 4, y, 400, 36}, 12, Regular, cFaint);
+  float cw = kHomeW, x0 = std::floor((W - cw) / 2), y = kTopPad;
+  // the About window (the Mac has it in the app menu): a small (i) in the corner
+  button(B_ABOUT, {W - 10 - 30, 8, 30, 30}, L"", Style::Ghost, true, Icon::Info);
+  if (!g.measuring) c.appIcon({std::floor(W / 2 - 42), y, 84, 84});
+  y += 84 + 12;
+  if (!g.measuring) c.text(L"Screen Share", {x0, y, cw, 28}, 22, Bold, cWhite, Center);
+  y += 28 + 4;
+  if (!g.measuring) c.text(L"Képernyőmegosztás hanggal, a lehető legkisebb késéssel.", {x0 - kSide, y, cw + 2 * kSide, 18}, 13, Regular, cMuted, Center);
+  y += 18 + 24;
+  segmented({std::floor(W / 2 - 132), y, 264, 28}, g.tab);
+  y += 28 + 22;
+  float pane = g.measuring ? 1.0f : A().to("pane", 1, 200); // a new tab fades in
+  c.pushAlpha(pane);
+  y = g.tab == 0 ? sharePane(x0, y, cw) : watchPane(x0, y, cw);
+  c.popAlpha();
   if (!g.update.version.empty()) {
-    Rect r{x0 + cw - 230, y, 230, 36};
-    if (g.updating && g.updateProgress >= 0 && !g.measuring) {
-      float k = A().to("updateBar", float(g.updateProgress) / 100.0f, 250);
-      c.fillRound(r, 12, cCardHi);
-      c.fillRoundGradient({r.x, r.y, std::max(24.0f, r.w * k), r.h}, 12, cAccent, cAccent2);
-      c.text(L"Letöltés… " + std::to_wstring(g.updateProgress) + L"%", r, 13.5f, Semibold, cWhite, Center);
+    y += 20;
+    Rect r{std::floor(W / 2 - 110), y, 220, 26};
+    if (g.updating && g.updateProgress >= 0) {
+      if (!g.measuring) {
+        float k = A().to("updateBar", float(g.updateProgress) / 100.0f, 250);
+        c.fillRound(r, r.h / 2, rgb(0xFFFFFF, 0.12f));
+        c.fillRound({r.x, r.y, std::max(r.h, r.w * k), r.h}, r.h / 2, cAccent);
+        c.text(L"Letöltés… " + std::to_wstring(g.updateProgress) + L"%", r, 12, Semibold, cWhite, Center);
+      }
     } else {
-      button(B_UPDATE, r, g.updating ? L"Telepítés…" : L"Frissítés: " + toW(g.update.version), Style::Primary, true, Icon::Download, !g.updating);
+      button(B_UPDATE, r, g.updating ? L"Telepítés…" : L"Frissítés: " + toW(g.update.version), Style::Secondary, true, Icon::Download, !g.updating);
     }
+    y += 26;
   }
-  return y + 50;
+  return y + kBottomPad;
 }
 
 std::wstring pathName(const std::string& path) {
@@ -564,132 +528,121 @@ std::wstring pathName(const std::string& path) {
   return it == names.end() ? toW(path) : it->second;
 }
 
-Color statusColor() { return g.statusKind == "ok" ? cOk : g.statusKind == "warn" ? cWarn : g.statusKind == "error" ? cErr : cMuted; }
+Color latencyColor(double ms) { return ms < 40 ? cOk : ms < 90 ? cWarn : cErr; }
 
-/** One viewer: status dot, name and path, the numbers as small pills. */
+/** One viewer: a dot, the name and the way; the numbers on the right. */
 void viewerRow(const Json& v, const Rect& r) {
+  if (g.measuring) return;
   Canvas& c = C();
   std::string id = v["id"].str(""), state = v["state"].str("");
   float a = A().to("v" + id, 1, 260);
   c.pushAlpha(a);
-  c.pushTranslate(0, (1 - a) * 10);
-  glass(r, 16, 0.85f, false);
   bool connected = state == "connected";
-  Color col = connected ? cOk : state == "unsupported" ? cErr : state == "retrying" ? cWarn : cMuted;
-  dot(r.x + 22, r.cy(), col, 4.5f);
-  c.text(L"Néző #" + std::to_wstring(int(v["n"].num())), {r.x + 40, r.y + 9, 200, 20}, 14, Semibold, cText);
+  dot(r.x + 16, r.cy(), connected ? cOk : state == "unsupported" ? cErr : state == "retrying" ? cWarn : cFaint);
+  // the numbers, right to left; the latency in its colour
+  std::vector<std::pair<std::wstring, Color>> parts;
+  if (connected) {
+    char b[48];
+    if (v["fps"].isNumber()) parts.push_back({std::to_wstring(int(v["fps"].num())) + L" FPS", cMuted});
+    if (v["kbps"].isNumber()) {
+      std::snprintf(b, sizeof b, "%.1f Mbit/s", v["kbps"].num() / 1000);
+      parts.push_back({toW(b), cMuted});
+    }
+    if (v["rtt"].isNumber()) parts.push_back({L"RTT " + std::to_wstring(int(std::lround(v["rtt"].num()))) + L" ms", cMuted});
+    if (v["lat"].isNumber()) parts.push_back({L"~" + std::to_wstring(int(std::lround(v["lat"].num()))) + L" ms", latencyColor(v["lat"].num())});
+  }
+  float x = r.right() - 12;
+  for (size_t i = parts.size(); i-- > 0;) {
+    bool last = i + 1 == parts.size() && v["lat"].isNumber();
+    float w = c.measure(parts[i].first, 11.5f, last ? Semibold : Regular);
+    x -= w;
+    c.text(parts[i].first, {x, r.y, w + 2, r.h}, 11.5f, last ? Semibold : Regular, parts[i].second);
+    if (i > 0) {
+      float dw = c.measure(L" · ", 11.5f, Regular);
+      x -= dw;
+      c.text(L" · ", {x, r.y, dw + 2, r.h}, 11.5f, Regular, cFaint);
+    }
+  }
   std::wstring sub = connected ? L"közvetlen mód · " + pathName(v["path"].str(""))
                      : state == "unsupported" ? L"nem tud nézni: " + toW(v["whyText"].str(""))
                      : state == "retrying"    ? L"kapcsolat újra… " + toW(v["whyText"].str(""))
                                               : L"kapcsolódik…";
-  c.text(sub, {r.x + 40, r.y + 29, r.w * 0.45f, 18}, 12, Regular, cMuted);
-  if (connected) {
-    std::vector<std::pair<std::wstring, Color>> pills;
-    char b[48];
-    if (v["fps"].isNumber()) pills.push_back({std::to_wstring(int(v["fps"].num())) + L" FPS", cText});
-    if (v["kbps"].isNumber()) {
-      std::snprintf(b, sizeof b, "%.1f Mbit/s", v["kbps"].num() / 1000);
-      pills.push_back({toW(b), cText});
-    }
-    if (v["rtt"].isNumber()) pills.push_back({L"RTT " + std::to_wstring(int(std::lround(v["rtt"].num()))) + L" ms", cText});
-    if (v["lat"].isNumber()) {
-      double lat = v["lat"].num();
-      pills.push_back({L"késés ~" + std::to_wstring(int(std::lround(lat))) + L" ms", lat < 40 ? cOk : lat < 90 ? cWarn : cErr});
-    }
-    float x = r.right() - 14;
-    for (auto it = pills.rbegin(); it != pills.rend(); ++it) {
-      float pw = c.measure(it->first, 12, Semibold) + 20;
-      x -= pw;
-      Rect pr{x, r.cy() - 13, pw, 26};
-      c.fillRound(pr, 13, rgb(0xFFFFFF, 0.05f));
-      c.text(it->first, pr, 12, Semibold, it->second, Center);
-      x -= 6;
-    }
-  }
-  c.popTranslate();
+  float tw = std::max(40.0f, x - 12 - (r.x + 30));
+  c.text(L"Néző #" + std::to_wstring(int(v["n"].num())), {r.x + 30, r.cy() - 17, tw, 18}, 13, Medium, cText);
+  c.text(sub, {r.x + 30, r.cy() + 1, tw, 15}, 11, Regular, cMuted);
   c.popAlpha();
 }
 
 float drawHosting(float W, float) {
   Canvas& c = C();
-  float m = 36, cw = std::min(W - 2 * m, 1000.0f), x0 = std::floor((W - cw) / 2), y = 30;
+  float cw = kHostW, x0 = std::floor((W - cw) / 2), y = kTopPad;
+  // ÉLŐ (or SZÜNETEL), in a little pill
   if (!g.measuring) {
-    c.text(L"Képernyőmegosztás", {x0, y, 360, 40}, 23, Bold, cText);
-    float tw = c.measure(L"Képernyőmegosztás", 23, Bold);
-    Rect badge{x0 + tw + 14, y + 8, g.live ? 64.0f : 96.0f, 24};
-    c.fillRound(badge, 12, g.live ? withAlpha(cAccent, 0.18f) : rgb(0xFFFFFF, 0.08f));
-    dot(badge.x + 14, badge.cy(), g.live ? cAccent : cMuted, 3.5f);
-    c.text(g.live ? L"ÉLŐ" : L"SZÜNETEL", {badge.x + 24, badge.y, badge.w - 28, badge.h}, 11.5f, Bold, g.live ? rgb(0xFFB3BF) : cMuted);
+    std::wstring t = g.live ? L"ÉLŐ" : L"SZÜNETEL";
+    Color col = g.live ? cErr : cMuted;
+    float tw = c.measure(t, 11, Bold);
+    Rect pill{std::floor(W / 2 - (tw + 32) / 2), y, tw + 32, 20};
+    c.fillRound(pill, 10, withAlpha(col, 0.15f));
+    dot(pill.x + 13, pill.cy(), col, 3.5f);
+    c.text(t, {pill.x + 22, pill.y, tw + 4, pill.h}, 11, Bold, col);
   }
-  button(B_STOP, {x0 + cw - 190, y, 190, 40}, L"Megosztás vége", Style::Danger, true, Icon::Stop);
-  button(B_PAUSE, {x0 + cw - 190 - 12 - 150, y, 150, 40}, g.live ? L"Szünet" : L"Folytatás", Style::Secondary, true, g.live ? Icon::Pause : Icon::Play);
-  y += 62;
-  float h = card(x0, y, cw, 0, [&](float yy) {
-    float p = 26, cx = x0 + p, iw = cw - 2 * p, cy = yy + p;
-    if (!g.measuring) {
-      c.text(L"SZOBAKÓD", {cx, cy, 200, 16}, 11.5f, Bold, cFaint);
-      // the code, letter by letter, in the accent gradient
-      std::wstring code = g.roomCode.empty() ? L"······" : g.roomCode;
-      float xx = cx;
-      for (wchar_t ch : code) {
-        std::wstring s(1, ch);
-        c.gradientText(s, {xx, cy + 18, 60, 58}, 44, Bold, cAccent, rgb(0xC08BFF));
-        xx += c.measure(s, 44, Bold) + 6;
-      }
-    }
-    cy += 86;
-    float bw = 186;
-    Rect lr{cx, cy, iw - bw - 12, 46};
-    if (!g.measuring) {
-      c.fillRound(lr, 12, cField);
-      c.strokeRoundGradient(lr, 12, rgb(0xFFFFFF, 0.16f), rgb(0xFFFFFF, 0.06f), 1);
-      c.icon(Icon::Link, lr.x + 22, lr.cy(), 16, cFaint, 1.6f);
-      c.text(g.roomLink.empty() ? L"A link a kapcsolódás után jelenik meg…" : toW(g.roomLink), {lr.x + 42, lr.y, lr.w - 56, lr.h}, 14, Regular,
-             g.roomLink.empty() ? cFaint : cText);
-    }
-    bool copied = A().now() - g.copiedAt < 2000;
-    if (copied) A().keepGoing();
-    button(B_COPY, {cx + iw - bw, cy, bw, 46}, copied ? L"Kimásolva" : L"Link másolása", copied ? Style::Success : Style::Primary, true, copied ? Icon::Check : Icon::Copy,
-           !g.roomLink.empty());
-    cy += 62;
-    if (!g.measuring) {
-      if (g.statusKind.empty()) spinner(cx + 8, cy + 11, 7, cMuted);
-      else dot(cx + 8, cy + 11, statusColor(), 4.5f);
-      c.text(g.statusText, {cx + 26, cy, iw - 26, 22}, 13.5f, Medium, g.statusKind.empty() ? cText : statusColor());
-      c.text(g.info, {cx + 26, cy + 24, iw - 26, 20}, 12.5f, Regular, cMuted);
-    }
-    cy += 46;
-    return cy + p - 6;
-  });
-  y += h + 26;
+  y += 20 + 14;
+  if (!g.measuring) c.text(L"SZOBAKÓD", {x0, y, cw, 14}, 11, Semibold, cMuted, Center);
+  y += 14;
+  if (!g.measuring) c.monoText(g.roomCode.empty() ? L"······" : g.roomCode, {x0, y, cw, 52}, 40, Bold, cText, Center);
+  y += 52 + 4;
+  if (!g.measuring) c.text(g.roomLink.empty() ? L"A link a kapcsolódás után jelenik meg…" : toW(g.roomLink), {x0, y, cw, 16}, 12, Regular, cMuted, Center);
+  y += 16 + 14;
+  bool copied = A().now() - g.copiedAt < 2000;
+  if (copied && !g.measuring) A().keepGoing();
+  button(B_COPY, {std::floor(W / 2 - 100), y, 200, 30}, copied ? L"Kimásolva" : L"Link másolása", copied ? Style::Success : Style::Secondary, true,
+         copied ? Icon::Check : Icon::Copy, !g.roomLink.empty());
+  y += 30 + 24;
+  // how it goes
+  float ih = 0;
+  c.measure(g.info.empty() ? L" " : g.info, 11.5f, Regular, cw - 24, &ih);
+  float sh = 40 + ih + 18;
+  group({x0, y, cw, sh}, {y + 40});
+  if (!g.measuring) {
+    if (g.statusKind.empty()) spinner(x0 + 20, y + 20, 6.5f, cMuted);
+    else dot(x0 + 20, y + 20, g.statusKind == "ok" ? cOk : g.statusKind == "warn" ? cWarn : g.statusKind == "error" ? cErr : cMuted);
+    c.text(g.statusText, {x0 + 36, y, cw - 48, 40}, 13, Regular, g.statusKind == "error" ? cErr : cText);
+    c.text(g.info, {x0 + 12, y + 40 + 9, cw - 24, ih + 2}, 11.5f, Regular, cMuted, Left, false, true);
+  }
+  y += sh + 22;
+  // the viewers
   int count = int(g.viewers.size());
   if (!g.measuring) {
-    c.icon(Icon::Users, x0 + 12, y + 13, 20, cMuted, 1.7f);
-    c.text(L"Nézők", {x0 + 32, y, 200, 26}, 16, Semibold, cText);
-    float tw = c.measure(L"Nézők", 16, Semibold);
-    Rect badge{x0 + 32 + tw + 10, y + 2, 28, 22};
-    c.fillRound(badge, 11, count ? withAlpha(cAccent, 0.2f) : rgb(0xFFFFFF, 0.07f));
-    c.text(std::to_wstring(count), badge, 12, Bold, count ? rgb(0xFFB3BF) : cMuted, Center);
+    c.text(L"Nézők", {x0 + 4, y, 200, 18}, 13, Semibold, cText);
+    if (count) c.text(std::to_wstring(count), {x0 + cw - 104, y, 100, 18}, 12, Regular, cMuted, Right);
   }
-  y += 38;
+  y += 18 + 7;
   if (count == 0) {
-    if (!g.measuring) {
-      Rect r{x0, y, cw, 116};
-      glass(r, 18, 0.6f, false);
-      c.icon(Icon::Users, r.cx(), r.y + 40, 30, cFaint, 1.8f);
-      c.text(L"Még nincs néző. Küldd el a linket vagy a kódot!", {r.x, r.y + 62, r.w, 30}, 14, Medium, cMuted, Center);
-    }
-    y += 116;
+    group({x0, y, cw, 56});
+    if (!g.measuring) c.text(L"Még nincs néző – küldd el a linket vagy a kódot.", {x0, y, cw, 56}, 12.5f, Regular, cMuted, Center);
+    y += 56;
   } else {
+    float rh = 46;
+    group({x0, y, cw, rh * float(count)});
+    int i = 0;
     for (const Json& v : g.viewers.items()) {
-      if (!g.measuring) viewerRow(v, {x0, y, cw, 58});
-      y += 66;
+      Rect r{x0, y + rh * float(i), cw, rh};
+      if (i > 0 && !g.measuring) c.fillRect({x0 + 12, std::floor(r.y), cw - 24, 1}, rgb(0xFFFFFF, 0.09f));
+      viewerRow(v, r);
+      i++;
     }
+    y += rh * float(count);
   }
-  return y + 30;
+  y += 22;
+  // pause, stop
+  float pw = 130, sw = 170, gap = 10, bx = std::floor(W / 2 - (pw + gap + sw) / 2);
+  button(B_PAUSE, {bx, y, pw, 30}, g.live ? L"Szünet" : L"Folytatás", Style::Secondary, true, g.live ? Icon::Pause : Icon::Play);
+  button(B_STOP, {bx + pw + gap, y, sw, 30}, L"Megosztás vége", Style::Danger);
+  y += 30;
+  return y + kBottomPad;
 }
 
-const float kBarH = 56;
+const float kBarH = 52;
 
 /** The viewer's bar: where its parts are (the drawing and the volume drag use the same numbers). */
 struct BarLayout {
@@ -699,15 +652,15 @@ struct BarLayout {
 
 BarLayout barLayout(float W) {
   BarLayout b;
-  float right = W - 14;
-  b.leave = {right - 118, 10, 118, 36};
-  right -= 118 + 8;
-  b.full = {right - 40, 10, 40, 36};
-  right -= 40 + 18;
-  b.volume = {right - 120, kBarH / 2 - 3, 120, 6};
-  right -= 120 + 10;
-  b.mute = {right - 38, 10, 38, 36};
-  b.textRight = right - 38 - 10;
+  float right = W - 12;
+  b.leave = {right - 104, 11, 104, 30};
+  right -= 104 + 10;
+  b.full = {right - 34, 11, 34, 30};
+  right -= 34 + 14;
+  b.volume = {right - 96, kBarH / 2 - 2, 96, 4};
+  right -= 96 + 6;
+  b.mute = {right - 34, 11, 34, 30};
+  b.textRight = right - 34 - 12;
   return b;
 }
 
@@ -718,31 +671,28 @@ float drawViewing(float W, float H) {
   c.fillRect({0, barH, W, H - barH}, rgb(0x000000));
   if (!g.fullscreen) {
     BarLayout b = barLayout(W);
-    c.verticalGradient({0, 0, W, barH}, rgb(0x171726), rgb(0x10101A));
-    c.glow(W * 0.1f, 0, 260, withAlpha(cAccent, 0.16f));
-    c.glow(W * 0.9f, 0, 300, withAlpha(cAccent2, 0.16f));
-    c.fillRect({0, 0, W, barH}, rgb(0xFFFFFF, 0.03f));
-    c.fillRoundStops({0, barH - 1, W, 1}, 0, {{0, rgb(0xFFFFFF, 0)}, {0.5f, rgb(0xFFFFFF, 0.22f)}, {1, rgb(0xFFFFFF, 0)}}, true);
-    dot(22, barH / 2, g.picture ? cOk : cWarn, 4.5f);
-    button(B_LEAVE, b.leave, L"Kilépés", Style::Danger, true, Icon::Close);
+    c.verticalGradient({0, 0, W, barH}, cWin1, cWin2);
+    c.fillRect({0, barH - 1, W, 1}, rgb(0xFFFFFF, 0.08f));
+    dot(22, barH / 2, g.picture ? cOk : cWarn);
+    button(B_LEAVE, b.leave, L"Kilépés", Style::Danger);
     button(B_FULL, b.full, L"", Style::Ghost, true, Icon::FullScreen);
     // volume: the icon mutes, the bar sets it
-    hit(B_VOLUME, {b.volume.x - 8, 12, b.volume.w + 16, 32});
+    hit(B_VOLUME, {b.volume.x - 8, 12, b.volume.w + 16, 28});
     float vol = A().to("vol", g.muted ? 0.0f : g.volume, 90);
     float vh = A().to(key("h", B_VOLUME), g.hover == B_VOLUME || g.draggingVolume ? 1.0f : 0.0f, 120);
-    c.fillRound(b.volume, 3, rgb(0xFFFFFF, 0.12f));
-    c.fillRoundGradient({b.volume.x, b.volume.y, std::max(6.0f, b.volume.w * vol), b.volume.h}, 3, cAccent, cAccent2);
-    c.fillCircle(b.volume.x + b.volume.w * vol, b.volume.cy(), 6 + 1.5f * vh, cWhite);
+    c.fillRound(b.volume, 2, rgb(0xFFFFFF, 0.18f));
+    c.fillRound({b.volume.x, b.volume.y, std::max(4.0f, b.volume.w * vol), b.volume.h}, 2, cAccent);
+    c.fillCircle(b.volume.x + b.volume.w * vol, b.volume.cy(), 6 + 1.2f * vh, cWhite);
     button(B_MUTE, b.mute, L"", Style::Ghost, true, g.muted ? Icon::Mute : Icon::Volume);
     std::wstring head = L"Szoba: " + g.roomCode;
-    c.text(head, {40, 0, 220, barH}, 14.5f, Semibold, cText);
-    float hw = c.measure(head, 14.5f, Semibold);
-    c.text(g.viewInfo, {40 + hw + 14, 0, std::max(0.0f, b.textRight - (40 + hw + 14)), barH}, 12.5f, Regular, cMuted);
+    c.text(head, {38, 0, 220, barH}, 13, Semibold, cText);
+    float hw = c.measure(head, 13, Semibold);
+    c.text(g.viewInfo, {38 + hw + 14, 0, std::max(0.0f, b.textRight - (38 + hw + 14)), barH}, 12, Regular, cMuted);
   }
   if (!g.picture || g.transitioning || !g.player || !g.player->hasPicture()) {
     float cy = barH + (H - barH) / 2;
-    spinner(W / 2, cy - 30, 18, cAccent);
-    c.text(g.overlayText, {40, cy + 2, W - 80, 60}, 15, Medium, cText, Center, false, true);
+    spinner(W / 2, cy - 28, 15, cMuted);
+    c.text(g.overlayText, {40, cy + 2, W - 80, 60}, 14, Medium, withAlpha(cText, 0.9f), Center, false, true);
   }
   return H;
 }
@@ -751,66 +701,66 @@ float drawViewing(float W, float H) {
  *  and the site under them. */
 void drawAboutWindow(float W, float H) {
   Canvas& c = C();
-  c.verticalGradient({0, 0, W, H}, cBg1, cBg2);
-  c.glow(W * 0.18f, H * 0.05f, 240, withAlpha(cAccent, 0.34f));
-  c.glow(W * 0.92f, H * 0.42f, 260, withAlpha(cAccent2, 0.30f));
-  float y = 28;
-  logo(std::floor(W / 2 - 38), y, 76);
-  y += 76 + 18;
-  c.text(L"Screen Share", {0, y, W, 26}, 17, Bold, cText, Center);
-  y += 27;
+  c.verticalGradient({0, 0, W, H}, cWin1, cWin2);
+  float y = 26;
+  c.appIcon({std::floor(W / 2 - 38), y, 76, 76});
+  y += 76 + 16;
+  c.text(L"Screen Share", {0, y, W, 24}, 17, Bold, cWhite, Center);
+  y += 26;
   c.text(std::wstring(L"Verzió ") + kVersion + L" (" + kBuild + L")", {0, y, W, 18}, 12, Regular, cMuted, Center);
   y += 30;
   float th = 0;
   c.measure(kCopyright, 11.5f, Regular, W - 56, &th);
   c.text(kCopyright, {28, y, W - 56, th + 4}, 11.5f, Regular, cFaint, Center, false, true);
   y += th + 22;
-  Rect r{std::floor(W / 2 - 112), y, 224, 36};
+  Rect r{std::floor(W / 2 - 105), y, 210, 30};
   if (g.updating && g.updateProgress >= 0) {
     float k = A().to("updateBar", float(g.updateProgress) / 100.0f, 250);
-    c.fillRound(r, 12, cCardHi);
-    c.fillRoundGradient({r.x, r.y, std::max(24.0f, r.w * k), r.h}, 12, cAccent, cAccent2);
-    c.text(L"Letöltés… " + std::to_wstring(g.updateProgress) + L"%", r, 13, Semibold, cWhite, Center);
+    c.fillRound(r, r.h / 2, rgb(0xFFFFFF, 0.12f));
+    c.fillRound({r.x, r.y, std::max(r.h, r.w * k), r.h}, r.h / 2, cAccent);
+    c.text(L"Letöltés… " + std::to_wstring(g.updateProgress) + L"%", r, 12.5f, Semibold, cWhite, Center);
   } else if (!g.update.version.empty()) {
     button(B_UPDATE, r, g.updating ? L"Telepítés…" : L"Frissítés: " + toW(g.update.version), Style::Primary, true, Icon::Download, !g.updating);
   } else {
     button(B_CHECK, r, g.checking ? L"Keresés…" : L"Frissítések keresése", Style::Secondary, true, Icon::Refresh, !g.checking);
   }
-  y += 36 + 8;
+  y += 30 + 10;
   c.text(g.updateNote, {0, y, W, 18}, 12, Regular, g.update.version.empty() ? cMuted : cOk, Center);
   y += 24;
-  button(B_SITE, {std::floor(W / 2 - 74), y, 148, 30}, L"mozizas.hu", Style::Ghost, true, Icon::Link);
+  button(B_SITE, {std::floor(W / 2 - 70), y, 140, 28}, L"mozizas.hu", Style::Ghost, true, Icon::Link);
   y += 40;
   const wchar_t* credits = L"BearSSL (MIT) · Opus (BSD) · NVIDIA Video Codec SDK (MIT)";
   c.measure(credits, 10.5f, Regular, W - 40, &th);
   c.text(credits, {20, y, W - 40, th + 4}, 10.5f, Regular, cFaint, Center, false, true);
 }
 
+/** A question over the screen (the Mac's alert): the title, the text, the buttons. */
 void drawModal(float W, float H) {
   Canvas& c = C();
   float k = A().to("modal", g.modal.open ? 1.0f : 0.0f, 170);
   if (k < 0.005f) return;
   if (g.modal.open) g.hits.clear(); // only the dialog answers
   c.pushAlpha(k);
-  c.fillRect({0, 0, W, H}, rgb(0x05050A, 0.62f));
-  float w = std::min(440.0f, W - 48), th = 0;
-  c.measure(g.modal.text, 13.5f, Regular, w - 56, &th);
-  float h = 56 + 26 + th + 30 + 42 + 28;
+  c.fillRect({0, 0, W, H}, rgb(0x000000, 0.45f));
+  float w = std::min(360.0f, W - 40), th = 0;
+  c.measure(g.modal.text, 13, Regular, w - 48, &th);
+  float h = 24 + 22 + 8 + th + 22 + 30 + 22;
   Rect r{std::floor((W - w) / 2), std::floor((H - h) / 2), w, h};
-  c.pushScale(0.95f + 0.05f * k, r.cx(), r.cy());
-  c.fillRound(r, 22, rgb(0x14141F, 0.80f));
-  glass(r, 22, 1.4f);
-  float x = r.x + 28, y = r.y + 28;
-  c.text(g.modal.title, {x, y, w - 56, 26}, 18, Semibold, cText);
-  y += 38;
-  c.text(g.modal.text, {x, y, w - 56, th + 4}, 13.5f, Regular, cMuted, Left, false, true);
-  y += th + 30;
-  float bw = (w - 56 - 12) / 2;
+  c.pushScale(0.96f + 0.04f * k, r.cx(), r.cy());
+  c.shadow(r, 14, 1.4f);
+  c.fillRound(r, 14, rgb(0x2E2E33));
+  c.strokeRound(r, 14, rgb(0xFFFFFF, 0.12f), 1);
+  float x = r.x + 24, y = r.y + 24;
+  c.text(g.modal.title, {x, y, w - 48, 22}, 15, Semibold, cText);
+  y += 22 + 8;
+  c.text(g.modal.text, {x, y, w - 48, th + 4}, 13, Regular, cMuted, Left, false, true);
+  y += th + 22;
+  float bw = (w - 48 - 10) / 2;
   if (g.modal.cancel.empty()) {
-    button(B_MODAL_OK, {x, y, w - 56, 42}, g.modal.ok, Style::Primary);
+    button(B_MODAL_OK, {x, y, w - 48, 30}, g.modal.ok, Style::Primary);
   } else {
-    button(B_MODAL_CANCEL, {x, y, bw, 42}, g.modal.cancel, Style::Secondary);
-    button(B_MODAL_OK, {x + bw + 12, y, bw, 42}, g.modal.ok, g.modal.danger ? Style::Danger : Style::Primary);
+    button(B_MODAL_CANCEL, {x, y, bw, 30}, g.modal.cancel, Style::Secondary);
+    button(B_MODAL_OK, {x + bw + 10, y, bw, 30}, g.modal.ok, g.modal.danger ? Style::Danger : Style::Primary);
   }
   c.popScale();
   c.popAlpha();
@@ -848,6 +798,89 @@ float drawScreen(Screen s, float W, float H) {
   return H;
 }
 
+/* ------------------------------------------------ the window: as tall as what it shows (as the Mac's) */
+
+const UINT WM_FIT = WM_APP + 5;
+
+float screenWidth(Screen s) { return (s == Screen::Hosting ? kHostW : kHomeW) + 2 * kSide; }
+
+/** How tall a compact screen's content is (laid out, not drawn). */
+float measureScreen(Screen s) {
+  bool was = g.measuring;
+  g.measuring = true;
+  float h = drawScreen(s, screenWidth(s), 0);
+  g.measuring = was;
+  return h;
+}
+
+/** The compact window to the size of its content: its top centre stays (or goes back where it was
+ *  before watching), and it stays on the screen. */
+void fitWindow() {
+  if (g.screen == Screen::Viewing || g.fullscreen || IsIconic(g.wnd) || IsZoomed(g.wnd)) return;
+  RECT want{0, 0, px(screenWidth(g.screen)), px(g.contentHeight)};
+  AdjustWindowRectExForDpi(&want, DWORD(GetWindowLongPtrW(g.wnd, GWL_STYLE)), FALSE, DWORD(GetWindowLongPtrW(g.wnd, GWL_EXSTYLE)), g.dpi);
+  int w = want.right - want.left, h = want.bottom - want.top;
+  RECT cur;
+  GetWindowRect(g.wnd, &cur);
+  POINT top = g.anchored ? g.anchor : POINT{(cur.left + cur.right) / 2, cur.top};
+  g.anchored = false;
+  MONITORINFO mi{sizeof mi};
+  GetMonitorInfoW(MonitorFromPoint(top, MONITOR_DEFAULTTONEAREST), &mi);
+  const RECT& wa = mi.rcWork;
+  w = std::min<int>(w, wa.right - wa.left);
+  h = std::min<int>(h, wa.bottom - wa.top);
+  int x = std::clamp<int>(top.x - w / 2, wa.left, wa.right - w), y = std::clamp<int>(top.y, wa.top, wa.bottom - h);
+  if (x == cur.left && y == cur.top && w == cur.right - cur.left && h == cur.bottom - cur.top) return;
+  SetWindowPos(g.wnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/** After something that changes the layout (a tab, an error, a viewer): measured and fitted now. */
+void relayout() {
+  if (g.screen != Screen::Viewing) {
+    g.contentHeight = measureScreen(g.screen);
+    fitWindow();
+  }
+  animate();
+}
+
+/** Watching: a large window that can be resized (as last time, or 16:9 on most of the screen). */
+void enterViewerWindow() {
+  RECT wr;
+  GetWindowRect(g.wnd, &wr);
+  g.anchor = {(wr.left + wr.right) / 2, wr.top};
+  g.anchored = true;
+  SetWindowLongPtrW(g.wnd, GWL_STYLE, GetWindowLongPtrW(g.wnd, GWL_STYLE) | WS_THICKFRAME | WS_MAXIMIZEBOX);
+  MONITORINFO mi{sizeof mi};
+  GetMonitorInfoW(MonitorFromWindow(g.wnd, MONITOR_DEFAULTTONEAREST), &mi);
+  const RECT& wa = mi.rcWork;
+  int maxW = wa.right - wa.left, maxH = wa.bottom - wa.top;
+  int w = int(loadDword(L"ViewerW", 0)), h = int(loadDword(L"ViewerH", 0));
+  if (w < px(640) || h < px(400) || w > maxW || h > maxH) {
+    w = std::min(px(1280), maxW * 86 / 100);
+    h = w * 9 / 16 + px(kBarH) + GetSystemMetricsForDpi(SM_CYCAPTION, g.dpi);
+    if (h > maxH * 86 / 100) {
+      h = maxH * 86 / 100;
+      w = (h - px(kBarH)) * 16 / 9;
+    }
+  }
+  int x = std::clamp<int>((wr.left + wr.right) / 2 - w / 2, wa.left, wa.right - w), y = std::clamp<int>((wr.top + wr.bottom) / 2 - h / 2, wa.top, wa.bottom - h);
+  SetWindowPos(g.wnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_FRAMECHANGED);
+  if (loadDword(L"ViewerMax", 0)) ShowWindow(g.wnd, SW_MAXIMIZE);
+}
+
+/** Back from watching: the viewer's size is kept for next time, the window compact again. */
+void leaveViewerWindow() {
+  bool zoomed = IsZoomed(g.wnd) != FALSE;
+  saveDword(L"ViewerMax", zoomed);
+  if (zoomed) ShowWindow(g.wnd, SW_RESTORE);
+  RECT wr;
+  GetWindowRect(g.wnd, &wr);
+  saveDword(L"ViewerW", DWORD(wr.right - wr.left));
+  saveDword(L"ViewerH", DWORD(wr.bottom - wr.top));
+  SetWindowLongPtrW(g.wnd, GWL_STYLE, GetWindowLongPtrW(g.wnd, GWL_STYLE) & ~(WS_THICKFRAME | WS_MAXIMIZEBOX));
+  SetWindowPos(g.wnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+}
+
 /* ------------------------------------------------ the Windows controls: where they are, when shown */
 
 void placeChild(int id, HWND h, bool visible) {
@@ -861,7 +894,7 @@ void placeChild(int id, HWND h, bool visible) {
     GetTextMetricsW(dc, &tm);
     SelectObject(dc, old);
     ReleaseDC(h, dc);
-    int x = px(r.x + 40), w = px(r.w - 52), eh = tm.tmHeight + 2;
+    int x = px(r.x + 8), w = px(r.w - 16), eh = tm.tmHeight + 2;
     int y = px(r.y - g.scroll + r.h / 2) - eh / 2;
     want = {x, y, x + w, y + eh};
   }
@@ -875,8 +908,8 @@ void placeChild(int id, HWND h, bool visible) {
 
 void updateChildren() {
   bool home = g.screen == Screen::Home && !g.transitioning;
-  placeChild(ID_PASSWORD, g.pass, home);
-  placeChild(ID_CODE, g.code, home);
+  placeChild(ID_PASSWORD, g.pass, home && g.tab == 0);
+  placeChild(ID_CODE, g.code, home && g.tab == 1);
   // (the window only once a frame is on it: before that a new swap chain shows whatever was there)
   bool video = g.screen == Screen::Viewing && g.picture && !g.transitioning && g.player && g.player->hasPicture();
   if (video) {
@@ -907,31 +940,23 @@ void paint() {
     t = easeOut(float((A().now() - g.transitionStart) / 240.0));
     if (t >= 1.0f) g.transitioning = false;
   }
-  // the background: dark, with two soft glows
-  if (g.screen == Screen::Viewing && !g.transitioning) {
-    c.clear(rgb(0x000000));
-  } else {
-    c.verticalGradient({0, 0, W, H}, cBg1, cBg2);
-    c.glow(W * 0.12f, H * 0.16f, 520, withAlpha(cAccent, 0.46f));
-    c.glow(W * 0.90f, H * 0.30f, 560, withAlpha(cAccent2, 0.44f));
-    c.glow(W * 0.52f, H * 1.05f, 600, withAlpha(rgb(0x3B82F6), 0.36f));
-    c.glow(W * 0.00f, H * 0.86f, 360, withAlpha(rgb(0x22D3EE), 0.18f));
-  }
+  if (g.screen == Screen::Viewing && !g.transitioning) c.clear(rgb(0x000000));
+  else c.verticalGradient({0, 0, W, H}, cWin1, cWin2);
   if (g.transitioning) {
     // the screens cross-fade: the old one rises and fades, the new one comes up
     c.pushAlpha(1 - t);
-    c.pushTranslate(0, -14 * t);
+    c.pushTranslate(0, -10 * t);
     drawScreen(g.prev, W, H);
     c.popTranslate();
     c.popAlpha();
     c.pushAlpha(t);
-    c.pushTranslate(0, 18 * (1 - t));
+    c.pushTranslate(0, 12 * (1 - t));
     g.contentHeight = drawScreen(g.screen, W, H);
     c.popTranslate();
     c.popAlpha();
     A().keepGoing();
   } else {
-    // the scroll position: eased, kept within the content
+    // the scroll position (when the content is taller than the screen): eased, kept within it
     float maxScroll = std::max(0.0f, g.contentHeight - H);
     g.scrollTarget = std::clamp(g.scrollTarget, 0.0f, maxScroll);
     g.scroll = A().to("scroll", g.scrollTarget, 120);
@@ -945,6 +970,11 @@ void paint() {
   if (g.screen == Screen::Viewing && g.picture && g.player && !g.player->hasPicture()) A().keepGoing(); // until the first frame shows
   c.end();
   updateChildren();
+  // the compact window follows its content (once the cross-fade is over)
+  if (!g.transitioning && g.screen != Screen::Viewing && !g.fitPosted && (std::fabs(g.contentHeight - H) > 0.75f || std::fabs(screenWidth(g.screen) - W) > 0.75f)) {
+    g.fitPosted = true;
+    PostMessageW(g.wnd, WM_FIT, 0, 0);
+  }
   if (A().active()) {
     animate();
   } else if (g.animTimer) {
@@ -955,6 +985,7 @@ void paint() {
 
 void show(Screen s) {
   if (s == g.screen) return;
+  bool fromViewer = g.screen == Screen::Viewing;
   g.prev = g.screen;
   g.screen = s;
   g.transitioning = true;
@@ -963,9 +994,57 @@ void show(Screen s) {
   A().set("scroll", 0);
   g.scroll = 0;
   g.hover = g.pressed = ID_NONE;
+  if (s == Screen::Viewing) {
+    enterViewerWindow();
+  } else {
+    if (fromViewer) leaveViewerWindow();
+    g.contentHeight = measureScreen(s);
+    fitWindow();
+  }
   updateChildren(); // the text boxes and the picture hide while the screens cross-fade
   if (s != Screen::Home) SetFocus(g.wnd);
   animate();
+}
+
+/** Megosztás or Nézés on the home screen. */
+void setTab(int tab) {
+  if (tab == g.tab) return;
+  g.tab = tab;
+  saveDword(L"Tab", DWORD(tab));
+  A().set("pane", 0);
+  g.hover = ID_NONE;
+  relayout();
+  updateChildren();
+  if (tab == 1) SetFocus(g.code);
+  else if (GetWindowTextLengthW(g.pass) == 0) SetFocus(g.pass);
+  else SetFocus(g.wnd);
+}
+
+/** A pop-up's menu, under it (Windows' own, dark): the choice is kept. */
+void openMenu(int id) {
+  auto it = g.controlRects.find(id);
+  if (it == g.controlRects.end()) return;
+  Rect r = it->second;
+  HMENU m = CreatePopupMenu();
+  if (id == B_MONITOR) {
+    for (size_t i = 0; i < g.monitors.size(); i++) AppendMenuW(m, MF_STRING | (int(i) == g.monitor ? MF_CHECKED : 0), kMenuMonitor0 + UINT(i), g.monitors[i].name.c_str());
+  } else {
+    for (size_t i = 0; i < std::size(kQualities); i++) AppendMenuW(m, MF_STRING | (int(i) == g.quality ? MF_CHECKED : 0), kMenuQuality0 + UINT(i), kQualities[i].name);
+  }
+  POINT pt{px(r.x), px(r.bottom() - g.scroll + 3)};
+  ClientToScreen(g.wnd, &pt);
+  g.pressed = g.hover = ID_NONE;
+  invalidate();
+  UINT cmd = UINT(TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, pt.x, pt.y, g.wnd, nullptr));
+  DestroyMenu(m);
+  if (cmd >= kMenuQuality0 && cmd < kMenuQuality0 + std::size(kQualities)) {
+    g.quality = int(cmd - kMenuQuality0);
+    saveDword(L"Quality", DWORD(g.quality));
+  } else if (cmd >= kMenuMonitor0 && cmd < kMenuMonitor0 + g.monitors.size()) {
+    g.monitor = int(cmd - kMenuMonitor0);
+    saveDword(L"Monitor", DWORD(g.monitor));
+  }
+  relayout(); // (another hint)
 }
 
 /* ------------------------------------------------ sessions */
@@ -990,7 +1069,7 @@ void endSession() {
 void setError(std::wstring& where, const std::wstring& text, const char* animKey) {
   where = text;
   A().set(animKey, 0);
-  animate();
+  relayout();
 }
 
 void startSharing() {
@@ -1007,6 +1086,7 @@ void startSharing() {
   saveDword(L"Quality", DWORD(g.quality));
   saveDword(L"Monitor", DWORD(g.monitor));
   saveDword(L"Audio", g.audio);
+  saveDword(L"Remember", g.remember);
   savePassword(g.remember ? pw : L"");
   g.shareErr.clear();
   endSession();
@@ -1121,7 +1201,9 @@ void onEngineEvent(const Json& e) {
     }
     std::vector<Json> list = e["list"].items();
     std::sort(list.begin(), list.end(), [](const Json& a, const Json& b) { return a["n"].num() < b["n"].num(); });
+    bool changed = list.size() != g.viewers.size();
     g.viewers = Json(list);
+    if (changed) relayout();
   } else if (type == "closed" && g.screen == Screen::Hosting) {
     stopToHome(L"A szobát egy másik ablak vette át.");
   } else if (type == "view-state" && g.screen == Screen::Viewing) {
@@ -1435,9 +1517,9 @@ void copyLink() {
 }
 
 void onClick(int id) {
-  if (id >= B_MONITOR0 && id < B_MONITOR0 + 100) g.monitor = id - B_MONITOR0;
-  else if (id >= B_QUALITY0 && id < B_QUALITY0 + 100) g.quality = id - B_QUALITY0;
   switch (id) {
+    case B_TAB0: setTab(0); break;
+    case B_TAB1: setTab(1); break;
     case B_SHARE: startSharing(); break;
     case B_JOIN: startWatching(parseCode(getText(g.code))); break;
     case B_REMEMBER: g.remember = !g.remember; break;
@@ -1511,7 +1593,7 @@ HWND makeEdit(int id, DWORD style, const std::wstring& text, const wchar_t* cue)
 
 void makeEditFont() {
   HFONT old = g.editFont;
-  g.editFont = CreateFontW(-px(14.5f), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
+  g.editFont = CreateFontW(-px(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
                            L"Segoe UI");
   for (HWND h : {g.pass, g.code})
     if (h) SendMessageW(h, WM_SETFONT, WPARAM(g.editFont), TRUE);
@@ -1523,15 +1605,16 @@ void createControls() {
   makeEditFont();
   g.fieldBrush = CreateSolidBrush(kFieldGdi);
   std::wstring pw = loadPassword();
-  g.pass = makeEdit(ID_PASSWORD, ES_PASSWORD, pw, L"jelszó");
-  g.code = makeEdit(ID_CODE, 0, L"", L"pl. abc123 vagy https://mozizas.hu/#abc123");
+  g.pass = makeEdit(ID_PASSWORD, ES_PASSWORD, pw, L"megosztási jelszó");
+  g.code = makeEdit(ID_CODE, 0, L"", L"abc123 vagy link");
   g.video = CreateWindowExW(0, L"SSVideo", L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, g.wnd, nullptr, g.inst, nullptr);
-  g.remember = !pw.empty();
+  g.remember = loadDword(L"Remember", 1) != 0; // (on unless turned off, as on the Mac)
   g.audio = loadDword(L"Audio", 1) != 0;
   g.quality = int(std::min<DWORD>(loadDword(L"Quality", 0), DWORD(std::size(kQualities) - 1)));
   g.monitors = listMonitors();
   g.monitor = int(std::min<DWORD>(loadDword(L"Monitor", 0), DWORD(g.monitors.empty() ? 0 : g.monitors.size() - 1)));
   g.volume = float(std::min<DWORD>(loadDword(L"Volume", 100), 100)) / 100.0f;
+  g.tab = loadDword(L"Tab", 0) == 1 ? 1 : 0;
 }
 
 LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1545,23 +1628,26 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         AppendMenuW(sys, MF_STRING, kSysAbout, L"A Screen Share névjegye");
       }
       SetTimer(h, TIMER_TICK, 1000, nullptr);
-      checkUpdatesLater();
+      if (!g.shots) checkUpdatesLater();
       return 0;
     case WM_DPICHANGED: {
       g.dpi = HIWORD(wp);
       makeEditFont();
       const RECT* r = reinterpret_cast<const RECT*>(lp);
       SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
-      invalidate();
+      relayout();
       return 0;
     }
     case WM_SIZE:
       g.placed.erase(-1);
       invalidate();
       return 0;
+    case WM_FIT:
+      g.fitPosted = false;
+      fitWindow();
+      return 0;
     case WM_GETMINMAXINFO: {
-      auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-      mm->ptMinTrackSize = {px(760), px(560)};
+      if (g.screen == Screen::Viewing) reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {px(640), px(400)};
       return 0;
     }
     case WM_ERASEBKGND: return 1;
@@ -1607,6 +1693,11 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
       float x = dip(GET_X_LPARAM(lp)), y = dip(GET_Y_LPARAM(lp));
       g.pressed = hitAt(x, y);
+      if (g.pressed == B_MONITOR || g.pressed == B_QUALITY) { // a pop-up's menu opens on the press
+        SetFocus(h);
+        openMenu(g.pressed);
+        return 0;
+      }
       if (g.pressed == ID_NONE) SetFocus(h); // a click beside the text boxes takes the focus from them
       SetCapture(h);
       if (g.pressed == B_VOLUME) {
@@ -1703,6 +1794,170 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     default:
       return DefWindowProcW(h, msg, wp, lp);
   }
+}
+
+/* ------------------------------------------------ dark menus (the pop-ups', the window menu) */
+
+/** Windows' own menus in the dark: uxtheme's SetPreferredAppMode (ordinal 135 – not documented, but
+ *  what the system's own apps use; from Windows 10 1903, before which 135 was something else). */
+void darkMenus() {
+  typedef LONG(WINAPI * GetVersionFn)(OSVERSIONINFOW*);
+  typedef int(WINAPI * SetModeFn)(int);
+  typedef void(WINAPI * FlushFn)();
+  GetVersionFn version = nullptr;
+  SetModeFn setMode = nullptr;
+  FlushFn flush = nullptr;
+  FARPROC p = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+  std::memcpy(&version, &p, sizeof version);
+  OSVERSIONINFOW v{};
+  v.dwOSVersionInfoSize = sizeof v;
+  if (!version || version(&v) != 0 || v.dwBuildNumber < 18362) return;
+  HMODULE ux = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!ux) return;
+  p = GetProcAddress(ux, MAKEINTRESOURCEA(135));
+  std::memcpy(&setMode, &p, sizeof setMode);
+  p = GetProcAddress(ux, MAKEINTRESOURCEA(136));
+  std::memcpy(&flush, &p, sizeof flush);
+  if (setMode) setMode(2); // ForceDark
+  if (flush) flush();
+}
+
+/** The compact window in the middle of its screen, a little above (as the Mac's). */
+void centerWindow() {
+  RECT want{0, 0, px(screenWidth(g.screen)), px(g.contentHeight)};
+  AdjustWindowRectExForDpi(&want, DWORD(GetWindowLongPtrW(g.wnd, GWL_STYLE)), FALSE, DWORD(GetWindowLongPtrW(g.wnd, GWL_EXSTYLE)), g.dpi);
+  MONITORINFO mi{sizeof mi};
+  GetMonitorInfoW(MonitorFromWindow(g.wnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+  const RECT& wa = mi.rcWork;
+  int w = std::min<int>(want.right - want.left, wa.right - wa.left), h = std::min<int>(want.bottom - want.top, wa.bottom - wa.top);
+  SetWindowPos(g.wnd, nullptr, wa.left + (wa.right - wa.left - w) / 2, wa.top + (wa.bottom - wa.top - h) / 3, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/* ------------------------------------------------ screenshots (CI): every screen drawn and saved */
+
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 0x00000002
+#endif
+
+bool savePng(HDC dc, HBITMAP bmp, int w, int h, const std::wstring& path) {
+  BITMAPINFO bi{};
+  bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bi.bmiHeader.biWidth = w;
+  bi.bmiHeader.biHeight = -h;
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+  std::vector<BYTE> pixels(size_t(w) * size_t(h) * 4);
+  if (!GetDIBits(dc, bmp, 0, UINT(h), pixels.data(), &bi, DIB_RGB_COLORS)) return false;
+  for (size_t i = 3; i < pixels.size(); i += 4) pixels[i] = 255;
+  using Microsoft::WRL::ComPtr;
+  ComPtr<IWICImagingFactory> wic;
+  ComPtr<IWICStream> stream;
+  ComPtr<IWICBitmapEncoder> enc;
+  ComPtr<IWICBitmapFrameEncode> frame;
+  WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+  return SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) && SUCCEEDED(wic->CreateStream(&stream)) &&
+         SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) && SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) &&
+         SUCCEEDED(enc->Initialize(stream.Get(), WICBitmapEncoderNoCache)) && SUCCEEDED(enc->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr)) &&
+         SUCCEEDED(frame->SetSize(UINT(w), UINT(h))) && SUCCEEDED(frame->SetPixelFormat(&format)) && IsEqualGUID(format, GUID_WICPixelFormat32bppBGRA) &&
+         SUCCEEDED(frame->WritePixels(UINT(h), UINT(w) * 4, UINT(pixels.size()), pixels.data())) && SUCCEEDED(frame->Commit()) && SUCCEEDED(enc->Commit());
+}
+
+/** The window as Windows composes it (the title bar, what Direct2D drew, the text boxes) into a PNG. */
+bool shoot(HWND h, const std::wstring& path) {
+  RECT wr, vis;
+  GetWindowRect(h, &wr);
+  if (FAILED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &vis, sizeof vis))) vis = wr; // (without the invisible borders)
+  int w = wr.right - wr.left, hh = wr.bottom - wr.top, cw = vis.right - vis.left, ch = vis.bottom - vis.top;
+  if (w <= 0 || hh <= 0 || cw <= 0 || ch <= 0) return false;
+  HDC screen = GetDC(nullptr);
+  HDC whole = CreateCompatibleDC(screen), part = CreateCompatibleDC(screen);
+  HBITMAP wb = CreateCompatibleBitmap(screen, w, hh), pb = CreateCompatibleBitmap(screen, cw, ch);
+  HGDIOBJ o1 = SelectObject(whole, wb), o2 = SelectObject(part, pb);
+  bool ok = PrintWindow(h, whole, PW_RENDERFULLCONTENT) != FALSE;
+  BitBlt(part, 0, 0, cw, ch, whole, vis.left - wr.left, vis.top - wr.top, SRCCOPY);
+  SelectObject(whole, o1);
+  SelectObject(part, o2);
+  ok = savePng(part, pb, cw, ch, path) && ok;
+  DeleteObject(wb);
+  DeleteObject(pb);
+  DeleteDC(whole);
+  DeleteDC(part);
+  ReleaseDC(nullptr, screen);
+  return ok;
+}
+
+void pumpFor(double ms) {
+  double end = nowMs() + ms;
+  MSG m;
+  while (nowMs() < end) { // (the clock checked after each message: while something moves, a paint is always due)
+    if (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&m);
+      DispatchMessageW(&m);
+    } else {
+      Sleep(5);
+    }
+  }
+}
+
+/** --ui-shot <folder>: each screen as it looks with made-up content, saved as a PNG, and whether
+ *  Direct2D drew it (a frame it refuses – a resource of another factory, say – fails: exit 1). */
+int uiShots(const std::wstring& dir) {
+  CreateDirectoryW(dir.c_str(), nullptr);
+  double hold = 900; // (SS_SHOT_HOLD: longer, for a screenshot from outside, as under Wine)
+  if (const char* e = std::getenv("SS_SHOT_HOLD")) hold = std::max(100.0, std::atof(e));
+  std::string report;
+  bool failed = false;
+  auto snap = [&](const wchar_t* name, HWND h) {
+    pumpFor(hold);
+    bool saved = h && shoot(h, dir + L"\\" + name + L".png");
+    HRESULT drawn = (h && h == g.about ? g.aboutCanvas : g.canvas).lastResult();
+    char line[200];
+    std::snprintf(line, sizeof line, "%s: %s, drawn 0x%08lX\n", narrow(name).c_str(), saved ? "saved" : "not saved", static_cast<unsigned long>(drawn));
+    report += line;
+    if (FAILED(drawn)) failed = true;
+  };
+  SetWindowTextW(g.pass, L"titok123");
+  snap(L"1-home-share", g.wnd);
+  setTab(1);
+  snap(L"2-home-watch", g.wnd);
+  setTab(0);
+  setError(g.shareErr, L"Hibás megosztási jelszó.", "shareErr");
+  snap(L"3-home-error", g.wnd);
+  g.shareErr.clear();
+  // sharing, with two viewers
+  g.live = true;
+  g.roomCode = L"x7k2pd";
+  g.roomLink = "https://mozizas.hu/#x7k2pd";
+  g.statusText = L"Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.";
+  g.statusKind = "ok";
+  g.info = L"Kép: 2560×1440 · NVENC (videókártya) · 60 FPS · 2,1 ms/kép · hang: sztereó";
+  g.viewers = Json::parse(R"([{"id":"a","n":1,"state":"connected","path":"lan","fps":60,"kbps":18400,"rtt":3,"lat":21},{"id":"b","n":2,"state":"connecting"}])");
+  show(Screen::Hosting);
+  snap(L"4-hosting", g.wnd);
+  ask(L"Befejezed a megosztást?", L"A nézőknél megáll a kép, és a szoba bezárul.", L"Befejezés", L"Mégse", true, nullptr);
+  snap(L"5-question", g.wnd);
+  closeModal(false);
+  g.viewers = Json::array();
+  g.statusKind.clear();
+  g.statusText = L"Kapcsolódás a szerverhez…";
+  relayout();
+  snap(L"6-hosting-empty", g.wnd);
+  // watching, before the picture comes
+  g.overlayText = L"Csatlakozás a szobához…";
+  g.viewInfo = L"Várakozás a képre…";
+  show(Screen::Viewing);
+  snap(L"7-viewing", g.wnd);
+  show(Screen::Home);
+  pumpFor(300);
+  showAbout();
+  snap(L"8-about", g.about);
+  if (FILE* f = _wfopen((dir + L"\\ui-check.txt").c_str(), L"w")) {
+    std::fputs(report.c_str(), f);
+    std::fclose(f);
+  }
+  DestroyWindow(g.wnd);
+  return failed ? 1 : 0;
 }
 
 /* ------------------------------------------------ smoke tests (CI): the real pipeline, no UI */
@@ -1830,9 +2085,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
     std::fclose(log);
     return 0;
   }
-  HWND wnd = CreateWindowExW(0, L"ScreenShare", L"Screen Share", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1120, 800, nullptr, nullptr, inst,
-                             nullptr);
+  g.shots = argc == 3 && std::wstring(argv[1]) == L"--ui-shot";
+  darkMenus();
+  // compact (as the Mac's): as tall as the home screen, not resized by hand; watching makes it large
+  HWND wnd = CreateWindowExW(0, L"ScreenShare", L"Screen Share", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
+                             480, 640, nullptr, nullptr, inst, nullptr);
   styleTitleBar(wnd);
+  g.contentHeight = measureScreen(Screen::Home);
+  centerWindow();
+  if (g.shots) {
+    ShowWindow(wnd, SW_SHOW);
+    UpdateWindow(wnd);
+    int result = uiShots(argv[2]);
+    timeEndPeriod(1);
+    MFShutdown();
+    CoUninitialize();
+    return result;
+  }
   // a room link given on the command line (screenshare://abc123 or the code)
   std::wstring arg = cmd ? cmd : L"";
   ShowWindow(wnd, showCmd);

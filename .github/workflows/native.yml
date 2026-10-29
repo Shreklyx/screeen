@@ -112,6 +112,19 @@ jobs:
             if (!(view.shownFps > 10)) problems.push('the app did not decode / show the picture');
             if (problems.length) { console.error(problems.join('\n')); process.exit(1); }
           "
+      # Every screen drawn with made-up content and saved as a picture (to look at: the artifact); a
+      # frame Direct2D refuses – as one with a resource of another factory: a white window – fails
+      - name: "UI: every screen drawn"
+        shell: bash
+        run: |
+          build/windows/ScreenShare.exe --ui-shot "$(cygpath -w "$PWD/ui-shots")" || { cat ui-shots/ui-check.txt; exit 1; }
+          cat ui-shots/ui-check.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshare-ui-windows
+          path: ui-shots
+          if-no-files-found: warn
       # Round trips through a WebSocket and an echo server: the platform's (WinHTTP, what the app uses
       # towards browsers) next to our own (Nagle off). A platform one that holds the end of a message
       # back shows here as long round trips for the big messages.

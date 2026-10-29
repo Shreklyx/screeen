@@ -9,7 +9,7 @@ target_include_directories(ScreenShare PRIVATE . ../common ../third_party/nvenc)
 target_compile_definitions(ScreenShare PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00 SS_VERSION="${SS_VERSION}" SS_BUILD="${SS_BUILD}")
 configure_file(version.h.in ${CMAKE_CURRENT_BINARY_DIR}/version.h)
 target_include_directories(ScreenShare PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(ScreenShare PRIVATE sscore opus d2d1 dwrite dwmapi
+target_link_libraries(ScreenShare PRIVATE sscore opus d2d1 dwrite dwmapi windowscodecs
   d3d11 dxgi mfplat mf mfuuid wmcodecdspuuid strmiids winhttp crypt32 comctl32 uxtheme winmm avrt ole32 oleaut32 shell32 user32 gdi32)
 if(MSVC)
   target_compile_options(ScreenShare PRIVATE /W3 /utf-8)

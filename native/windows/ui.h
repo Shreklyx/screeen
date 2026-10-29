@@ -48,9 +48,11 @@ class Canvas {
   ~Canvas();
   /** Starts a frame for the window (creates / resizes the target as needed). */
   bool begin(HWND wnd, float dpi);
-  /** Ends it; false when the target was lost (the next begin makes a new one). */
+  /** Ends it (a lost target: the next begin makes a new one). */
   void end();
   void resized();
+  /** How the last frame ended (EndDraw's result: anything but S_OK, the frame did not show). */
+  HRESULT lastResult() const { return last_; }
 
   void clear(const Color& c);
   void fillRect(const Rect& r, const Color& c);
@@ -75,6 +77,11 @@ class Canvas {
   float measure(const std::wstring& s, float size, int weight, float maxWidth = 100000, float* height = nullptr);
   /** Text filled with a horizontal gradient. */
   void gradientText(const std::wstring& s, const Rect& r, float size, int weight, const Color& from, const Color& to);
+  /** Text in the fixed-width face (Cascadia Mono, Consolas). */
+  float monoText(const std::wstring& s, const Rect& r, float size, int weight, const Color& c, Align align = Left);
+
+  /** The app's own icon (the .exe's icon resource 1), as sharp as the screen allows. */
+  void appIcon(const Rect& r);
 
   void icon(Icon i, float cx, float cy, float size, const Color& c, float stroke = 1.7f);
 
@@ -93,14 +100,18 @@ class Canvas {
 
  private:
   ID2D1SolidColorBrush* brush(const Color& c);
-  IDWriteTextFormat* format(float size, int weight);
+  IDWriteTextFormat* format(float size, int weight, bool mono = false);
   void applyTransform();
   Microsoft::WRL::ComPtr<ID2D1Factory> factory_;
   Microsoft::WRL::ComPtr<IDWriteFactory> dwrite_;
   Microsoft::WRL::ComPtr<ID2D1HwndRenderTarget> target_;
   Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush_;
+  // (made by this canvas' factory: Direct2D refuses one from another factory – the whole frame)
+  Microsoft::WRL::ComPtr<ID2D1StrokeStyle> round_;
   std::map<int, Microsoft::WRL::ComPtr<IDWriteTextFormat>> formats_;
-  std::wstring family_;
+  std::map<int, Microsoft::WRL::ComPtr<ID2D1Bitmap>> icons_; // the app icon by its size in pixels (this target's)
+  std::wstring family_, mono_;
+  HRESULT last_ = S_OK;
   HWND wnd_ = nullptr;
   float dpi_ = 96, width_ = 0, height_ = 0;
   std::vector<float> alpha_{1.0f};

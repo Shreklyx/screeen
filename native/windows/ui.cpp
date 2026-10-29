@@ -1,5 +1,7 @@
 #include "ui.h"
 
+#include <wincodec.h>
+
 #include <algorithm>
 #include <cmath>
 
@@ -28,30 +30,30 @@ D2D1_ROUNDED_RECT rr(const Rect& r, float radius) { return D2D1::RoundedRect(D2D
 D2D1_RECT_F rf(const Rect& r) { return D2D1::RectF(r.x, r.y, r.x + r.w, r.y + r.h); }
 }  // namespace
 
-struct StrokeHolder {
-  ComPtr<ID2D1StrokeStyle> round;
-};
-static StrokeHolder g_stroke;
-
 Canvas::Canvas() {
   D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory_.GetAddressOf());
   DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dwrite_.GetAddressOf()));
   // the first of these the system has (Windows 11, Windows 10, then anything sensible)
   family_ = L"Segoe UI";
+  mono_ = L"Consolas";
   ComPtr<IDWriteFontCollection> fonts;
   if (dwrite_ && SUCCEEDED(dwrite_->GetSystemFontCollection(&fonts, FALSE))) {
-    for (const wchar_t* name : {L"Segoe UI Variable Text", L"Segoe UI", L"Tahoma", L"Arial", L"Liberation Sans", L"DejaVu Sans"}) {
-      UINT32 index = 0;
-      BOOL exists = FALSE;
-      if (SUCCEEDED(fonts->FindFamilyName(name, &index, &exists)) && exists) {
-        family_ = name;
-        break;
+    auto first = [&](std::initializer_list<const wchar_t*> names, std::wstring& out) {
+      for (const wchar_t* name : names) {
+        UINT32 index = 0;
+        BOOL exists = FALSE;
+        if (SUCCEEDED(fonts->FindFamilyName(name, &index, &exists)) && exists) {
+          out = name;
+          return;
+        }
       }
-    }
+    };
+    first({L"Segoe UI Variable Text", L"Segoe UI", L"Tahoma", L"Arial", L"Liberation Sans", L"DejaVu Sans"}, family_);
+    first({L"Cascadia Mono", L"Consolas", L"Liberation Mono", L"DejaVu Sans Mono", L"Courier New"}, mono_);
   }
   if (factory_) {
     D2D1_STROKE_STYLE_PROPERTIES p = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND);
-    factory_->CreateStrokeStyle(p, nullptr, 0, g_stroke.round.ReleaseAndGetAddressOf());
+    factory_->CreateStrokeStyle(p, nullptr, 0, round_.GetAddressOf());
   }
 }
 
@@ -66,6 +68,7 @@ bool Canvas::begin(HWND wnd, float dpi) {
     wnd_ = wnd;
     target_.Reset();
     brush_.Reset();
+    icons_.clear();
     D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), dpi, dpi);
     if (FAILED(factory_->CreateHwndRenderTarget(props, D2D1::HwndRenderTargetProperties(wnd, size, D2D1_PRESENT_OPTIONS_NONE), target_.GetAddressOf()))) return false;
     target_->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0), brush_.GetAddressOf());
@@ -86,9 +89,11 @@ bool Canvas::begin(HWND wnd, float dpi) {
 
 void Canvas::end() {
   if (!target_) return;
-  if (target_->EndDraw() == HRESULT(D2DERR_RECREATE_TARGET)) {
+  last_ = target_->EndDraw();
+  if (last_ == HRESULT(D2DERR_RECREATE_TARGET)) {
     target_.Reset();
     brush_.Reset();
+    icons_.clear();
   }
 }
 
@@ -161,11 +166,11 @@ void Canvas::fillRoundStops(const Rect& r, float radius, std::initializer_list<s
 void Canvas::fillCircle(float cx, float cy, float radius, const Color& c) { target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius), brush(c)); }
 
 void Canvas::strokeCircle(float cx, float cy, float radius, const Color& c, float width) {
-  target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius), brush(c), width, g_stroke.round.Get());
+  target_->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius), brush(c), width, round_.Get());
 }
 
 void Canvas::line(float x1, float y1, float x2, float y2, const Color& c, float width) {
-  target_->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2), brush(c), width, g_stroke.round.Get());
+  target_->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2), brush(c), width, round_.Get());
 }
 
 void Canvas::arc(float cx, float cy, float radius, float startDeg, float sweepDeg, const Color& c, float width) {
@@ -182,7 +187,7 @@ void Canvas::arc(float cx, float cy, float radius, float startDeg, float sweepDe
   }
   sink->EndFigure(D2D1_FIGURE_END_OPEN);
   sink->Close();
-  target_->DrawGeometry(path.Get(), brush(c), width, g_stroke.round.Get());
+  target_->DrawGeometry(path.Get(), brush(c), width, round_.Get());
 }
 
 void Canvas::verticalGradient(const Rect& r, const Color& top, const Color& bottom) {
@@ -221,12 +226,13 @@ void Canvas::shadow(const Rect& r, float radius, float strength) {
   }
 }
 
-IDWriteTextFormat* Canvas::format(float size, int weight) {
-  int key = int(size * 10) * 1000 + weight;
+IDWriteTextFormat* Canvas::format(float size, int weight, bool mono) {
+  int key = (int(size * 10) * 1000 + weight) * 2 + (mono ? 1 : 0);
   auto it = formats_.find(key);
   if (it != formats_.end()) return it->second.Get();
   ComPtr<IDWriteTextFormat> f;
-  dwrite_->CreateTextFormat(family_.c_str(), nullptr, DWRITE_FONT_WEIGHT(weight), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"hu-hu", f.GetAddressOf());
+  dwrite_->CreateTextFormat((mono ? mono_ : family_).c_str(), nullptr, DWRITE_FONT_WEIGHT(weight), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"hu-hu",
+                            f.GetAddressOf());
   formats_[key] = f;
   return f.Get();
 }
@@ -284,6 +290,42 @@ void Canvas::gradientText(const std::wstring& s, const Rect& r, float size, int 
   target_->DrawTextLayout(D2D1::Point2F(r.x, r.y), layout.Get(), g.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
 }
 
+float Canvas::monoText(const std::wstring& s, const Rect& r, float size, int weight, const Color& c, Align align) {
+  if (s.empty() || !dwrite_) return 0;
+  IDWriteTextFormat* f = format(size, weight, true);
+  ComPtr<IDWriteTextLayout> layout;
+  if (!f || FAILED(dwrite_->CreateTextLayout(s.c_str(), UINT32(s.size()), f, std::max(1.0f, r.w), std::max(1.0f, r.h), layout.GetAddressOf()))) return 0;
+  layout->SetTextAlignment(align == Center ? DWRITE_TEXT_ALIGNMENT_CENTER : align == Right ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_LEADING);
+  layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+  layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+  target_->DrawTextLayout(D2D1::Point2F(r.x, r.y), layout.Get(), brush(c), D2D1_DRAW_TEXT_OPTIONS_NONE);
+  DWRITE_TEXT_METRICS m{};
+  layout->GetMetrics(&m);
+  return m.width;
+}
+
+void Canvas::appIcon(const Rect& r) {
+  // the icon at the size it shows in pixels: Windows picks the best image of the .ico and scales it
+  int size = std::max(16, int(std::lround(r.w * dpi_ / 96.0f)));
+  ComPtr<ID2D1Bitmap>& bitmap = icons_[size];
+  if (!bitmap) {
+    HICON icon = HICON(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
+    ComPtr<IWICImagingFactory> wic;
+    ComPtr<IWICBitmap> source;
+    ComPtr<IWICFormatConverter> premultiplied;
+    if (icon && SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+        SUCCEEDED(wic->CreateBitmapFromHICON(icon, &source)) && SUCCEEDED(wic->CreateFormatConverter(&premultiplied)) &&
+        SUCCEEDED(premultiplied->Initialize(source.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
+      target_->CreateBitmapFromWicBitmap(premultiplied.Get(), nullptr, bitmap.GetAddressOf());
+    if (icon) DestroyIcon(icon);
+    if (!bitmap) {
+      icons_.erase(size);
+      return;
+    }
+  }
+  target_->DrawBitmap(bitmap.Get(), rf(r), std::clamp(alpha_.back(), 0.0f, 1.0f), D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+}
+
 void Canvas::icon(Icon i, float cx, float cy, float size, const Color& c, float stroke) {
   float s = size / 24.0f;
   auto X = [&](float x) { return cx + (x - 12) * s; };
@@ -299,7 +341,7 @@ void Canvas::icon(Icon i, float cx, float cy, float size, const Color& c, float 
     sink->EndFigure(closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
     sink->Close();
     if (fill) target_->FillGeometry(path.Get(), brush(c));
-    else target_->DrawGeometry(path.Get(), brush(c), stroke, g_stroke.round.Get());
+    else target_->DrawGeometry(path.Get(), brush(c), stroke, round_.Get());
   };
   auto box = [&](float x, float y, float w, float h, float r, bool fill) {
     Rect b{X(x), Y(y), w * s, h * s};
