@@ -52,6 +52,17 @@ Section "Screen Share"
     RMDir /r "$9"
   noElectron:
   SetOutPath "$INSTDIR"
+  ; the app's windows (there may be several) end: each, asked with WM_APP+6, ends its session and closes
+  StrCpy $2 0
+  closeWindows:
+    FindWindow $1 "ScreenShare"
+    StrCmp $1 0 closed
+    SendMessage $1 0x8006 0 0 /TIMEOUT=3000
+    Sleep 150
+    IntOp $2 $2 + 1
+    IntCmp $2 30 closed
+    Goto closeWindows
+  closed:
   ; the app that started this update closes itself: wait until its file is free
   StrCpy $0 0
   retry:
@@ -89,6 +100,17 @@ Section "Screen Share"
 SectionEnd
 
 Section "Uninstall"
+  StrCpy $2 0
+  closeWindows:
+    FindWindow $1 "ScreenShare"
+    StrCmp $1 0 closed
+    SendMessage $1 0x8006 0 0 /TIMEOUT=3000
+    Sleep 150
+    IntOp $2 $2 + 1
+    IntCmp $2 30 closed
+    Goto closeWindows
+  closed:
+  Sleep 300
   Delete "$INSTDIR\ScreenShare.exe"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"

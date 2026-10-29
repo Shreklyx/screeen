@@ -47,6 +47,32 @@ float sampleAt(const BYTE* p, const WAVEFORMATEX* f, size_t frame, int channel) 
   return 0;
 }
 
+/** Says when Windows' default output changes (headphones plugged in, another device chosen, a
+ *  monitor's speakers gone to sleep): the capture and the playback then open the new one. */
+class DeviceWatch : public IMMNotificationClient {
+ public:
+  std::atomic<bool> changed{false};
+  // (lives as long as its owner, which unregisters it first: no counting)
+  ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+  ULONG STDMETHODCALLTYPE Release() override { return 1; }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+    if (iid == __uuidof(IUnknown) || iid == __uuidof(IMMNotificationClient)) {
+      *out = static_cast<IMMNotificationClient*>(this);
+      return S_OK;
+    }
+    *out = nullptr;
+    return E_NOINTERFACE;
+  }
+  HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
+    if (flow == eRender && role == eConsole) changed = true;
+    return S_OK;
+  }
+  HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { return S_OK; }
+  HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+};
+
 }  // namespace
 
 /* ------------------------------------------------ the sharer: loopback → Opus */
@@ -61,17 +87,35 @@ struct AudioCapture::Impl {
 
   void run() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    error = loop();
-    started = error.empty() ? 1 : -1;
+    ComPtr<IMMDeviceEnumerator> en;
+    DeviceWatch watch;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en)))) en->RegisterEndpointNotificationCallback(&watch);
+    // the default output's sound, until stopped – when that device changes or goes away, the new
+    // one's (the viewers would hear nothing more otherwise)
+    bool first = true;
+    while (!quit) {
+      watch.changed = false;
+      std::string why = en ? loop(en.Get(), watch) : "no-device";
+      if (first) {
+        first = false;
+        if (!why.empty()) { // (the first try's failure is what start() reports)
+          error = why;
+          started = -1;
+          break;
+        }
+      }
+      if (!quit) Sleep(why.empty() ? 30 : 500);
+    }
+    if (en) en->UnregisterEndpointNotificationCallback(&watch);
     CoUninitialize();
   }
 
-  std::string loop() {
-    ComPtr<IMMDeviceEnumerator> en;
+  /** One device's sound: returns when stopped, when the default device changed or this one went
+   *  away ("" – open the default one again), or with what failed. */
+  std::string loop(IMMDeviceEnumerator* en, DeviceWatch& watch) {
     ComPtr<IMMDevice> device;
     ComPtr<IAudioClient> client;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en))) ||
-        FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &device)) || FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client)))
+    if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &device)) || FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client)))
       return "no-device";
     WAVEFORMATEX* mix = nullptr;
     if (FAILED(client->GetMixFormat(&mix))) return "no-format";
@@ -108,7 +152,8 @@ struct AudioCapture::Impl {
     double streamUs = -1;       // timestamp of pending[0]
     uint8_t out[1500];
     std::vector<float> pairBuf(kFrame * 2);
-    while (!quit) {
+    bool lost = false;
+    while (!quit && !watch.changed && !lost) {
       if (WaitForSingleObject(event, 50) != WAIT_OBJECT_0) {
         // nothing plays: Windows sends no packets – the next sound starts a fresh timeline
         continue;
@@ -118,7 +163,12 @@ struct AudioCapture::Impl {
         UINT32 frames = 0;
         DWORD flags = 0;
         UINT64 qpcPos = 0;
-        if (capture->GetBuffer(&data, &frames, &flags, nullptr, &qpcPos) != S_OK) break;
+        HRESULT got = capture->GetBuffer(&data, &frames, &flags, nullptr, &qpcPos);
+        if (got == AUDCLNT_S_BUFFER_EMPTY) break;
+        if (FAILED(got)) { // the device went away (unplugged, gone to sleep): the default one again
+          lost = true;
+          break;
+        }
         if (streamUs < 0 || pending.empty()) {
           // the timestamp: when this packet was captured (QPC, 100 ns) on the engine's clock
           LARGE_INTEGER now;
@@ -194,22 +244,26 @@ struct AudioPlayer::Impl {
 
   void run() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    while (!quit) {
-      play(); // returns when the device goes away: open the (new) default one
-      if (!quit) Sleep(500);
+    ComPtr<IMMDeviceEnumerator> en;
+    DeviceWatch watch;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en)))) en->RegisterEndpointNotificationCallback(&watch);
+    while (!quit && en) {
+      watch.changed = false;
+      // returns when the device goes away or another becomes the default: that one then
+      bool played = play(en.Get(), watch);
+      if (!quit) Sleep(played && watch.changed ? 30 : 500);
     }
+    if (en) en->UnregisterEndpointNotificationCallback(&watch);
     CoUninitialize();
   }
 
-  void play() {
-    ComPtr<IMMDeviceEnumerator> en;
+  bool play(IMMDeviceEnumerator* en, DeviceWatch& watch) {
     ComPtr<IMMDevice> device;
     ComPtr<IAudioClient> client;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en))) ||
-        FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &device)) || FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client)))
-      return;
+    if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &device)) || FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client)))
+      return false;
     WAVEFORMATEX* mix = nullptr;
-    if (FAILED(client->GetMixFormat(&mix))) return;
+    if (FAILED(client->GetMixFormat(&mix))) return false;
     // our own format: float at 48 kHz with the device's channels (Windows converts if needed)
     WAVEFORMATEXTENSIBLE fmt = {};
     fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
@@ -230,7 +284,7 @@ struct AudioPlayer::Impl {
                                     &fmt.Format, nullptr);
     if (FAILED(hr)) {
       CloseHandle(event);
-      return;
+      return false;
     }
     client->SetEventHandle(event);
     ComPtr<IAudioRenderClient> render;
@@ -240,7 +294,7 @@ struct AudioPlayer::Impl {
     DWORD task = 0;
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &task);
     client->Start();
-    while (!quit) {
+    while (!quit && !watch.changed) {
       if (WaitForSingleObject(event, 200) != WAIT_OBJECT_0) continue;
       UINT32 padding = 0;
       if (FAILED(client->GetCurrentPadding(&padding))) break; // the device went away
@@ -255,6 +309,7 @@ struct AudioPlayer::Impl {
     client->Stop();
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
     CloseHandle(event);
+    return true;
   }
 };
 

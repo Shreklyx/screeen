@@ -125,6 +125,8 @@ struct VideoPlayer::Impl {
   ComPtr<IMFTransform> decoder;
   ComPtr<IMFDXGIDeviceManager> manager;
   bool hardware = false;
+  bool software = false; // the GPU's way gave no picture here: the processor decodes from then on
+  int fedWithoutPicture = 0;
   bool providesSamples = false;
   DWORD outSize = 0;
   UINT32 frameW = 0, frameH = 0, stride = 0;
@@ -227,12 +229,14 @@ struct VideoPlayer::Impl {
   bool initDecoder() {
     decoder.Reset();
     manager.Reset();
+    hardware = false;
+    fedWithoutPicture = 0;
     if (FAILED(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&decoder)))) return false;
     ComPtr<IMFAttributes> attrs;
     if (SUCCEEDED(decoder->GetAttributes(&attrs))) {
       attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE); // a frame out for every frame in, no reordering wait
       UINT32 aware = 0;
-      if (SUCCEEDED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &aware)) && aware) {
+      if (!software && SUCCEEDED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &aware)) && aware) {
         UINT token = 0;
         if (SUCCEEDED(MFCreateDXGIDeviceManager(&token, &manager)) && SUCCEEDED(manager->ResetDevice(dev.Get(), token)) &&
             SUCCEEDED(decoder->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(manager.Get())))) {
@@ -321,12 +325,27 @@ struct VideoPlayer::Impl {
     captures.push_back(f.capture);
     if (captures.size() > 16) captures.pop_front();
     pull();
+    if (hardware && !pictured && ++fedWithoutPicture > 120) toSoftware(); // (2 s of frames and nothing shown)
   }
 
   void failed() {
     // start over: a fresh decoder and a keyframe
     initDecoder();
     if (owner->needKeyframe) owner->needKeyframe();
+  }
+
+  /** The GPU's way shows nothing on this computer (a texture or a view its driver will not make,
+   *  a decoder that gives no picture): the processor decodes from now on – slower, but a picture. */
+  void toSoftware() {
+    if (software) return;
+    software = true;
+    nv12.Reset();
+    lumSrv.Reset();
+    chromaSrv.Reset();
+    lumTex.Reset();
+    chromaTex.Reset();
+    texW = texH = 0;
+    failed();
   }
 
   /** Takes every frame the decoder has ready; only the newest is drawn. */
@@ -384,6 +403,10 @@ struct VideoPlayer::Impl {
       D3D11_TEXTURE2D_DESC td;
       tex->GetDesc(&td);
       ensureTextures(td.Width, td.Height, true);
+      if (!nv12 || !lumSrv || !chromaSrv) { // (this GPU will not show its decoder's frames this way)
+        toSoftware();
+        return false;
+      }
       ctx->CopySubresourceRegion(nv12.Get(), 0, 0, 0, 0, tex.Get(), index, nullptr);
       return true;
     }

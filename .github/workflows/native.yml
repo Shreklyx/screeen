@@ -114,11 +114,49 @@ jobs:
           "
       # Every screen drawn with made-up content and saved as a picture (to look at: the artifact); a
       # frame Direct2D refuses – as one with a resource of another factory: a white window – fails
+      # Six windows of the app watching at once (each its own process, as "Új ablak" opens them)
+      - name: "Six viewers at once"
+        shell: bash
+        run: |
+          PORT=8094 HOST_PASSWORD=ci DIRECT_PORT=3484 node server/server.js &
+          sleep 3
+          build/ss-cli.exe host --server http://127.0.0.1:8094 --password ci --h264 native/tests/data/test.h264 --seconds 40 > six-host.log &
+          for i in $(seq 1 80); do grep -q '^CODE' six-host.log 2>/dev/null && break; sleep 0.25; done
+          code=$(grep '^CODE' six-host.log | awk '{print $2}' | tr -d '\r')
+          pids=""
+          for k in 1 2 3 4 5 6; do
+            build/windows/ScreenShare.exe --smoke-view http://127.0.0.1:8094 "$code" 15 six-$k.log &
+            pids="$pids $!"
+          done
+          for p in $pids; do wait $p || true; done
+          node -e "
+            const fs = require('fs');
+            let bad = 0;
+            for (let k = 1; k <= 6; k++) {
+              let r = {};
+              try { r = JSON.parse(fs.readFileSync('six-' + k + '.log', 'utf8').split(/\r?\n/).find((l) => l.startsWith('RESULT ')).slice(7)); } catch {}
+              console.log('viewer ' + k + ':', JSON.stringify(r));
+              if (!(r.received > 100 && r.shownFps > 10)) bad++;
+            }
+            if (bad) { console.error(bad + ' of 6 viewers did not get or show the picture'); process.exit(1); }
+          "
       - name: "UI: every screen drawn"
         shell: bash
         run: |
           build/windows/ScreenShare.exe --ui-shot "$(cygpath -w "$PWD/ui-shots")" || { cat ui-shots/ui-check.txt; exit 1; }
           cat ui-shots/ui-check.txt
+      # The app watches a live room in its real window – the video in its child window over the
+      # drawn UI – and the screen there is looked at: the colour bars must show (not black)
+      - name: "UI: the picture shows when watching"
+        shell: bash
+        run: |
+          PORT=8093 HOST_PASSWORD=ci DIRECT_PORT=3483 node server/server.js &
+          sleep 3
+          build/ss-cli.exe host --server http://127.0.0.1:8093 --password ci --h264 native/tests/data/test.h264 --seconds 50 > watch-host.log &
+          for i in $(seq 1 80); do grep -q '^CODE' watch-host.log 2>/dev/null && break; sleep 0.25; done
+          code=$(grep '^CODE' watch-host.log | awk '{print $2}' | tr -d '\r')
+          build/windows/ScreenShare.exe --ui-watch http://127.0.0.1:8093 "$code" "$(cygpath -w "$PWD/ui-shots")" || { cat ui-shots/ui-watch.txt; exit 1; }
+          cat ui-shots/ui-watch.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -319,6 +357,22 @@ jobs:
             if (problems.length) { console.error(problems.join('\n')); process.exit(1); }
           "
       # the zip for the in-app update, the disk image for people (drag to Applications)
+      # Six viewers in one app (as six of its windows): every one gets and shows the picture
+      - name: "Six viewers in one app"
+        run: |
+          PORT=8094 HOST_PASSWORD=ci DIRECT_PORT=3484 node server/server.js &
+          sleep 3
+          build-arm64/ss-cli host --server http://127.0.0.1:8094 --password ci --h264 native/tests/data/test.h264 --seconds 40 > six-host.log &
+          for i in $(seq 1 80); do grep -q '^CODE' six-host.log 2>/dev/null && break; sleep 0.25; done
+          code=$(grep '^CODE' six-host.log | awk '{print $2}')
+          SS_VIEWERS=6 "dist/Screen Share.app/Contents/MacOS/Screen Share" --smoke-view http://127.0.0.1:8094 "$code" 15 six.log
+          node -e "
+            const fs = require('fs');
+            const r = JSON.parse(fs.readFileSync('six.log', 'utf8').split(/\r?\n/).find((l) => l.startsWith('RESULT ')).slice(7));
+            console.log(JSON.stringify(r.viewers));
+            console.log('fewest frames:', r.fewestReceived, 'slowest FPS:', r.slowestFps);
+            if (!(r.viewers && r.viewers.length === 6 && r.fewestReceived > 100 && r.slowestFps > 10)) { console.error('not every viewer got and showed the picture'); process.exit(1); }
+          "
       - name: "WebSocket round trips: NSURLSession and ours"
         run: |
           node -e "const {WebSocketServer}=require('ws'); const s=new WebSocketServer({port:8095}); s.on('connection',w=>w.on('message',(d,b)=>w.send(d,{binary:b})));" &

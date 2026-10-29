@@ -11,6 +11,7 @@
 #import <Security/Security.h>
 
 #include <algorithm>
+#include <climits>
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -518,10 +519,30 @@ static NSColor* latencyColor(double ms) {
 
 /* ------------------------------------------------ the app */
 
-@interface SSApp : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate>
+@class SSWin;
+
+/** The app: the menus, the About panel, updates – and its windows: any number, each sharing or
+ *  watching on its own (more rooms watched at once). */
+@interface SSApp : NSObject <NSApplicationDelegate>
+@property(nonatomic, readonly) NSArray<SSWin*>* windows;
+- (void)newWindowFrom:(SSWin*)from watch:(BOOL)watch;
+- (void)windowClosed:(SSWin*)w;
+- (void)installUpdate;
 @end
 
-@implementation SSApp {
+/** One window: home, sharing, watching. */
+@interface SSWin : NSObject <NSWindowDelegate, NSTextFieldDelegate>
+@property(nonatomic, readonly) NSWindow* window;
+- (instancetype)initFrom:(SSWin*)from watch:(BOOL)watch;
+- (NSEvent*)key:(NSEvent*)e;
+- (void)endSession;
+- (bool)busy;
+- (void)ask:(NSString*)title text:(NSString*)text ok:(NSString*)ok cancel:(NSString*)cancel danger:(BOOL)danger action:(void (^)(void))action;
+- (void)showUpdate:(NSString*)version;
+- (void)updateBusy:(BOOL)busy failed:(BOOL)failed;
+@end
+
+@implementation SSWin {
   NSWindow* _window;
   NSView *_stage, *_current;
   NSView *_home, *_host, *_viewer;
@@ -561,25 +582,27 @@ static NSColor* latencyColor(double ms) {
   std::unique_ptr<MacPlayer> _player;
   std::unique_ptr<MacAudioOut> _audioOut;
   int _session;
-  bool _live, _picture, _stats, _muted, _checking, _barHidden;
+  bool _live, _picture, _stats, _muted, _barHidden;
   std::string _roomLink, _statusKind;
   Json _viewStats;
-  NSString *_updateFile, *_updateVersion, *_savedPassword, *_passwordToSave;
+  NSString *_savedPassword, *_passwordToSave;
+  NSTimer *_tickTimer, *_barTimer;
 }
 
-- (void)applicationDidFinishLaunching:(NSNotification*)n {
-  if ([self signLocallyFirst]) return;
-  [self makeMenu];
+- (instancetype)initFrom:(SSWin*)from watch:(BOOL)watch {
+  if (!(self = [super init])) return nil;
   _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, kHomeWidth + 2 * kSide, 560)
                                         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView
                                           backing:NSBackingStoreBuffered
                                             defer:NO];
+  _window.releasedWhenClosed = NO; // (this object keeps it)
   _window.title = @"Screen Share";
   _window.titlebarAppearsTransparent = YES;
   _window.titleVisibility = NSWindowTitleHidden;
   _window.movableByWindowBackground = YES;
   _window.delegate = self;
   _window.collectionBehavior = NSWindowCollectionBehaviorFullScreenNone;
+  _window.tabbingMode = NSWindowTabbingModeDisallowed; // (windows side by side, not tabs)
   // the window's own background: what is behind it, blurred – as the system's panels
   NSVisualEffectView* root = [NSVisualEffectView new];
   root.material = NSVisualEffectMaterialUnderWindowBackground;
@@ -594,35 +617,33 @@ static NSColor* latencyColor(double ms) {
   [self makeHome];
   [self makeHost];
   [self makeViewer];
+  if (watch) { // (another window: to watch one more room)
+    _tabs.selectedSegment = 1;
+    [self applyTab];
+  }
   [self show:_home];
   [self fitWindow:NO];
-  [_window center];
+  if (from) { // a little lower and to the right of the window it came from
+    NSRect f = from.window.frame;
+    [_window setFrameTopLeftPoint:NSMakePoint(NSMinX(f) + 26, NSMaxY(f) - 26)];
+    [_window setFrame:[self clamp:_window.frame] display:NO];
+  } else {
+    [_window center];
+  }
   [_window makeKeyAndOrderFront:nil];
-  [NSApp activateIgnoringOtherApps:YES];
-  [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(tick) userInfo:nil repeats:YES];
-  [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(barTick) userInfo:nil repeats:YES];
-  [self checkUpdatesLater];
-  __weak SSApp* weak = self;
-  [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
-                                        handler:^NSEvent*(NSEvent* e) {
-                                          SSApp* s = weak;
-                                          return s ? [s key:e] : e;
-                                        }];
+  if (watch) [_window makeFirstResponder:_code];
+  __weak SSWin* weak = self;
+  _tickTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer*) { [weak tick]; }];
+  _barTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer*) { [weak barTick]; }];
+  return self;
 }
 
-/** Not yet signed with this Mac's own identity (a new install, or an update the old way): before
- *  anything is asked, the app signs itself and starts again – a second. Tried once per build. */
-- (BOOL)signLocallyFirst {
-  NSString* app = NSBundle.mainBundle.bundlePath;
-  NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
-  NSString* build = [NSString stringWithFormat:@"%s-%s", SS_VERSION, SS_BUILD];
-  if ([app hasPrefix:@"/Volumes/"] || [app containsString:@"/AppTranslocation/"] || [[ud stringForKey:@"signTried"] isEqualToString:build]) return NO;
-  if (![NSFileManager.defaultManager isWritableFileAtPath:app.stringByDeletingLastPathComponent] || signedLocally()) return NO;
-  [ud setObject:build forKey:@"signTried"];
-  [ud synchronize];
-  if (!swapAfterQuit(nil)) return NO;
-  [NSApp terminate:nil];
-  return YES;
+- (void)dealloc {
+  _window.delegate = nil;
+}
+
+- (bool)busy {
+  return _engine != nullptr;
 }
 
 - (NSEvent*)key:(NSEvent*)e {
@@ -637,84 +658,6 @@ static NSColor* latencyColor(double ms) {
   else return e;
   [self moved];
   return nil;
-}
-
-- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)a {
-  return YES;
-}
-
-- (BOOL)applicationSupportsSecureRestorableState:(NSApplication*)a {
-  return YES;
-}
-
-- (void)applicationWillTerminate:(NSNotification*)n {
-  [self endSession];
-}
-
-- (void)makeMenu {
-  NSMenu* bar = [NSMenu new];
-  NSMenuItem* appItem = [NSMenuItem new];
-  [bar addItem:appItem];
-  NSMenu* app = [NSMenu new];
-  [app addItemWithTitle:@"A Screen Share névjegye" action:@selector(showAbout) keyEquivalent:@""];
-  [app addItemWithTitle:@"Frissítések keresése…" action:@selector(checkUpdatesNow) keyEquivalent:@""];
-  [app addItem:[NSMenuItem separatorItem]];
-  [app addItemWithTitle:@"A Screen Share elrejtése" action:@selector(hide:) keyEquivalent:@"h"];
-  [app addItemWithTitle:@"A többi elrejtése" action:@selector(hideOtherApplications:) keyEquivalent:@"h"].keyEquivalentModifierMask =
-      NSEventModifierFlagCommand | NSEventModifierFlagOption;
-  [app addItemWithTitle:@"Az összes megjelenítése" action:@selector(unhideAllApplications:) keyEquivalent:@""];
-  [app addItem:[NSMenuItem separatorItem]];
-  [app addItemWithTitle:@"Kilépés a Screen Share-ből" action:@selector(terminate:) keyEquivalent:@"q"];
-  appItem.submenu = app;
-  NSMenuItem* editItem = [NSMenuItem new];
-  [bar addItem:editItem];
-  NSMenu* edit = [[NSMenu alloc] initWithTitle:@"Szerkesztés"];
-  [edit addItemWithTitle:@"Visszavonás" action:@selector(undo:) keyEquivalent:@"z"];
-  [edit addItemWithTitle:@"Ismét" action:@selector(redo:) keyEquivalent:@"Z"];
-  [edit addItem:[NSMenuItem separatorItem]];
-  [edit addItemWithTitle:@"Kivágás" action:@selector(cut:) keyEquivalent:@"x"];
-  [edit addItemWithTitle:@"Másolás" action:@selector(copy:) keyEquivalent:@"c"];
-  [edit addItemWithTitle:@"Beillesztés" action:@selector(paste:) keyEquivalent:@"v"];
-  [edit addItemWithTitle:@"Az összes kijelölése" action:@selector(selectAll:) keyEquivalent:@"a"];
-  editItem.submenu = edit;
-  NSMenuItem* viewItem = [NSMenuItem new];
-  [bar addItem:viewItem];
-  NSMenu* view = [[NSMenu alloc] initWithTitle:@"Nézet"];
-  [view addItemWithTitle:@"Teljes képernyő" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask =
-      NSEventModifierFlagCommand | NSEventModifierFlagControl;
-  viewItem.submenu = view;
-  NSMenuItem* windowItem = [NSMenuItem new];
-  [bar addItem:windowItem];
-  NSMenu* window = [[NSMenu alloc] initWithTitle:@"Ablak"];
-  [window addItemWithTitle:@"Kis méret" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
-  [window addItemWithTitle:@"Nagyítás" action:@selector(performZoom:) keyEquivalent:@""];
-  windowItem.submenu = window;
-  NSApp.mainMenu = bar;
-  NSApp.windowsMenu = window;
-}
-
-/* ---- the standard About panel: icon, name, version (build), copyright – as every Mac app's */
-
-- (void)showAbout {
-  NSMutableParagraphStyle* centred = [NSMutableParagraphStyle new];
-  centred.alignment = NSTextAlignmentCenter;
-  NSDictionary* small = @{
-    NSFontAttributeName : [NSFont systemFontOfSize:11],
-    NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
-    NSParagraphStyleAttributeName : centred
-  };
-  NSMutableAttributedString* credits = [NSMutableAttributedString new];
-  NSMutableDictionary* link = [small mutableCopy];
-  link[NSLinkAttributeName] = [NSURL URLWithString:kSite];
-  [credits appendAttributedString:[[NSAttributedString alloc] initWithString:@"mozizas.hu" attributes:link]];
-  [credits appendAttributedString:[[NSAttributedString alloc] initWithString:@"\nBearSSL (MIT) · Opus (BSD)" attributes:small]];
-  [NSApp orderFrontStandardAboutPanelWithOptions:@{
-    NSAboutPanelOptionApplicationName : @"Screen Share",
-    NSAboutPanelOptionApplicationVersion : @SS_VERSION,
-    NSAboutPanelOptionVersion : @SS_BUILD,
-    NSAboutPanelOptionCredits : credits
-  }];
-  [NSApp activateIgnoringOtherApps:YES];
 }
 
 /* ---- the window: compact for home and sharing (as tall as its content), large for watching */
@@ -764,7 +707,7 @@ static NSColor* latencyColor(double ms) {
   NSString* saved = [NSUserDefaults.standardUserDefaults stringForKey:@"viewerFrame"];
   if (saved) {
     NSRect r = NSRectFromString(saved);
-    if (r.size.width >= 640 && r.size.height >= 400 && NSIntersectsRect(r, vis)) return r;
+    if (r.size.width >= 640 && r.size.height >= 400 && NSIntersectsRect(r, vis)) return [self besideOthers:r];
   }
   CGFloat w = std::min<CGFloat>(1280, vis.size.width * 0.86), h = w * 9 / 16;
   if (h > vis.size.height * 0.86) {
@@ -772,7 +715,20 @@ static NSColor* latencyColor(double ms) {
     w = h * 16 / 9;
   }
   NSRect old = _window.frame;
-  return NSMakeRect(NSMidX(old) - w / 2, NSMidY(old) - h / 2, w, h);
+  return [self besideOthers:NSMakeRect(NSMidX(old) - w / 2, NSMidY(old) - h / 2, w, h)];
+}
+
+/** Not right on top of another window watching there: a little lower and to the right. */
+- (NSRect)besideOthers:(NSRect)r {
+  for (int i = 0; i < 12; i++) {
+    bool taken = false;
+    for (SSWin* w in ((SSApp*)NSApp.delegate).windows)
+      if (w != self && std::fabs(NSMinX(w.window.frame) - NSMinX(r)) < 4 && std::fabs(NSMaxY(w.window.frame) - NSMaxY(r)) < 4) taken = true;
+    if (!taken) break;
+    r.origin.x += 26;
+    r.origin.y -= 26;
+  }
+  return r;
 }
 
 - (NSView*)titlebar {
@@ -907,7 +863,7 @@ static NSColor* latencyColor(double ms) {
   stretch(room, _watchPane);
   stretch(hint, _watchPane, 12);
 
-  _updateButton = button(@"", @"arrow.down.circle", self, @selector(installUpdate));
+  _updateButton = button(@"", @"arrow.down.circle", self, @selector(installUpdateClicked));
   _updateButton.controlSize = NSControlSizeSmall;
   _updateButton.hidden = YES;
   _homeContent = vstack(@[ icon, title, sub, _tabs, _sharePane, _watchPane, _updateButton ], 4);
@@ -1044,7 +1000,7 @@ static NSColor* latencyColor(double ms) {
 /* ---- watching */
 
 - (void)makeViewer {
-  __weak SSApp* weak = self;
+  __weak SSWin* weak = self;
   _viewer = [SSFlipped new];
   _viewer.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]; // over the picture: always dark
   _video = [[SSVideoView alloc] initWithFrame:NSZeroRect];
@@ -1075,9 +1031,13 @@ static NSColor* latencyColor(double ms) {
   _volume.controlSize = NSControlSizeSmall;
   sizeTo(_volume, 96, 0);
   NSButton* full = iconButton(@"arrow.up.left.and.arrow.down.right", self, @selector(fullScreen));
+  full.toolTip = @"Teljes képernyő (F)";
+  _muteButton.toolTip = @"Némítás (M)";
+  NSButton* more = iconButton(@"plus.rectangle.on.rectangle", self, @selector(newWindow));
+  more.toolTip = @"Új ablak – még egy szoba nézése (⌘N)";
   NSButton* leave = button(@"Kilépés", nil, self, @selector(stopToHome));
   leave.hasDestructiveAction = YES;
-  NSStackView* row = hstack(@[ _viewDot, _viewTitle, _viewInfo, _muteButton, _volume, full, leave ], 10);
+  NSStackView* row = hstack(@[ _viewDot, _viewTitle, _viewInfo, more, _muteButton, _volume, full, leave ], 10);
   [row setCustomSpacing:14 afterView:_viewInfo];
   [row setCustomSpacing:4 afterView:_muteButton];
   [row setCustomSpacing:14 afterView:full];
@@ -1115,7 +1075,7 @@ static NSColor* latencyColor(double ms) {
 
 - (EngineCallbacks)callbacks:(int)session {
   EngineCallbacks cb;
-  __weak SSApp* weak = self;
+  __weak SSWin* weak = self;
   cb.event = [weak, session](const Json& e) {
     std::string text = e.dump();
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1195,6 +1155,7 @@ static NSColor* latencyColor(double ms) {
   [self updateViewers:Json::array()];
   _pauseButton.title = @"Szünet";
   _pauseButton.image = symbol(@"pause.fill", 13);
+  _window.title = @"Megosztás";
   [self show:_host];
   _engine->host(U(pw));
 }
@@ -1244,6 +1205,7 @@ static std::string parseCode(NSString* text) {
   _overlay.alphaValue = 1;
   [_overlaySpinner startAnimation:nil];
   _viewTitle.stringValue = S("Szoba: " + code);
+  _window.title = S("Szoba " + code); // (the Window menu, Mission Control: which room this window shows)
   _viewInfo.stringValue = @"";
   setDotColor(_viewDot, NSColor.systemOrangeColor);
   [self show:_viewer];
@@ -1252,6 +1214,7 @@ static std::string parseCode(NSString* text) {
 
 - (void)stopToHome {
   [self endSession];
+  _window.title = @"Screen Share";
   [_overlaySpinner stopAnimation:nil];
   if (_window.styleMask & NSWindowStyleMaskFullScreen) {
     _homeAfterFullScreen = true; // the window first leaves full screen, then shrinks
@@ -1262,7 +1225,7 @@ static std::string parseCode(NSString* text) {
 }
 
 - (void)askStop {
-  __weak SSApp* weak = self;
+  __weak SSWin* weak = self;
   [self ask:@"Befejezed a megosztást?" text:@"A nézőknél megáll a kép, és a szoba bezárul." ok:@"Befejezés" cancel:@"Mégse" danger:YES action:^{
     [weak stopToHome];
   }];
@@ -1380,6 +1343,7 @@ static std::string parseCode(NSString* text) {
     }];
     _roomLink = e["link"].str();
     _link.stringValue = S(_roomLink);
+    _window.title = [@"Megosztás · " stringByAppendingString:S(e["code"].str())];
     _copyButton.enabled = YES;
     if (e["changed"].b())
       [self ask:@"Új link készült" text:@"A korábbi szoba lejárt, ezért új kód és link készült – küldd el újra a nézőknek." ok:@"Rendben" cancel:nil danger:NO action:nil];
@@ -1388,6 +1352,7 @@ static std::string parseCode(NSString* text) {
     NSString* text = c == "auth" ? @"Hibás megosztási jelszó." : c == "rate" ? @"Túl sok próbálkozás, várj egy kicsit." : c == "full" ? @"A szerver megtelt, próbáld később."
                                                                                                                                       : S("Nem érem el a szervert (" + c + ").");
     [self endSession];
+    _window.title = @"Screen Share";
     [self show:_home];
     [self setError:_shareError text:text];
   } else if (type == "viewers") {
@@ -1468,6 +1433,234 @@ static std::string parseCode(NSString* text) {
   }
 }
 
+/* ---- window */
+
+- (BOOL)windowShouldClose:(NSWindow*)w {
+  if (_current != _host) return YES;
+  __weak NSWindow* win = w;
+  __weak SSWin* weak = self;
+  [self ask:@"Kilépsz?" text:@"A megosztás befejeződik: a nézőknél megáll a kép, és a szoba bezárul." ok:@"Kilépés" cancel:@"Mégse" danger:YES action:^{
+    [weak endSession];
+    [win close];
+  }];
+  return NO;
+}
+
+- (void)windowDidExitFullScreen:(NSNotification*)n {
+  if (_homeAfterFullScreen) {
+    _homeAfterFullScreen = false;
+    if (!_engine) [self show:_home];
+    return;
+  }
+  [self moved];
+}
+
+- (void)windowWillClose:(NSNotification*)n {
+  [self endSession];
+  [_tickTimer invalidate];
+  [_barTimer invalidate];
+  [(SSApp*)NSApp.delegate windowClosed:self];
+}
+
+/* ---- more windows */
+
+- (void)newWindow {
+  [(SSApp*)NSApp.delegate newWindowFrom:self watch:YES];
+}
+
+/* ---- updates (the app finds and installs them; each window shows the button) */
+
+- (void)showUpdate:(NSString*)version {
+  _updateButton.title = [NSString stringWithFormat:@"Frissítés: %@", version];
+  _updateButton.enabled = YES;
+  if (_updateButton.hidden) {
+    _updateButton.alphaValue = 0;
+    _updateButton.hidden = NO;
+    animateAlpha(_updateButton, 1, 0.3);
+    [self fitWindow:YES];
+  }
+}
+
+- (void)updateBusy:(BOOL)busy failed:(BOOL)failed {
+  if (busy) _updateButton.title = @"Letöltés…";
+  else if (failed) _updateButton.title = @"Frissítés sikertelen – újra";
+  _updateButton.enabled = !busy;
+}
+
+- (void)installUpdateClicked {
+  [(SSApp*)NSApp.delegate installUpdate];
+}
+
+@end
+
+/* ------------------------------------------------ the app: menus, About, updates, the windows */
+
+@implementation SSApp {
+  NSMutableArray<SSWin*>* _windows;
+  NSString *_updateFile, *_updateVersion;
+  bool _checking;
+}
+
+- (void)applicationDidFinishLaunching:(NSNotification*)n {
+  if ([self signLocallyFirst]) return;
+  _windows = [NSMutableArray array];
+  [self makeMenu];
+  [self newWindowFrom:nil watch:NO];
+  [NSApp activateIgnoringOtherApps:YES];
+  [self checkUpdatesLater];
+  __weak SSApp* weak = self;
+  [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                        handler:^NSEvent*(NSEvent* e) {
+                                          SSApp* s = weak;
+                                          if (s)
+                                            for (SSWin* w in [s->_windows copy])
+                                              if (w.window == e.window) return [w key:e];
+                                          return e;
+                                        }];
+}
+
+- (NSArray<SSWin*>*)windows {
+  return _windows;
+}
+
+/** Another window – to watch one more room: any number at once, each on its own. */
+- (void)newWindowFrom:(SSWin*)from watch:(BOOL)watch {
+  SSWin* w = [[SSWin alloc] initFrom:from watch:watch];
+  [_windows addObject:w];
+  if (_updateVersion) [w showUpdate:_updateVersion];
+}
+
+/** Fájl → Új ablak (⌘N), the Dock's menu. */
+- (void)newWindow:(id)sender {
+  [self newWindowFrom:[self front] watch:YES];
+}
+
+- (void)windowClosed:(SSWin*)w {
+  // (once its close has finished: the window's object goes with it)
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self->_windows removeObject:w];
+  });
+}
+
+/** The window in front (where questions go). */
+- (SSWin*)front {
+  for (SSWin* w in _windows)
+    if (w.window.isKeyWindow) return w;
+  for (SSWin* w in _windows)
+    if (w.window.isMainWindow) return w;
+  return _windows.lastObject;
+}
+
+- (NSMenu*)applicationDockMenu:(NSApplication*)sender {
+  NSMenu* m = [NSMenu new];
+  [m addItemWithTitle:@"Új ablak" action:@selector(newWindow:) keyEquivalent:@""].target = self;
+  return m;
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication*)a hasVisibleWindows:(BOOL)visible {
+  if (!_windows.count) [self newWindowFrom:nil watch:NO];
+  return YES;
+}
+
+/** Not yet signed with this Mac's own identity (a new install, or an update the old way): before
+ *  anything is asked, the app signs itself and starts again – a second. Tried once per build. */
+- (BOOL)signLocallyFirst {
+  NSString* app = NSBundle.mainBundle.bundlePath;
+  NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
+  NSString* build = [NSString stringWithFormat:@"%s-%s", SS_VERSION, SS_BUILD];
+  if ([app hasPrefix:@"/Volumes/"] || [app containsString:@"/AppTranslocation/"] || [[ud stringForKey:@"signTried"] isEqualToString:build]) return NO;
+  if (![NSFileManager.defaultManager isWritableFileAtPath:app.stringByDeletingLastPathComponent] || signedLocally()) return NO;
+  [ud setObject:build forKey:@"signTried"];
+  [ud synchronize];
+  if (!swapAfterQuit(nil)) return NO;
+  [NSApp terminate:nil];
+  return YES;
+}
+
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)a {
+  return YES;
+}
+
+- (BOOL)applicationSupportsSecureRestorableState:(NSApplication*)a {
+  return YES;
+}
+
+- (void)applicationWillTerminate:(NSNotification*)n {
+  for (SSWin* w in [_windows copy]) [w endSession];
+}
+
+- (void)makeMenu {
+  NSMenu* bar = [NSMenu new];
+  NSMenuItem* appItem = [NSMenuItem new];
+  [bar addItem:appItem];
+  NSMenu* app = [NSMenu new];
+  [app addItemWithTitle:@"A Screen Share névjegye" action:@selector(showAbout) keyEquivalent:@""];
+  [app addItemWithTitle:@"Frissítések keresése…" action:@selector(checkUpdatesNow) keyEquivalent:@""];
+  [app addItem:[NSMenuItem separatorItem]];
+  [app addItemWithTitle:@"A Screen Share elrejtése" action:@selector(hide:) keyEquivalent:@"h"];
+  [app addItemWithTitle:@"A többi elrejtése" action:@selector(hideOtherApplications:) keyEquivalent:@"h"].keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagOption;
+  [app addItemWithTitle:@"Az összes megjelenítése" action:@selector(unhideAllApplications:) keyEquivalent:@""];
+  [app addItem:[NSMenuItem separatorItem]];
+  [app addItemWithTitle:@"Kilépés a Screen Share-ből" action:@selector(terminate:) keyEquivalent:@"q"];
+  appItem.submenu = app;
+  NSMenuItem* fileItem = [NSMenuItem new];
+  [bar addItem:fileItem];
+  NSMenu* file = [[NSMenu alloc] initWithTitle:@"Fájl"];
+  [file addItemWithTitle:@"Új ablak" action:@selector(newWindow:) keyEquivalent:@"n"].target = self;
+  [file addItemWithTitle:@"Ablak bezárása" action:@selector(performClose:) keyEquivalent:@"w"];
+  fileItem.submenu = file;
+  NSMenuItem* editItem = [NSMenuItem new];
+  [bar addItem:editItem];
+  NSMenu* edit = [[NSMenu alloc] initWithTitle:@"Szerkesztés"];
+  [edit addItemWithTitle:@"Visszavonás" action:@selector(undo:) keyEquivalent:@"z"];
+  [edit addItemWithTitle:@"Ismét" action:@selector(redo:) keyEquivalent:@"Z"];
+  [edit addItem:[NSMenuItem separatorItem]];
+  [edit addItemWithTitle:@"Kivágás" action:@selector(cut:) keyEquivalent:@"x"];
+  [edit addItemWithTitle:@"Másolás" action:@selector(copy:) keyEquivalent:@"c"];
+  [edit addItemWithTitle:@"Beillesztés" action:@selector(paste:) keyEquivalent:@"v"];
+  [edit addItemWithTitle:@"Az összes kijelölése" action:@selector(selectAll:) keyEquivalent:@"a"];
+  editItem.submenu = edit;
+  NSMenuItem* viewItem = [NSMenuItem new];
+  [bar addItem:viewItem];
+  NSMenu* view = [[NSMenu alloc] initWithTitle:@"Nézet"];
+  [view addItemWithTitle:@"Teljes képernyő" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagControl;
+  viewItem.submenu = view;
+  NSMenuItem* windowItem = [NSMenuItem new];
+  [bar addItem:windowItem];
+  NSMenu* window = [[NSMenu alloc] initWithTitle:@"Ablak"];
+  [window addItemWithTitle:@"Kis méret" action:@selector(performMiniaturize:) keyEquivalent:@"m"];
+  [window addItemWithTitle:@"Nagyítás" action:@selector(performZoom:) keyEquivalent:@""];
+  windowItem.submenu = window;
+  NSApp.mainMenu = bar;
+  NSApp.windowsMenu = window;
+}
+
+/* ---- the standard About panel: icon, name, version (build), copyright – as every Mac app's */
+
+- (void)showAbout {
+  NSMutableParagraphStyle* centred = [NSMutableParagraphStyle new];
+  centred.alignment = NSTextAlignmentCenter;
+  NSDictionary* small = @{
+    NSFontAttributeName : [NSFont systemFontOfSize:11],
+    NSForegroundColorAttributeName : NSColor.secondaryLabelColor,
+    NSParagraphStyleAttributeName : centred
+  };
+  NSMutableAttributedString* credits = [NSMutableAttributedString new];
+  NSMutableDictionary* link = [small mutableCopy];
+  link[NSLinkAttributeName] = [NSURL URLWithString:kSite];
+  [credits appendAttributedString:[[NSAttributedString alloc] initWithString:@"mozizas.hu" attributes:link]];
+  [credits appendAttributedString:[[NSAttributedString alloc] initWithString:@"\nBearSSL (MIT) · Opus (BSD)" attributes:small]];
+  [NSApp orderFrontStandardAboutPanelWithOptions:@{
+    NSAboutPanelOptionApplicationName : @"Screen Share",
+    NSAboutPanelOptionApplicationVersion : @SS_VERSION,
+    NSAboutPanelOptionVersion : @SS_BUILD,
+    NSAboutPanelOptionCredits : credits
+  }];
+  [NSApp activateIgnoringOtherApps:YES];
+}
+
 /* ---- updates: native-latest.json → the zip → the app replaced, started again */
 
 - (void)checkUpdatesLater {
@@ -1508,18 +1701,13 @@ static std::string parseCode(NSString* text) {
   if (version) {
     _updateVersion = version;
     _updateFile = file;
-    _updateButton.title = [NSString stringWithFormat:@"Frissítés: %@", version];
-    if (_updateButton.hidden) {
-      _updateButton.alphaValue = 0;
-      _updateButton.hidden = NO;
-      animateAlpha(_updateButton, 1, 0.3);
-      [self fitWindow:YES];
-    }
+    for (SSWin* w in _windows) [w showUpdate:version];
   }
   if (!asked) return;
   __weak SSApp* weak = self;
+  SSWin* front = [self front];
   if (version)
-    [self ask:[NSString stringWithFormat:@"Elérhető a Screen Share %@", version]
+    [front ask:[NSString stringWithFormat:@"Elérhető a Screen Share %@", version]
          text:[NSString stringWithFormat:@"A telepített verzió: %@. A frissítés letöltődik, majd a Screen Share újraindul.", @SS_VERSION]
            ok:@"Frissítés"
        cancel:@"Később"
@@ -1528,16 +1716,35 @@ static std::string parseCode(NSString* text) {
          [weak installUpdate];
        }];
   else if (failed)
-    [self ask:@"Nem érem el a frissítéseket" text:@"Ellenőrizd az internetkapcsolatot, és próbáld újra később." ok:@"OK" cancel:nil danger:NO action:nil];
+    [front ask:@"Nem érem el a frissítéseket" text:@"Ellenőrizd az internetkapcsolatot, és próbáld újra később." ok:@"OK" cancel:nil danger:NO action:nil];
   else
-    [self ask:@"Ez a legújabb verzió" text:[NSString stringWithFormat:@"A Screen Share %@ a legfrissebb.", @SS_VERSION] ok:@"OK" cancel:nil danger:NO action:nil];
+    [front ask:@"Ez a legújabb verzió" text:[NSString stringWithFormat:@"A Screen Share %@ a legfrissebb.", @SS_VERSION] ok:@"OK" cancel:nil danger:NO action:nil];
 }
 
 - (void)installUpdate {
+  if (!_updateFile) return;
+  // the app starts again: what the other windows show ends too – asked first
+  int busy = 0;
+  for (SSWin* w in _windows) busy += [w busy] ? 1 : 0;
+  if (busy > ([[self front] busy] ? 1 : 0)) {
+    __weak SSApp* weak = self;
+    [[self front] ask:@"Frissítés"
+                 text:@"A frissítéshez a Screen Share újraindul: a többi ablakban futó nézés vagy megosztás is véget ér."
+                   ok:@"Frissítés"
+               cancel:@"Mégse"
+               danger:NO
+               action:^{
+                 [weak downloadUpdate];
+               }];
+    return;
+  }
+  [self downloadUpdate];
+}
+
+- (void)downloadUpdate {
   NSString* file = _updateFile;
   if (!file) return;
-  _updateButton.title = @"Letöltés…";
-  _updateButton.enabled = NO;
+  for (SSWin* w in _windows) [w updateBusy:YES failed:NO];
   NSURL* url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/%@", kFeed, file]];
   [[NSURLSession.sharedSession downloadTaskWithURL:url
                                   completionHandler:^(NSURL* location, NSURLResponse* response, NSError* error) {
@@ -1555,9 +1762,8 @@ static std::string parseCode(NSString* text) {
                                     ok = ok && [NSFileManager.defaultManager fileExistsAtPath:fresh];
                                     dispatch_async(dispatch_get_main_queue(), ^{
                                       if (!ok) {
-                                        self->_updateButton.title = @"Frissítés sikertelen – újra";
-                                        self->_updateButton.enabled = YES;
-                                        [self ask:@"A frissítés nem sikerült" text:@"Nem tudtam letölteni az új verziót. Próbáld újra később." ok:@"OK" cancel:nil danger:NO action:nil];
+                                        for (SSWin* w in self->_windows) [w updateBusy:NO failed:YES];
+                                        [[self front] ask:@"A frissítés nem sikerült" text:@"Nem tudtam letölteni az új verziót. Próbáld újra később." ok:@"OK" cancel:nil danger:NO action:nil];
                                         return;
                                       }
                                       // after we quit: the new app (signed with this Mac's identity) in place of this one, then start it
@@ -1573,28 +1779,6 @@ static std::string parseCode(NSString* text) {
                                       [NSApp terminate:nil];
                                     });
                                   }] resume];
-}
-
-/* ---- window */
-
-- (BOOL)windowShouldClose:(NSWindow*)w {
-  if (_current != _host) return YES;
-  __weak NSWindow* win = w;
-  __weak SSApp* weak = self;
-  [self ask:@"Kilépsz?" text:@"A megosztás befejeződik: a nézőknél megáll a kép, és a szoba bezárul." ok:@"Kilépés" cancel:@"Mégse" danger:YES action:^{
-    [weak endSession];
-    [win close];
-  }];
-  return NO;
-}
-
-- (void)windowDidExitFullScreen:(NSNotification*)n {
-  if (_homeAfterFullScreen) {
-    _homeAfterFullScreen = false;
-    if (!_engine) [self show:_home];
-    return;
-  }
-  [self moved];
 }
 
 @end
@@ -1643,33 +1827,63 @@ static int smoke(NSArray<NSString*>* args) {
     host.stop();
     hostPtr = nullptr;
   } else {
-    CALayer* layer = [CALayer layer];
-    MacPlayer player(layer);
-    MacAudioOut audio;
-    std::atomic<int> frames{0}, sounds{0};
-    cb.media = [&](const MediaMeta& m, const uint8_t* d, size_t n) {
-      if (m.stream == 0) {
-        frames++;
-        player.push(d, n, m.key, m.capture);
-      } else {
-        sounds++;
-        audio.push(m.sub, d, n, m.ts);
-      }
+    // SS_VIEWERS=n: n viewers at once in this one process, as n windows of the app watch
+    int n = 1;
+    if (const char* e = getenv("SS_VIEWERS")) n = std::max(1, std::min(16, atoi(e)));
+    struct Viewer {
+      std::unique_ptr<MacPlayer> player;
+      std::unique_ptr<MacAudioOut> audio;
+      std::unique_ptr<Engine> engine;
+      std::atomic<int> frames{0}, sounds{0};
+      double best = 0;
+      MacPlayer::Stats st;
     };
-    Engine engine(cfg, cb);
-    player.clockOffset = [&] { return engine.clockOffset(); };
-    player.needKeyframe = [&] { engine.requestKeyframe(); };
-    engine.join(secret);
-    double best = 0;
-    MacPlayer::Stats st;
+    std::vector<std::unique_ptr<Viewer>> viewers;
+    for (int k = 0; k < n; k++) {
+      auto v = std::make_unique<Viewer>();
+      v->player.reset(new MacPlayer([CALayer layer]));
+      v->audio.reset(new MacAudioOut());
+      Viewer* vp = v.get();
+      EngineCallbacks each = cb;
+      each.media = [vp](const MediaMeta& m, const uint8_t* d, size_t len) {
+        if (m.stream == 0) {
+          vp->frames++;
+          vp->player->push(d, len, m.key, m.capture);
+        } else {
+          vp->sounds++;
+          vp->audio->push(m.sub, d, len, m.ts);
+        }
+      };
+      v->engine.reset(new Engine(cfg, each));
+      Engine* engine = v->engine.get();
+      v->player->clockOffset = [engine] { return engine->clockOffset(); };
+      v->player->needKeyframe = [engine] { engine->requestKeyframe(); };
+      engine->join(secret);
+      viewers.push_back(std::move(v));
+    }
     for (int t = 0; t < seconds * 10; t++) {
       runFor(0.1);
-      st = player.stats();
-      best = std::max(best, st.fps);
+      for (auto& v : viewers) {
+        v->st = v->player->stats();
+        v->best = std::max(v->best, v->st.fps);
+      }
     }
-    player.detach();
-    result.set("received", frames.load()).set("audioPackets", sounds.load()).set("shownFps", best).set("width", st.width).set("height", st.height).set("latencyMs", st.latencyMs);
-    result.set("metal", st.metal);
+    for (auto& v : viewers) v->player->detach();
+    const Viewer& f = *viewers[0];
+    result.set("received", f.frames.load()).set("audioPackets", f.sounds.load()).set("shownFps", f.best).set("width", f.st.width).set("height", f.st.height).set("latencyMs", f.st.latencyMs);
+    result.set("metal", f.st.metal);
+    if (n > 1) {
+      Json each = Json::array();
+      int fewest = INT_MAX;
+      double slowest = 1e9;
+      for (auto& v : viewers) {
+        each.push(Json::object().set("received", v->frames.load()).set("shownFps", v->best).set("latencyMs", v->st.latencyMs));
+        fewest = std::min(fewest, v->frames.load());
+        slowest = std::min(slowest, v->best);
+      }
+      result.set("viewers", each).set("fewestReceived", fewest).set("slowestFps", slowest);
+    }
+    for (auto& v : viewers) v->engine.reset(); // (before their players)
   }
   line("RESULT " + result.dump());
   fclose(log);

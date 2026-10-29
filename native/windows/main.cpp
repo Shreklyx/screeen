@@ -18,6 +18,7 @@
 #include <dwmapi.h>
 #include <mfapi.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <uxtheme.h>
 #include <wincodec.h>
 #include <windowsx.h>
@@ -72,6 +73,7 @@ const UINT WM_ENGINE = WM_APP + 1; // wParam: session, lParam: std::string* (an 
 const UINT WM_UPDATE = WM_APP + 2; // wParam: 1 asked for; lParam: UpdateInfo* (nullptr: no newer version)
 const UINT WM_UPDATE_PROGRESS = WM_APP + 3;
 const UINT WM_UPDATE_DONE = WM_APP + 4; // wParam: ok
+const UINT WM_CLOSE_FOR_UPDATE = WM_APP + 6; // from another window or the installer: end, an update replaces the app
 
 const UINT_PTR TIMER_TICK = 1, TIMER_ANIM = 3;
 
@@ -80,7 +82,7 @@ const wchar_t* kSite = L"https://mozizas.hu";
 const wchar_t* kVersion = WIDEN(SS_VERSION);
 const wchar_t* kBuild = WIDEN(SS_BUILD);
 const wchar_t* kCopyright = L"Copyright © 2026 mozizas.hu.\nMinden jog fenntartva.";
-const UINT kSysAbout = 0x1010; // "About" in the window menu (Alt+Space)
+const UINT kSysAbout = 0x1010, kSysNew = 0x1020; // "About" and "New window" in the window menu (Alt+Space)
 
 // the palette: the Mac app's (macOS in its dark appearance), with the app's pink
 const Color cWin1 = rgb(0x323237), cWin2 = rgb(0x29292E), cText = rgb(0xEDEDF0), cMuted = rgb(0xA3A3AB), cFaint = rgb(0x77777F),
@@ -98,7 +100,7 @@ enum Id {
   ID_NONE = 0,
   ID_PASSWORD = 100, ID_CODE,
   B_SHARE = 200, B_JOIN, B_REMEMBER, B_AUDIO, B_UPDATE, B_ABOUT, B_COPY, B_PAUSE, B_STOP, B_FULL, B_LEAVE, B_VOLUME, B_MUTE,
-  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL, B_TAB0, B_TAB1, B_MONITOR, B_QUALITY,
+  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL, B_TAB0, B_TAB1, B_MONITOR, B_QUALITY, B_NEW,
 };
 const UINT kMenuMonitor0 = 1000, kMenuQuality0 = 2000; // the pop-up menus' items
 
@@ -143,7 +145,9 @@ struct App {
   Anims anim;
   bool animTimer = false;
   std::vector<Hit> hits;
+  std::map<int, std::wstring> tips; // what an icon-only button does (shown when the mouse rests on it)
   int hover = ID_NONE, pressed = ID_NONE;
+  double hoverSince = 0;
   bool tracking = false, measuring = false;
   float scroll = 0, scrollTarget = 0, contentHeight = 0;
   bool fitPosted = false;
@@ -190,7 +194,8 @@ struct App {
   int aboutHover = ID_NONE, aboutPressed = ID_NONE;
   bool aboutTimer = false, aboutTracking = false, paintingAbout = false;
 
-  bool shots = false; // --ui-shot (CI): no update check
+  bool shots = false;            // --ui-shot, --ui-watch (CI): no update check
+  std::string server = kServer;  // (CI: a local server)
 };
 
 App g;
@@ -270,6 +275,36 @@ void hit(int id, const Rect& r) {
 }
 
 std::string key(const char* what, int id) { return std::string(what) + std::to_string(id); }
+
+/** What a button without a label does: shown under it once the mouse rests there. */
+void tip(int id, const std::wstring& text) {
+  if (!g.measuring && !g.paintingAbout && !g.transitioning) g.tips[id] = text;
+}
+
+void drawTip(float W, float H) {
+  auto it = g.tips.find(g.hover);
+  if (it == g.tips.end() || g.modal.open || g.pressed != ID_NONE) return;
+  const Rect* at = nullptr;
+  for (const Hit& h : g.hits)
+    if (h.id == g.hover) at = &h.r;
+  if (!at) return;
+  double held = A().now() - g.hoverSince;
+  if (held < 600) {
+    A().keepGoing();
+    return;
+  }
+  float a = std::clamp(float((held - 600) / 120), 0.0f, 1.0f);
+  if (a < 1) A().keepGoing();
+  Canvas& c = C();
+  float tw = c.measure(it->second, 12, Regular), w = tw + 18, h = 24;
+  float x = std::clamp(at->cx() - w / 2, 6.0f, std::max(6.0f, W - w - 6)), y = at->bottom() + 6;
+  if (y + h > H - 6) y = at->y - h - 6;
+  c.pushAlpha(a);
+  c.fillRound({x, y, w, h}, 6, rgb(0x18181C, 0.97f));
+  c.strokeRound({x, y, w, h}, 6, rgb(0xFFFFFF, 0.12f), 1);
+  c.text(it->second, {x, y, w, h}, 12, Regular, cText, Center);
+  c.popAlpha();
+}
 
 /** A settings group, as in the Mac app (and System Settings): a faint panel, its rows split by lines. */
 void group(const Rect& r, std::initializer_list<float> lines = {}) {
@@ -489,8 +524,11 @@ float watchPane(float x0, float y, float cw) {
 float drawHome(float W, float) {
   Canvas& c = C();
   float cw = kHomeW, x0 = std::floor((W - cw) / 2), y = kTopPad;
-  // the About window (the Mac has it in the app menu): a small (i) in the corner
+  // a new window (watching more at once) and the About window (the Mac has these in its menus)
+  button(B_NEW, {W - 10 - 30 - 4 - 30, 8, 30, 30}, L"", Style::Ghost, true, Icon::Plus);
+  tip(B_NEW, L"Új ablak (Ctrl+N)");
   button(B_ABOUT, {W - 10 - 30, 8, 30, 30}, L"", Style::Ghost, true, Icon::Info);
+  tip(B_ABOUT, L"Névjegy");
   if (!g.measuring) c.appIcon({std::floor(W / 2 - 42), y, 84, 84});
   y += 84 + 12;
   if (!g.measuring) c.text(L"Screen Share", {x0, y, cw, 28}, 22, Bold, cWhite, Center);
@@ -646,7 +684,7 @@ const float kBarH = 52;
 
 /** The viewer's bar: where its parts are (the drawing and the volume drag use the same numbers). */
 struct BarLayout {
-  Rect leave, full, volume, mute;
+  Rect leave, full, volume, mute, more;
   float textRight;
 };
 
@@ -660,6 +698,8 @@ BarLayout barLayout(float W) {
   b.volume = {right - 96, kBarH / 2 - 2, 96, 4};
   right -= 96 + 6;
   b.mute = {right - 34, 11, 34, 30};
+  right -= 34 + 8;
+  b.more = {right - 34, 11, 34, 30};
   b.textRight = right - 34 - 12;
   return b;
 }
@@ -676,6 +716,9 @@ float drawViewing(float W, float H) {
     dot(22, barH / 2, g.picture ? cOk : cWarn);
     button(B_LEAVE, b.leave, L"Kilépés", Style::Danger);
     button(B_FULL, b.full, L"", Style::Ghost, true, Icon::FullScreen);
+    tip(B_FULL, L"Teljes képernyő (F)");
+    button(B_NEW, b.more, L"", Style::Ghost, true, Icon::Plus);
+    tip(B_NEW, L"Új ablak – még egy szoba nézése (Ctrl+N)");
     // volume: the icon mutes, the bar sets it
     hit(B_VOLUME, {b.volume.x - 8, 12, b.volume.w + 16, 28});
     float vol = A().to("vol", g.muted ? 0.0f : g.volume, 90);
@@ -684,6 +727,7 @@ float drawViewing(float W, float H) {
     c.fillRound({b.volume.x, b.volume.y, std::max(4.0f, b.volume.w * vol), b.volume.h}, 2, cAccent);
     c.fillCircle(b.volume.x + b.volume.w * vol, b.volume.cy(), 6 + 1.2f * vh, cWhite);
     button(B_MUTE, b.mute, L"", Style::Ghost, true, g.muted ? Icon::Mute : Icon::Volume);
+    tip(B_MUTE, g.muted ? L"Hang vissza (M)" : L"Némítás (M)");
     std::wstring head = L"Szoba: " + g.roomCode;
     c.text(head, {38, 0, 220, barH}, 13, Semibold, cText);
     float hw = c.measure(head, 13, Semibold);
@@ -934,6 +978,7 @@ void paint() {
   if (!c.begin(g.wnd, float(g.dpi))) return;
   A().frame(nowMs());
   g.hits.clear();
+  g.tips.clear();
   float W = c.width(), H = c.height();
   float t = 1;
   if (g.transitioning) {
@@ -967,6 +1012,7 @@ void paint() {
       for (Hit& hh : g.hits) hh.r.y -= g.scroll;
   }
   drawModal(W, H);
+  drawTip(W, H);
   if (g.screen == Screen::Viewing && g.picture && g.player && !g.player->hasPicture()) A().keepGoing(); // until the first frame shows
   c.end();
   updateChildren();
@@ -1047,6 +1093,82 @@ void openMenu(int id) {
   relayout(); // (another hint)
 }
 
+/* ------------------------------------------------ more windows: each its own process, a little offset */
+
+/** Another window (to watch one more room – on its Nézés tab): this program once more, near this window. */
+void newWindow(bool watch = true) {
+  wchar_t exe[MAX_PATH];
+  if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return;
+  RECT wr;
+  GetWindowRect(g.wnd, &wr);
+  std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --from " + std::to_wstring(wr.left) + L" " + std::to_wstring(wr.top) + (watch ? L" --watch" : L"");
+  STARTUPINFOW si{};
+  si.cb = sizeof si;
+  PROCESS_INFORMATION pi{};
+  if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    AllowSetForegroundWindow(pi.dwProcessId);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+  }
+}
+
+/** The title (on the taskbar, Alt+Tab): which room this window shows. */
+void setTitle(const std::wstring& what) {
+  SetWindowTextW(g.wnd, what.empty() ? L"Screen Share" : (what + L" – Screen Share").c_str());
+}
+
+/** The other Screen Share windows (other processes of this program). */
+std::vector<HWND> otherWindows() {
+  std::vector<HWND> out;
+  EnumWindows(
+      [](HWND h, LPARAM lp) -> BOOL {
+        wchar_t cls[32];
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid != GetCurrentProcessId() && GetClassNameW(h, cls, 32) && std::wstring(cls) == L"ScreenShare") reinterpret_cast<std::vector<HWND>*>(lp)->push_back(h);
+        return TRUE;
+      },
+      LPARAM(&out));
+  return out;
+}
+
+/** The taskbar button's menu (right click): Új ablak. */
+void setJumpList() {
+  using Microsoft::WRL::ComPtr;
+  wchar_t exe[MAX_PATH];
+  if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return;
+  ComPtr<ICustomDestinationList> list;
+  ComPtr<IObjectCollection> tasks;
+  ComPtr<IShellLinkW> link;
+  ComPtr<IPropertyStore> props;
+  ComPtr<IObjectArray> removed, array;
+  UINT slots = 0;
+  if (FAILED(CoCreateInstance(CLSID_DestinationList, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&list))) ||
+      FAILED(CoCreateInstance(CLSID_EnumerableObjectCollection, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&tasks))) ||
+      FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link))) || FAILED(link.As(&props)) ||
+      FAILED(list->BeginList(&slots, IID_PPV_ARGS(&removed))))
+    return;
+  link->SetPath(exe);
+  link->SetArguments(L"--watch");
+  link->SetIconLocation(exe, 0);
+  link->SetDescription(L"Még egy ablak – például egy másik szoba nézéséhez");
+  // the task's name (PKEY_Title)
+  const PROPERTYKEY title = {{0xF29F85E0, 0x4FF9, 0x1068, {0xAB, 0x91, 0x08, 0x00, 0x2B, 0x27, 0xB3, 0xD9}}, 2};
+  PROPVARIANT v;
+  PropVariantInit(&v);
+  v.vt = VT_LPWSTR;
+  const wchar_t* name = L"Új ablak";
+  size_t bytes = (wcslen(name) + 1) * sizeof(wchar_t);
+  v.pwszVal = static_cast<wchar_t*>(CoTaskMemAlloc(bytes));
+  if (!v.pwszVal) return;
+  std::memcpy(v.pwszVal, name, bytes);
+  props->SetValue(title, v);
+  props->Commit();
+  PropVariantClear(&v);
+  if (SUCCEEDED(tasks->AddObject(link.Get())) && SUCCEEDED(tasks.As(&array)) && SUCCEEDED(list->AddUserTasks(array.Get()))) list->CommitList();
+  else list->AbortList();
+}
+
 /* ------------------------------------------------ sessions */
 
 EngineCallbacks callbacks(int session) {
@@ -1092,7 +1214,7 @@ void startSharing() {
   endSession();
   int session = ++g.session;
   EngineConfig cfg;
-  cfg.server = kServer;
+  cfg.server = g.server;
   cfg.webSocket = openWinHttpWebSocket;
   EngineCallbacks cb = callbacks(session);
   // the pipeline exists before the engine can call it
@@ -1118,6 +1240,7 @@ void startSharing() {
   g.statusText = L"Kapcsolódás a szerverhez…";
   g.statusKind.clear();
   g.info.clear();
+  setTitle(L"Megosztás");
   show(Screen::Hosting);
   g.engine->host(narrow(pw.c_str()));
 }
@@ -1143,7 +1266,7 @@ void startWatching(const std::string& code) {
   endSession();
   int session = ++g.session;
   EngineConfig cfg;
-  cfg.server = kServer;
+  cfg.server = g.server;
   cfg.webSocket = openWinHttpWebSocket;
   g.player.reset(new VideoPlayer(g.video));
   g.audioOut.reset(new AudioPlayer());
@@ -1163,6 +1286,7 @@ void startWatching(const std::string& code) {
   g.overlayText = L"Csatlakozás a szobához…";
   g.roomCode = toW(code);
   g.viewInfo.clear();
+  setTitle(L"Szoba " + g.roomCode);
   show(Screen::Viewing);
   engine->join(code);
 }
@@ -1172,6 +1296,7 @@ void toggleFullscreen();
 void stopToHome(const std::wstring& message = L"") {
   if (g.fullscreen) toggleFullscreen();
   endSession();
+  setTitle(L"");
   show(Screen::Home);
   if (!message.empty()) setError(g.joinErr, message, "joinErr");
 }
@@ -1186,12 +1311,14 @@ void onEngineEvent(const Json& e) {
   } else if (type == "hosted") {
     g.roomCode = toW(e["code"].str());
     g.roomLink = e["link"].str();
+    setTitle(L"Megosztás · " + g.roomCode);
     if (e["changed"].b()) ask(L"Új link készült", L"A korábbi szoba lejárt, ezért új kód és link készült – küldd el újra a nézőknek.", L"Rendben", L"", false, nullptr);
   } else if (type == "host-error") {
     std::string c = e["code"].str();
     std::wstring text = c == "auth" ? L"Hibás megosztási jelszó." : c == "rate" ? L"Túl sok próbálkozás, várj egy kicsit." : c == "full" ? L"A szerver megtelt, próbáld később."
                                                                                                                                         : L"Nem érem el a szervert (" + toW(c) + L").";
     endSession();
+    setTitle(L"");
     show(Screen::Home);
     setError(g.shareErr, text, "shareErr");
   } else if (type == "viewers") {
@@ -1340,8 +1467,15 @@ void checkUpdatesNow() {
   animate();
 }
 
-void installUpdate() {
+void installUpdate(bool othersAsked = false) {
   if (g.updating || g.update.version.empty()) return;
+  if (!othersAsked && !otherWindows().empty()) { // the new version replaces the program: the other windows close
+    ask(L"Frissítés", L"A frissítéshez a többi Screen Share ablak is bezárul – a bennük futó nézés vagy megosztás véget ér.", L"Frissítés", L"Mégse", false, [] {
+      for (HWND h : otherWindows()) PostMessageW(h, WM_CLOSE_FOR_UPDATE, 0, 0);
+      installUpdate(true);
+    });
+    return;
+  }
   g.updating = true;
   g.updateProgress = 0;
   HWND wnd = g.wnd;
@@ -1519,6 +1653,7 @@ void copyLink() {
 void onClick(int id) {
   switch (id) {
     case B_TAB0: setTab(0); break;
+    case B_NEW: newWindow(); break;
     case B_TAB1: setTab(1); break;
     case B_SHARE: startSharing(); break;
     case B_JOIN: startWatching(parseCode(getText(g.code))); break;
@@ -1625,6 +1760,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       createControls();
       if (HMENU sys = GetSystemMenu(h, FALSE)) {
         AppendMenuW(sys, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(sys, MF_STRING, kSysNew, L"Új ablak\tCtrl+N");
         AppendMenuW(sys, MF_STRING, kSysAbout, L"A Screen Share névjegye");
       }
       SetTimer(h, TIMER_TICK, 1000, nullptr);
@@ -1645,6 +1781,9 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_FIT:
       g.fitPosted = false;
       fitWindow();
+      return 0;
+    case WM_CLOSE_FOR_UPDATE:
+      DestroyWindow(h); // (the session ends there)
       return 0;
     case WM_GETMINMAXINFO: {
       if (g.screen == Screen::Viewing) reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {px(640), px(400)};
@@ -1673,6 +1812,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       int id = hitAt(x, y);
       if (id != g.hover) {
         g.hover = id;
+        g.hoverSince = nowMs();
         animate();
       }
       return 0;
@@ -1776,6 +1916,10 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSCOMMAND:
       if ((wp & 0xFFF0) == kSysAbout) {
         showAbout();
+        return 0;
+      }
+      if ((wp & 0xFFF0) == kSysNew) {
+        newWindow();
         return 0;
       }
       return DefWindowProcW(h, msg, wp, lp);
@@ -1960,6 +2104,70 @@ int uiShots(const std::wstring& dir) {
   return failed ? 1 : 0;
 }
 
+/** What a part of the screen shows (as Windows composed it: what a person sees there). */
+bool grabScreen(const RECT& r, std::vector<BYTE>& pixels) {
+  int w = r.right - r.left, h = r.bottom - r.top;
+  if (w <= 0 || h <= 0) return false;
+  HDC screen = GetDC(nullptr), mem = CreateCompatibleDC(screen);
+  HBITMAP bmp = CreateCompatibleBitmap(screen, w, h);
+  HGDIOBJ old = SelectObject(mem, bmp);
+  bool ok = BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY | CAPTUREBLT) != FALSE;
+  SelectObject(mem, old);
+  BITMAPINFO bi{};
+  bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bi.bmiHeader.biWidth = w;
+  bi.bmiHeader.biHeight = -h;
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+  pixels.assign(size_t(w) * size_t(h) * 4, 0);
+  ok = ok && GetDIBits(mem, bmp, 0, UINT(h), pixels.data(), &bi, DIB_RGB_COLORS);
+  DeleteObject(bmp);
+  DeleteDC(mem);
+  ReleaseDC(nullptr, screen);
+  return ok;
+}
+
+/** --ui-watch <server> <code> <folder> (CI): the app watches a room as a person would – its window,
+ *  the video in it – and the screen there is looked at: the exit code says whether the picture
+ *  shows (the test stream is colour bars: most of it bright), the window is saved to look at. */
+int uiWatch(const std::string& server, const std::string& code, const std::wstring& dir) {
+  CreateDirectoryW(dir.c_str(), nullptr);
+  g.server = server;
+  startWatching(code);
+  double until = nowMs() + 25000;
+  while (nowMs() < until && !(g.picture && g.player && g.player->hasPicture())) pumpFor(100);
+  bool pictured = g.player && g.player->hasPicture();
+  pumpFor(2500); // more frames; the fade-in over
+  SetWindowPos(g.wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+  SetForegroundWindow(g.wnd);
+  pumpFor(600);
+  // the video's area: the window's client below the bar, on the screen
+  RECT rc;
+  GetClientRect(g.wnd, &rc);
+  POINT tl{0, px(kBarH)}, br{rc.right, rc.bottom};
+  ClientToScreen(g.wnd, &tl);
+  ClientToScreen(g.wnd, &br);
+  RECT area{tl.x + 8, tl.y + 8, br.x - 8, br.y - 8};
+  std::vector<BYTE> pixels;
+  bool grabbed = grabScreen(area, pixels);
+  size_t bright = 0, total = pixels.size() / 4;
+  for (size_t i = 0; i < pixels.size(); i += 4) bright += std::max({pixels[i], pixels[i + 1], pixels[i + 2]}) > 60 ? 1 : 0;
+  double share = total ? double(bright) / double(total) : 0;
+  shoot(g.wnd, dir + L"\\watch.png");
+  VideoPlayer::Stats st = g.player ? g.player->stats() : VideoPlayer::Stats{};
+  char report[400];
+  std::snprintf(report, sizeof report, "picture %d, shown %d, grabbed %d, bright %.3f, %dx%d, %.0f FPS, decoding %s, latency %.1f ms\n", g.picture ? 1 : 0, pictured ? 1 : 0,
+                grabbed ? 1 : 0, share, st.width, st.height, st.fps, st.hardware ? "GPU" : "CPU", st.latencyMs);
+  if (FILE* f = _wfopen((dir + L"\\ui-watch.txt").c_str(), L"w")) {
+    std::fputs(report, f);
+    std::fclose(f);
+  }
+  endSession();
+  DestroyWindow(g.wnd);
+  return pictured && share > 0.3 ? 0 : 1;
+}
+
 /* ------------------------------------------------ smoke tests (CI): the real pipeline, no UI */
 
 // --smoke-host <server> <password> <seconds> <log>: captures, encodes and shares the main screen
@@ -2085,7 +2293,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
     std::fclose(log);
     return 0;
   }
-  g.shots = argc == 3 && std::wstring(argv[1]) == L"--ui-shot";
+  g.shots = (argc == 3 && std::wstring(argv[1]) == L"--ui-shot") || (argc == 5 && std::wstring(argv[1]) == L"--ui-watch");
   darkMenus();
   // compact (as the Mac's): as tall as the home screen, not resized by hand; watching makes it large
   HWND wnd = CreateWindowExW(0, L"ScreenShare", L"Screen Share", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -2096,22 +2304,67 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
   if (g.shots) {
     ShowWindow(wnd, SW_SHOW);
     UpdateWindow(wnd);
-    int result = uiShots(argv[2]);
+    int result = argc == 5 ? uiWatch(narrow(argv[2]), narrow(argv[3]), argv[4]) : uiShots(argv[2]);
     timeEndPeriod(1);
     MFShutdown();
     CoUninitialize();
     return result;
   }
-  // a room link given on the command line (screenshare://abc123 or the code)
-  std::wstring arg = cmd ? cmd : L"";
+  // the command line: --from <x> <y> (another window's corner: this one goes near it), --watch
+  // (the Nézés tab), a room link (screenshare://abc123, or the code)
+  std::wstring link;
+  bool watch = false, from = false;
+  POINT at{};
+  for (int i = 1; i < argc; i++) {
+    std::wstring a = argv[i];
+    if (a == L"--from" && i + 2 < argc) {
+      at = {_wtoi(argv[i + 1]), _wtoi(argv[i + 2])};
+      from = true;
+      i += 2;
+    } else if (a == L"--watch") {
+      watch = true;
+    } else if (!a.empty() && a[0] != L'-' && a[0] != L'/') {
+      link = a;
+    }
+  }
+  if (!from) { // (started from the taskbar's menu or a link while another window is open: near that one)
+    std::vector<HWND> others = otherWindows();
+    RECT r;
+    if (!others.empty() && GetWindowRect(others.front(), &r)) {
+      at = {r.left, r.top};
+      from = true;
+    }
+  }
+  if (from) {
+    at.x += 32;
+    at.y += 32;
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT r;
+    GetWindowRect(wnd, &r);
+    int w = r.right - r.left, h = r.bottom - r.top;
+    SetWindowPos(wnd, nullptr, std::clamp<int>(at.x, mi.rcWork.left, std::max<int>(mi.rcWork.left, mi.rcWork.right - w)),
+                 std::clamp<int>(at.y, mi.rcWork.top, std::max<int>(mi.rcWork.top, mi.rcWork.bottom - h)), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+  }
+  if (watch) {
+    g.tab = 1;
+    g.contentHeight = measureScreen(Screen::Home);
+    fitWindow();
+  }
   ShowWindow(wnd, showCmd);
   UpdateWindow(wnd);
-  if (!arg.empty() && arg.find(L"/") != 0) {
-    std::string code = parseCode(arg);
+  setJumpList();
+  if (watch) SetFocus(g.code);
+  if (!link.empty()) {
+    std::string code = parseCode(link);
     if (code.size() >= 4) startWatching(code);
   }
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0)) {
+    if (msg.message == WM_KEYDOWN && msg.wParam == 'N' && (GetKeyState(VK_CONTROL) & 0x8000) && !g.modal.open) {
+      newWindow(); // Ctrl+N: another window
+      continue;
+    }
     if (msg.message == WM_KEYDOWN && msg.hwnd != g.about && (g.modal.open || g.screen == Screen::Viewing)) {
       // keys in the viewer go to the window, whichever child has the focus
       SendMessageW(g.wnd, WM_KEYDOWN, msg.wParam, msg.lParam);

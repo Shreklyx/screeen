@@ -35,7 +35,7 @@ struct Rect {
   float cy() const { return y + h / 2; }
 };
 
-enum class Icon { Monitor, Eye, Play, FullScreen, Volume, Mute, Info, Copy, Check, Back, Pause, Stop, Download, Link, Users, Lock, Sound, Close, Refresh, Bolt };
+enum class Icon { Monitor, Eye, Play, FullScreen, Volume, Mute, Info, Copy, Check, Back, Pause, Stop, Download, Link, Users, Lock, Sound, Close, Refresh, Bolt, Plus };
 
 enum Align { Left, Center, Right };
 

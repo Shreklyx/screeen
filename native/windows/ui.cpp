@@ -423,6 +423,10 @@ void Canvas::icon(Icon i, float cx, float cy, float size, const Color& c, float 
       poly({{11.5f, 2}, {14.5f, 4.6f}, {11.2f, 7}}, false, false);
       break;
     case Icon::Bolt: poly({{13.5f, 2}, {5, 13.5f}, {11, 13.5f}, {10, 22}, {19, 10}, {13, 10}}, true, true); break;
+    case Icon::Plus:
+      L(12, 5, 12, 19);
+      L(5, 12, 19, 12);
+      break;
   }
 }
 

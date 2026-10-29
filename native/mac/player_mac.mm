@@ -11,6 +11,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <mutex>
 #include <vector>
@@ -73,6 +74,8 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
   VTDecompressionSessionRef session = nullptr;
   std::vector<uint8_t> sps, pps;
   bool needKey = true;
+  std::atomic<int> waiting{0}; // frames handed over, not decoded yet
+  double lastDraw = 0;
   CVPixelBufferRef shown = nullptr; // kept while it is on screen
   // Metal: each frame goes to the screen at once – not held for the display's next refresh
   // (in full screen that is up to a frame less delay); layer.contents when there is no Metal
@@ -223,6 +226,9 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
   }
 
   void decode(const std::vector<uint8_t>& data, bool key, double capture) {
+    // far behind (the computer was busy): the frames up to the next keyframe are left out, so the
+    // picture is live again instead of a growing lag
+    if (waiting.load() > 15 && !key) needKey = true;
     if (needKey && !key) return keyframe();
     // Annex B → NAL units; SPS/PPS make the format, the rest goes length-prefixed (AVCC)
     std::vector<uint8_t> avcc;
@@ -284,6 +290,10 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
   void show(CVImageBufferRef image, double capture) {
     IOSurfaceRef surface = CVPixelBufferGetIOSurface(image);
     if (!surface) return;
+    // a newer frame waits already: not this one but that one goes to the screen (still one at least
+    // every 40 ms) – drawing each one late would be a lag
+    if (waiting.load() > 0 && nowMs() - lastDraw < 40) return;
+    lastDraw = nowMs();
     CVPixelBufferRetain(image);
     bool first = firstAt == 0;
     if (!drawMetal(image)) {
@@ -338,9 +348,12 @@ void MacPlayer::detach() {
 void MacPlayer::push(const uint8_t* data, size_t n, bool key, double captureMs) {
   auto copy = std::make_shared<std::vector<uint8_t>>(data, data + n);
   std::weak_ptr<Impl> weak = impl_;
+  impl_->waiting++;
   dispatch_async(impl_->queue, ^{
     auto s = weak.lock();
-    if (s) s->decode(*copy, key, captureMs);
+    if (!s) return;
+    s->waiting--;
+    s->decode(*copy, key, captureMs);
   });
 }
 

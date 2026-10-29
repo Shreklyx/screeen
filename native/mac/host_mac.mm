@@ -141,6 +141,9 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
   VTCompressionSessionRef encoder = nullptr;
   dispatch_source_t timer = nil;
   std::atomic<bool> streaming{false}, wantKey{true}, running{false};
+  std::atomic<int> inFlight{0}; // frames in VideoToolbox, not out yet
+  int restarts = 0;
+  double restartsSince = 0;
   std::atomic<double> bitrate{20e6};
   double sentBitrate = 0;
   // on the video queue
@@ -271,6 +274,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
       i.width = w;
       i.height = h;
       i.audioLayout = audio ? "sztereó" : "";
+      i.error.clear(); // (started again after a stop)
     });
     engine.setEncoder("VideoToolbox", true);
     auto self = shared_from_this();
@@ -305,6 +309,9 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
   }
 
   void encode(CVPixelBufferRef image, double capture) {
+    // the encoder still works on two: this one is left out – waiting in a queue is only delay (an
+    // encoder that cannot keep up, as 4K 60 on a busy or older Mac, would add up a lag otherwise)
+    if (inFlight.load() >= 2) return;
     double started = nowMs();
     double bps = bitrate;
     if (std::fabs(bps - sentBitrate) > 1) {
@@ -323,9 +330,11 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     lastPts = pts;
     NSDictionary* props = key ? @{(__bridge NSString*)kVTEncodeFrameOptionKey_ForceKeyFrame : @YES} : nil;
     std::weak_ptr<Impl> weak = shared_from_this();
-    VTCompressionSessionEncodeFrameWithOutputHandler(encoder, image, CMTimeMake(pts, 1000000), kCMTimeInvalid, (__bridge CFDictionaryRef)props, nullptr,
+    inFlight++;
+    OSStatus queued = VTCompressionSessionEncodeFrameWithOutputHandler(encoder, image, CMTimeMake(pts, 1000000), kCMTimeInvalid, (__bridge CFDictionaryRef)props, nullptr,
                                                     ^(OSStatus status, VTEncodeInfoFlags, CMSampleBufferRef out) {
                                                       auto s = weak.lock();
+                                                      if (s) s->inFlight--;
                                                       if (!s || !s->running || status != noErr || !out) return;
                                                       std::vector<uint8_t> data;
                                                       bool isKey = false;
@@ -333,6 +342,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
                                                       s->engine.sendVideo(data.data(), data.size(), isKey, capture, double(pts));
                                                       s->stats(nowMs() - started);
                                                     });
+    if (queued != noErr) inFlight--;
   }
 
   void stats(double ms) {
@@ -396,7 +406,39 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     }
   }
 
-  void onStopped(NSError* error) override { fail(error.code == -3801 ? "permission" : "capture-stopped"); }
+  void onStopped(NSError* error) override {
+    // not allowed (-3801), or stopped by the person from the menu bar (-3817): that is the end
+    if (error.code == -3801 || error.code == -3817 || !running) return fail(error.code == -3801 ? "permission" : "capture-stopped");
+    // stopped by the system (the display changed or woke, the sound's capture failed…): the picture
+    // and the sound start again in a second – a few times a minute at most
+    double now = nowMs();
+    if (now - restartsSince > 60000) {
+      restarts = 0;
+      restartsSince = now;
+    }
+    if (++restarts > 5) return fail("capture-stopped");
+    auto self = shared_from_this();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), videoQueue, ^{
+      if (!self->running) return;
+      if (self->timer) dispatch_source_cancel(self->timer);
+      self->timer = nil;
+      self->stream = nil;
+      if (self->encoder) {
+        VTCompressionSessionInvalidate(self->encoder);
+        CFRelease(self->encoder);
+        self->encoder = nullptr;
+      }
+      self->inFlight = 0;
+      dispatch_sync(self->audioQueue, ^{ // (the sound's encoder is used there)
+        if (self->opus) opus_encoder_destroy(self->opus);
+        self->opus = nullptr;
+        self->pending.clear();
+        self->pendingTs = -1;
+      });
+      self->wantKey = true;
+      self->start(self->opts);
+    });
+  }
 
   void stop() {
     running = false;
