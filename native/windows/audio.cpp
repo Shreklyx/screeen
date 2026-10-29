@@ -176,6 +176,9 @@ struct AudioCapture::Impl {
           LARGE_INTEGER f;
           QueryPerformanceFrequency(&f);
           double ageMs = (double(now.QuadPart) / f.QuadPart * 1e7 - double(qpcPos)) / 1e4;
+          // (no time – the driver says so – or one it cannot have: now; a wrong one put the sound
+          // seconds behind, where the viewers dropped it)
+          if ((flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) || !(ageMs >= 0 && ageMs < 1000)) ageMs = 0;
           streamUs = (nowMs() - ageMs) * 1000;
         }
         bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;

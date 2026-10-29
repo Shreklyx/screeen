@@ -57,6 +57,12 @@ if(WIN32 OR APPLE)
   FetchContent_Declare(opus URL https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz
     URL_HASH SHA256=65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1)
   FetchContent_MakeAvailable(opus)
+  if(SS_TESTS)
+    # the viewers' sound buffer (it decodes with libopus)
+    add_executable(audio_ring_test tests/audio_ring_test.cpp common/audio_ring.cpp)
+    target_include_directories(audio_ring_test PRIVATE common)
+    target_link_libraries(audio_ring_test PRIVATE opus)
+  endif()
 endif()
 
 if(WIN32 AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/windows/CMakeLists.txt)

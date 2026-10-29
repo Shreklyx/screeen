@@ -67,7 +67,9 @@ jobs:
           dir build\windows
       - name: Core tests
         shell: bash
-        run: build/sscore_test.exe
+        run: |
+          build/sscore_test.exe
+          build/audio_ring_test.exe
       - name: "Smoke: the app shares the screen, a native viewer receives it; the app watches a native sharer"
         shell: bash
         run: |
@@ -229,7 +231,9 @@ jobs:
           codesign --force --deep --sign - "dist/Screen Share.app"
           codesign --verify --verbose "dist/Screen Share.app"
       - name: Core tests
-        run: build-arm64/sscore_test
+        run: |
+          build-arm64/sscore_test
+          build-arm64/audio_ring_test
       # the app signs itself and its updates with this Mac's own identity (sign_local.sh): two different
       # builds must get the same designated requirement, so that macOS keeps the permissions it gave
       - name: "Own signature: another build, the same identity"

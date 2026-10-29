@@ -384,7 +384,9 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     size_t frames = raw.size() / size_t(channels);
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
     double ageMs = (CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())) - CMTimeGetSeconds(pts)) * 1000;
-    if (pendingTs < 0 || pending.empty()) pendingTs = (nowMs() - ageMs) * 1000;
+    // (no time, or one it cannot have: now – an invalid one made every timestamp NaN, no sound)
+    if (!CMTIME_IS_NUMERIC(pts) || !(ageMs >= 0 && ageMs < 1000)) ageMs = 0;
+    if (!(pendingTs >= 0) || pending.empty()) pendingTs = (nowMs() - ageMs) * 1000;
     for (size_t i = 0; i < frames; i++) {
       for (int c = 0; c < 2; c++) {
         size_t ch = size_t(std::min(c, channels - 1));

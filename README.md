@@ -203,7 +203,9 @@ sötét menüivel): kompakt ablak, Megosztás / Nézés kapcsoló, csoportosíto
   a Dock ikonjának menüje, vagy a nézés sávjának **＋** gombja. Minden ablak külön néz (vagy oszt meg), saját
   hanggal és hangerővel; a címsorban (Macen az *Ablak* menüben) a szoba kódja.
 - **Hang:** ha menet közben más lesz a gép hangeszköze (fülhallgató, Bluetooth, elalvó monitorhangszóró), a
-  megosztás és a nézés is magától átvált rá.
+  megosztás és a nézés is magától átvált rá. A hang nem csúszik a kép mögé: ami egy hálózati akadás után
+  felgyűlt, azt átugorja (2 ms-os áttűnéssel, kattanás nélkül), csend / szünet után sem késik jobban, és ha a
+  megosztó újraindul, a hang azonnal visszajön (korábban ilyenkor percekre elnémulhatott).
 - **Frissítés:** induláskor megnézi (`native-latest.json`), van-e új verzió; Windowson letölti és csendben telepíti,
   majd újraindul; Macen letölti, kicseréli magát és újraindul. A korábbi (Electron) alkalmazás is erre frissül:
   Windowson magától (a telepítő eltávolítja az Electron-os változatot), Macen a *Letöltés* gombbal a DMG-t kapod –
