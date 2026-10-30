@@ -29,6 +29,11 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   böngésző **~23–30 ms** (medián). 0 ms nem lehetséges: a képet rögzíteni, kódolni, átküldeni, dekódolni és a
   monitornak kirajzolni is idő (60 Hz-en egy képkocka 16,7 ms). A késést méri is: a néző statisztikájában és a
   megosztó nézőlistájában nézőnként látszik.
+- **Minden út mérve** (CI, 12 Mbit/s-os kép, 20 ms-os hálózat): közvetlenül (UDP) és a szerver reléjén át a kép a
+  hálózat saját idején felül **~2 ms** alatt ér át, 1% csomagvesztésnél is. A böngészős nézők útján (WebSocket, a
+  szerveren át) a néző minden képet **visszaigazol**: ha a vonala lassabb a képnél, a megosztó a késve maradó képeket
+  eldobja (legfeljebb ~120 ms várakozás bárhol az úton – a szerver, a Caddy, a hálózati pufferek), és a bitráta
+  lejjebb megy – a késés nem nő.
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).
 - **A szoba megmarad:** ha a megosztó újratölti az oldalt, bezárja a böngészőt vagy az alkalmazás ablakát, megszakad a
@@ -55,7 +60,9 @@ A telepítő:
 3. ha egy másik Docker alkalmazás – pl. a **Sori** – foglalja a 80/443-as portot, **leállítja**: a konténerei
    megszűnnek, de az adatai (filmek, adatbázis) a lemezen maradnak, semmit nem töröl,
 4. megnyitja a portokat a tűzfalon (ha `ufw` fut),
-5. elindítja az oldalt, a **Caddy**-t (automatikus HTTPS, Let's Encrypt) és a **coturn** TURN relét.
+5. bekapcsolja a **BBR** torlódásvezérlést (ha a rendszermag tudja): a böngészős nézők felé veszteséges vonalon (wifi,
+   mobil) is tartja a sebességet és nem tölti fel a hálózat puffereit – kisebb késés,
+6. elindítja az oldalt, a **Caddy**-t (automatikus HTTPS, Let's Encrypt) és a **coturn** TURN relét.
 
 Pár perc múlva él a **https://mozizas.hu**.
 
