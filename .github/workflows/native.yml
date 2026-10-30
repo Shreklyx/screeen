@@ -95,8 +95,9 @@ jobs:
       # each packet 20 ms (then also loses 1% of them; then is slower than the picture) with internet-sized
       # packets (MTU 1500): straight to the viewer (UDP), through the server's relay (UDP, two legs), in the
       # WebSocket (TCP, two legs, as to a browser) – how long a frame takes from the sharer to the viewer,
-      # beyond what the network itself takes. On a line slower than the picture the viewer's confirmations
-      # keep the delay short (frames are dropped instead); without them it grows.
+      # beyond what the network itself takes. On a line slower than the picture the bitrate comes down to
+      # what the viewer gets, and its confirmations keep the queue short (frames are dropped instead);
+      # without them the delay grows. With 1% loss TCP slows down: BBR (the server's) keeps more speed.
       - name: "Latency: every path"
         run: |
           PORT=8099 HOST_PASSWORD=ci DIRECT_PORT=3499 node server/server.js &
@@ -121,15 +122,19 @@ jobs:
           measure "WebSocket, 1% lost"    "delay 20ms loss 1%"    2 ""        "--tcp"
           measure "WebSocket, 8 Mbit/s"   "delay 20ms rate 8mbit" 2 ""        "--tcp"
           measure "  same, unconfirmed"   "delay 20ms rate 8mbit" 2 ""        "--tcp --no-acks"
+          sudo modprobe tcp_bbr || true
+          sudo sysctl -qw net.ipv4.tcp_congestion_control=bbr
+          measure "WebSocket, 1% lost, BBR" "delay 20ms loss 1%" 2 ""     "--tcp"
+          sudo sysctl -qw net.ipv4.tcp_congestion_control=cubic
           sudo ip link set lo mtu 65536
           node -e '
             const rows = require("fs").readFileSync("paths.txt", "utf8").trim().split("\n").map((l) => l.split("|"));
             const got = {};
-            console.log("path                  network  median  (+ ours)     p90   frames  keyframes");
+            console.log("path                     network  median  (+ ours)     p90   frames  keyframes");
             for (const [name, legs, json] of rows) {
               const r = (got[name] = JSON.parse(json || "{}")), net = 20 * Number(legs);
               const over = (v) => (v == null ? "  –" : (v - net >= 0 ? "+" : "") + (v - net).toFixed(1));
-              console.log(name.padEnd(21), String(net + " ms").padStart(8), String(r.latMedian).padStart(7), ("(" + over(r.latMedian) + ")").padStart(10), String(r.latP90).padStart(7), String(r.frames).padStart(8), String(r.keyframes).padStart(10));
+              console.log(name.padEnd(24), String(net + " ms").padStart(8), String(r.latMedian).padStart(7), ("(" + over(r.latMedian) + ")").padStart(10), String(r.latP90).padStart(7), String(r.frames).padStart(8), String(r.keyframes).padStart(10));
             }
             const problems = [];
             for (const [name, legs] of [["direct (UDP)", 1], ["relay (UDP)", 2], ["WebSocket (TCP)", 2]]) {
@@ -137,7 +142,7 @@ jobs:
               if (!(r.frames > 600) || !(r.latMedian < 20 * legs + 15)) problems.push(name + ": " + JSON.stringify(r));
             }
             const slow = got["WebSocket, 8 Mbit/s"] || {};
-            if (!(slow.latP90 < 600)) problems.push("a slow line made the WebSocket path late: " + JSON.stringify(slow));
+            if (!(slow.latMedian < 250)) problems.push("a slow line made the WebSocket path late: " + JSON.stringify(slow));
             if (problems.length) { console.error(problems.join("\n")); process.exit(1); }
           '
 

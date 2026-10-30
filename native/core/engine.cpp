@@ -107,6 +107,7 @@ struct Engine::Impl {
   int seq = 0;
   std::unique_ptr<DirectEndpoint> ep;
   double kbps = 0, lastCut = 0, lastRaise = 0, targetKbps = 0, sentKbps = 0;
+  double encodedBytes = 0, encodedAt = 0, encodedKbps = 0; // what the encoder makes (kbit/s, each second)
   bool streaming = false;
   double lastKey = -1e9;
   int keyTimer = 0;
@@ -586,14 +587,22 @@ struct Engine::Impl {
     if (list.empty()) return;
     double now = nowMs();
     bool congested = false, calm = true;
+    double reached = INFINITY; // what got through to a viewer in trouble (kbit/s)
     for (Viewer* v : list) {
       const Json& r = v->report;
-      if (r["loss"].num() > 2 || r["skips"].num() > 0) congested = true;
-      if (r["rtt"].isNumber() && r["rtt"].num() > v->minRtt + 40) congested = true;
+      bool trouble = r["loss"].num() > 2 || r["skips"].num() > 0 || (r["rtt"].isNumber() && r["rtt"].num() > v->minRtt + 40);
+      if (trouble) {
+        congested = true;
+        if (r["kbps"].num() > 0) reached = std::min(reached, r["kbps"].num());
+      }
       if (r["loss"].num() >= 0.5) calm = false;
     }
     if (congested && now - lastCut > 2000) {
-      kbps = std::max(kMinKbps, kbps * 0.7);
+      double next = kbps * 0.7;
+      // the encoder made (nearly) what was asked and a viewer got much less: that is its line's speed –
+      // straight down there, not 30% at a time (every step was two more seconds of a growing delay)
+      if (encodedKbps > kbps * 0.6 && reached * 0.85 < next) next = reached * 0.85;
+      kbps = std::max(kMinKbps, next);
       lastCut = now;
     } else if (!congested && now - lastCut > 3000 && now - lastRaise > 1000 && calm) {
       kbps = std::min(target(), kbps * 1.12 + 500);
@@ -601,6 +610,17 @@ struct Engine::Impl {
     }
     kbps = std::min(kbps, target());
     applyBitrate(false);
+  }
+
+  void countEncoded(size_t n) {
+    double t = nowMs();
+    if (!encodedAt) encodedAt = t;
+    encodedBytes += double(n);
+    if (t - encodedAt >= 1000) {
+      encodedKbps = encodedBytes * 8 / (t - encodedAt);
+      encodedBytes = 0;
+      encodedAt = t;
+    }
   }
 
   void applyBitrate(bool force) {
@@ -968,6 +988,7 @@ void Engine::sendVideo(const uint8_t* data, size_t n, bool key, double captureMs
   Impl* impl = impl_.get();
   impl->loop.post([impl, copy, key, captureMs, tsUs] {
     if (!impl->ep || impl->mode != "host") return;
+    impl->countEncoded(copy->size());
     MediaMeta m;
     m.stream = 0;
     m.key = key;

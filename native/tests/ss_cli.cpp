@@ -93,13 +93,13 @@ static int host(int argc, char** argv) {
   int fps = std::stoi(arg(argc, argv, "--fps", "60"));
   double seconds = std::stod(arg(argc, argv, "--seconds", "30"));
   // --kbps: every frame padded (zeros after its data, as trailing_zero bytes) to carry that many
-  // kilobits a second on average – as a real screen at that bitrate (the viewer does not decode)
-  if (double kbps = std::stod(arg(argc, argv, "--kbps", "0")); kbps > 0) {
-    size_t total = 0;
-    for (const Bytes& f : frames) total += f.size();
-    double avg = double(total) / double(frames.size()), want = kbps * 1000 / 8 / fps;
-    for (Bytes& f : frames) f.resize(f.size() + (want > avg ? size_t(want - avg) : 0), 0);
-  }
+  // kilobits a second on average – as a real screen at that bitrate (the viewer does not decode); and as
+  // an encoder, it follows the bitrate the engine asks for (down to what the file carries itself)
+  double kbpsMax = std::stod(arg(argc, argv, "--kbps", "0"));
+  std::atomic<double> asked{kbpsMax};
+  double natural = 0;
+  for (const Bytes& f : frames) natural += double(f.size());
+  natural /= double(frames.size());
   std::atomic<bool> streaming{false}, key{true};
   std::atomic<int> keyframes{0};
   EngineConfig cfg;
@@ -121,10 +121,14 @@ static int host(int argc, char** argv) {
     line(std::string("STREAMING ") + (on ? "on" : "off"));
   };
   cb.keyframe = [&] { key = true; keyframes++; };
-  cb.bitrate = [](double bps) { line("BITRATE " + std::to_string(int(bps))); };
+  cb.bitrate = [&asked](double bps) {
+    line("BITRATE " + std::to_string(int(bps)));
+    asked = bps / 1000;
+  };
   Engine engine(cfg, cb);
   chat.engine = &engine;
   engine.setName(arg(argc, argv, "--name"));
+  if (kbpsMax > 0) engine.setTargetKbps(kbpsMax);
   std::string resume = arg(argc, argv, "--resume");
   size_t colon = resume.find(':');
   engine.host(arg(argc, argv, "--password"), colon == std::string::npos ? "" : resume.substr(0, colon), colon == std::string::npos ? "" : resume.substr(colon + 1));
@@ -139,7 +143,14 @@ static int host(int argc, char** argv) {
     // a keyframe asked for: the stream again from its first (IDR) frame
     if (key.exchange(false)) n = 0;
     const Bytes& fr = frames[n % frames.size()];
-    engine.sendVideo(fr.data(), fr.size(), n % frames.size() == 0, nowMs(), double(n) * 1e6 / fps);
+    double want = std::min(kbpsMax, asked.load()) * 1000 / 8 / fps;
+    if (kbpsMax > 0 && want > natural) {
+      Bytes padded(fr);
+      padded.resize(fr.size() + size_t(want - natural), 0);
+      engine.sendVideo(padded.data(), padded.size(), n % frames.size() == 0, nowMs(), double(n) * 1e6 / fps);
+    } else {
+      engine.sendVideo(fr.data(), fr.size(), n % frames.size() == 0, nowMs(), double(n) * 1e6 / fps);
+    }
     n++;
     if (nowMs() - lastViewers > 2000) {
       lastViewers = nowMs();
