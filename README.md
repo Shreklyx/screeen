@@ -234,8 +234,13 @@ lehető legrövidebb úton:
   („desynchronized”) vásznon rajzolja ki, amely nem vár a böngésző képösszeállítására; ha a gép nem bírja a tempót,
   mindig csak a legfrissebb kép kerül ki;
 - elveszett csomagot a néző azonnal újrakér (NACK); ha egy kép így sem lesz teljes, kihagyja, és kulcskockát kér;
-- a hang Opus, 2,5 ms-os csomagokban (az Opus legkisebb késése), 5.1/7.1 is (csatornapáronként); a néző csak 10–100 ms hangpuffert tart, amennyit a
-  hálózat éppen kíván;
+- **javítócsomagok (FEC):** ha egy néző interneten át csomagokat veszít, a megosztó minden 10 (1% veszteség felett
+  5) csomaghoz egy paritáscsomagot is küld – a csoportból bármelyik elveszett csomagot a néző azonnal visszaállítja,
+  nem kell egy oda-vissza utat várnia rá (helyi hálózaton nem kell, ott az újrakérés ~1 ms); a régebbi nézők nem
+  kapnak ilyet;
+- a hang Opus, 2,5 ms-os csomagokban (az Opus legkisebb késése), 5.1/7.1 is (csatornapáronként); a néző csak 5–100 ms hangpuffert tart, amennyit a
+  hálózat éppen kíván, és ami ezen felül felgyűlt, azt átugorja; Windowson a hangkártya 2,7–3 ms-os periódusával
+  szól, ahol az eszköz tudja (Windows 10+, 48 kHz – 10 ms helyett), Macen 128 mintás (2,7 ms) pufferrel;
 - kapcsolat: a két alkalmazás a szerver UDP-portján (**3479**) megtudja a saját nyilvános címét, és közvetlenül
   egymásnak küld (helyi hálózaton a helyi címen); ha ez nem megy, a szerver továbbítja a (titkosított) csomagokat
   (3479/udp, vagy a TURN szerveren át); ha semmilyen UDP nem jut át (szigorú tűzfal), a szerver HTTPS-portján,

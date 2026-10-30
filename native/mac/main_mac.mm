@@ -666,8 +666,8 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   NSDictionary* small = @{NSFontAttributeName : [NSFont systemFontOfSize:10.5], NSForegroundColorAttributeName : NSColor.tertiaryLabelColor};
   add(tag, small);
   if (m["at"].isNumber()) add([@"  " stringByAppendingString:[_clock stringFromDate:[NSDate dateWithTimeIntervalSince1970:m["at"].num() / 1000]]], small);
-  add([@"\n" stringByAppendingString:S(m["text"].str())],
-      @{NSFontAttributeName : [NSFont systemFontOfSize:13], NSForegroundColorAttributeName : mine ? NSColor.labelColor : [NSColor.labelColor colorWithAlphaComponent:0.88]});
+  // (the system's own label colour: one changed with alpha is fixed to the light look – dark on dark)
+  add([@"\n" stringByAppendingString:S(m["text"].str())], @{NSFontAttributeName : [NSFont systemFontOfSize:13], NSForegroundColorAttributeName : NSColor.labelColor});
   return s;
 }
 

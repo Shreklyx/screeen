@@ -117,8 +117,9 @@ static void packetTests() {
   CHECK(!direct_detail::unseal(recv, 2, packet.data(), packet.size(), body) && !direct_detail::unseal(wrong, 1, packet.data(), packet.size(), body), "not with the wrong direction or key");
 }
 
-/** Two endpoints in one loop exchange frames over loopback; some packets are dropped on the way. */
-static void endpointTest() {
+/** Two endpoints in one loop exchange frames over loopback. `lossy`: the third packet of every frame
+ *  never arrives (nor when it is asked for again) – only the parity can bring it back. */
+static void endpointTest(bool lossy) {
   Loop loop;
   loop.start();
   std::mutex mu;
@@ -140,6 +141,10 @@ static void endpointTest() {
     };
     host = new DirectEndpoint(loop, DirectEndpoint::Role::Host, "127.0.0.1", "", nullptr, he);
     view = new DirectEndpoint(loop, DirectEndpoint::Role::Viewer, "127.0.0.1", "", nullptr, ve);
+    if (lossy) {
+      host->forceFec = 5;
+      view->dropIncoming = [](uint8_t type, const uint8_t* b, size_t n) { return type == 3 && n >= kMediaHeader && b[0] == 0 && getU16(b + 12) == 2; };
+    }
     host->open();
     view->open();
     PeerInfo info;
@@ -185,7 +190,19 @@ static void endpointTest() {
   }
   bool inOrder = got.size() == 30;
   for (size_t i = 0; inOrder && i < got.size(); i++) inOrder = got[i].first == i && got[i].second == 5 * kMaxData + 17 + i;
-  CHECK(inOrder, "30 frames arrive whole and in order");
+  if (!lossy) {
+    CHECK(inOrder, "30 frames arrive whole and in order");
+  } else {
+    std::atomic<uint64_t> rebuilt{0};
+    std::atomic<bool> asked{false};
+    loop.post([&] {
+      rebuilt = view->fecRebuilt();
+      asked = true;
+    });
+    while (!asked) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CHECK(inOrder && rebuilt >= 30, ("a lost packet in every frame: parity rebuilds them, the frames arrive whole and in order (" + std::to_string(got.size()) + " frames, " +
+                                     std::to_string(rebuilt.load()) + " rebuilt)").c_str());
+  }
   std::atomic<bool> closed{false};
   loop.post([&] {
     delete view;
@@ -201,7 +218,8 @@ int main() {
   cryptoVectors();
   jsonTests();
   packetTests();
-  endpointTest();
+  endpointTest(false);
+  endpointTest(true);
   std::printf(failures ? "%d FAILED\n" : "ALL PASS\n", failures);
   return failures ? 1 : 0;
 }

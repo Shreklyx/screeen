@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <thread>
 
 #include "clock.h"
@@ -14,12 +15,48 @@ namespace {
 const uint8_t PEER = 0x53; // 'S': packets between the two ends (the relay forwards them as they are)
 const uint8_t REG = 0x52;  // 'R': registration at the server
 const uint8_t REG_ACK = 0x41;
-enum T : uint8_t { PROBE = 1, PROBE_ACK = 2, MEDIA = 3, NACK = 4, PLI = 5, PING = 6, PONG = 7, REPORT = 8, BYE = 9 };
+// (FEC: parity for a group of a frame's packets – a type of its own, which older viewers ignore)
+enum T : uint8_t { PROBE = 1, PROBE_ACK = 2, MEDIA = 3, NACK = 4, PLI = 5, PING = 6, PONG = 7, REPORT = 8, BYE = 9, FEC = 10 };
 const uint8_t WHOLE = 4; // media flag: the whole frame in this one packet (the WebSocket path)
 const size_t RING = 1 << 14; // video packets kept for retransmission
 const size_t MAX_CANDS = 8;
 const char* INFO = "screenshare-direct-v1";
 const double NaN = std::nan("");
+
+/** Parity for a frame's packets, a group of g at a time: each the XOR of the group's data (padded to
+ *  the longest), with the XOR of their lengths – any one of the group can be rebuilt from the rest.
+ *  Header: frame id (4), packets in the frame (2), the group's first index (2), packets in it (1),
+ *  key flag (1), the first one's sequence number (4), the lengths' XOR (2), capture (8), ts (8). */
+std::vector<std::shared_ptr<const Bytes>> makeParity(const std::vector<std::shared_ptr<Bytes>>& pkts, uint32_t frameId, uint32_t seq0, const MediaMeta& meta, int g) {
+  std::vector<std::shared_ptr<const Bytes>> out;
+  size_t count = pkts.size();
+  for (size_t first = 0; first < count; first += size_t(g)) {
+    size_t k = std::min(count - first, size_t(g)), longest = 0;
+    uint16_t lens = 0;
+    for (size_t i = first; i < first + k; i++) {
+      size_t len = pkts[i]->size() - kMediaHeader;
+      longest = std::max(longest, len);
+      lens ^= uint16_t(len);
+    }
+    auto b = std::make_shared<Bytes>(kMediaHeader + longest, 0);
+    Bytes& par = *b;
+    putU32(&par[0], frameId);
+    putU16(&par[4], uint16_t(count));
+    putU16(&par[6], uint16_t(first));
+    par[8] = uint8_t(k);
+    par[9] = meta.key ? 1 : 0;
+    putU32(&par[10], seq0 + uint32_t(first));
+    putU16(&par[14], lens);
+    putF64(&par[16], meta.capture);
+    putF64(&par[24], meta.ts);
+    for (size_t i = first; i < first + k; i++) {
+      const Bytes& d = *pkts[i];
+      for (size_t j = kMediaHeader; j < d.size(); j++) par[j] ^= d[j];
+    }
+    out.push_back(b);
+  }
+  return out;
+}
 
 Bytes hmac16(const Bytes& secret, const uint8_t* data, size_t n) {
   uint8_t mac[32];
@@ -463,6 +500,12 @@ struct DirectEndpoint::Peer {
     double first, last;
     int tries;
   };
+  struct Parity {
+    uint8_t k = 0;
+    uint32_t firstSeq = 0;
+    uint16_t lens = 0;
+    Bytes body;
+  };
   struct Frame {
     uint32_t id;
     uint16_t count;
@@ -472,6 +515,7 @@ struct DirectEndpoint::Peer {
     size_t bytes = 0;
     bool key;
     double ts, capture, first;
+    std::map<uint16_t, Parity> fec; // by the group's first index
   };
 
   std::string id;
@@ -495,7 +539,8 @@ struct DirectEndpoint::Peer {
   int tcpGen = 0;
   double tcpAt = -1e9;
   // sending (pacing)
-  std::deque<std::shared_ptr<const Bytes>> out;
+  std::deque<std::pair<uint8_t, std::shared_ptr<const Bytes>>> out; // (type, payload)
+  double fecUntil = 0, fecLoss = 0; // parity for this viewer: while it loses packets (and a while after)
   size_t outBytes = 0;
   double tokens = 0, lastFill = nowMs();
   uint64_t sentBytes = 0;
@@ -504,6 +549,7 @@ struct DirectEndpoint::Peer {
   // receiving video (viewer)
   std::optional<uint32_t> expect;
   std::map<uint32_t, Missing> missing;
+  std::set<uint32_t> rebuilt; // rebuilt from parity before their gap was seen: not to be asked for
   std::map<uint32_t, Frame> frames;
   std::optional<uint32_t> next;
   uint32_t minNext = 0;
@@ -923,6 +969,7 @@ void DirectEndpoint::onMessage(const uint8_t* msg, size_t n, const Rinfo& from) 
   Peer& p = *pp;
   Bytes body;
   if (!unseal(*p.recvKey, p.recvDir(role_), msg, n, body)) return;
+  if (dropIncoming && dropIncoming(msg[1], body.data(), body.size())) return; // (tests)
   double t = nowMs();
   p.lastRecv = t;
   p.stats.bytes += n;
@@ -935,6 +982,9 @@ void DirectEndpoint::onMessage(const uint8_t* msg, size_t n, const Rinfo& from) 
       break;
     case MEDIA:
       if (role_ == Role::Viewer) onMedia(p, body.data(), body.size(), t);
+      break;
+    case FEC:
+      if (role_ == Role::Viewer) onFec(p, body.data(), body.size(), t);
       break;
     case NACK:
       if (role_ == Role::Host) onNack(p, body.data(), body.size());
@@ -955,7 +1005,17 @@ void DirectEndpoint::onMessage(const uint8_t* msg, size_t n, const Rinfo& from) 
       break;
     case REPORT: {
       Json r = Json::parse(std::string(body.begin(), body.end()));
-      if (r.isObject() && ev_.report) ev_.report(p.id, r);
+      if (!r.isObject()) break;
+      if (role_ == Role::Host) {
+        // parity follows the viewer's losses (before any recovery): on while it loses, ten seconds after
+        // (lossRaw: a viewer that knows parity – an older one only has "loss", and ignores parity)
+        double loss = r["lossRaw"].num(0);
+        if (loss >= 0.1) {
+          p.fecUntil = t + 10000;
+          p.fecLoss = loss;
+        }
+      }
+      if (ev_.report) ev_.report(p.id, r);
       break;
     }
     case BYE:
@@ -1029,7 +1089,90 @@ void DirectEndpoint::onMedia(Peer& p, const uint8_t* body, size_t n, double t) {
   f.have[index] = true;
   f.got++;
   f.bytes += len;
-  if (f.got == f.count) deliver(p, t);
+  bool done = f.got == f.count;
+  // the rest of its group here and the parity too: the one still missing is rebuilt now
+  for (auto& kv : f.fec)
+    if (!done && index >= kv.first && index < kv.first + kv.second.k) {
+      done = rebuild(p, frameId, kv.first);
+      break;
+    }
+  if (done) deliver(p, t);
+}
+
+void DirectEndpoint::onFec(Peer& p, const uint8_t* body, size_t n, double t) {
+  if (n < kMediaHeader) return;
+  uint32_t frameId = getU32(body);
+  uint16_t count = getU16(body + 4), first = getU16(body + 6);
+  uint8_t k = body[8];
+  if (!count || !k || first >= count || first + k > count) return;
+  if (p.next && int32_t(frameId - *p.next) < 0) return; // already delivered or skipped
+  auto it = p.frames.find(frameId);
+  if (it == p.frames.end()) {
+    if (p.frames.size() > 600) return;
+    Peer::Frame f;
+    f.id = frameId;
+    f.count = count;
+    f.parts.resize(count);
+    f.have.assign(count, false);
+    f.key = body[9] & 1;
+    f.capture = getF64(body + 16);
+    f.ts = getF64(body + 24);
+    f.first = t;
+    it = p.frames.emplace(frameId, std::move(f)).first;
+  }
+  if (it->second.count != count) return;
+  Peer::Parity& par = it->second.fec[first];
+  par.k = k;
+  par.firstSeq = getU32(body + 10);
+  par.lens = getU16(body + 14);
+  par.body.assign(body + kMediaHeader, body + n);
+  if (rebuild(p, frameId, first)) deliver(p, t);
+}
+
+/** A group with its parity and exactly one packet missing: that one, rebuilt from the rest – no round
+ *  trip to ask for it. True when the frame is complete. */
+bool DirectEndpoint::rebuild(Peer& p, uint32_t frameId, uint16_t first) {
+  Peer::Frame& f = p.frames.at(frameId);
+  auto it = f.fec.find(first);
+  if (it == f.fec.end()) return f.got == f.count;
+  const Peer::Parity& par = it->second;
+  int lost = -1;
+  for (int i = first; i < first + par.k; i++) {
+    if (f.have[size_t(i)]) continue;
+    if (lost >= 0) return false; // two or more: the parity cannot help (asking again can)
+    lost = i;
+  }
+  if (lost >= 0) {
+    Bytes data = par.body;
+    uint16_t len = par.lens;
+    for (int i = first; i < first + par.k; i++) {
+      if (i == lost) continue;
+      const Bytes& d = f.parts[size_t(i)];
+      if (d.size() > data.size()) return false; // (not this frame's parity)
+      for (size_t j = 0; j < d.size(); j++) data[j] ^= d[j];
+      len ^= uint16_t(d.size());
+    }
+    if (len > data.size()) return false;
+    data.resize(len);
+    uint32_t seq = par.firstSeq + uint32_t(lost - first);
+    if (p.missing.erase(seq)) p.stats.recovered++;
+    else if (int32_t(seq - (p.expect ? *p.expect : seq)) >= 0) p.rebuilt.insert(seq); // (its gap not seen yet)
+    if (p.rebuilt.size() > 4096) p.rebuilt.clear();
+    f.parts[size_t(lost)] = std::move(data);
+    f.have[size_t(lost)] = true;
+    f.got++;
+    f.bytes += len;
+    fecRebuilt_++;
+  }
+  f.fec.erase(it);
+  return f.got == f.count;
+}
+
+/** Parity for this viewer: one per how many packets (0: none) – not on the local network (asking
+ *  again takes a millisecond there), not over the WebSocket (nothing is lost there). */
+int DirectEndpoint::fecGroup(const Peer& p, double t) const {
+  if (!p.path || p.path->kind == "lan" || p.path->kind == "tcp" || t > p.fecUntil) return 0;
+  return p.fecLoss >= 1.0 ? 5 : 10;
 }
 
 void DirectEndpoint::trackSequence(Peer& p, uint32_t seq, double t) {
@@ -1042,7 +1185,8 @@ void DirectEndpoint::trackSequence(Peer& p, uint32_t seq, double t) {
     p.expect = seq + 1;
   } else if (d > 0) {
     if (d < 4000) {
-      for (uint32_t s = *p.expect; s != seq; s++) p.missing[s] = {t, 0, 0};
+      for (uint32_t s = *p.expect; s != seq; s++)
+        if (!p.rebuilt.erase(s)) p.missing[s] = {t, 0, 0}; // (one rebuilt already is not asked for)
       p.stats.lost += uint64_t(d);
       scheduleNack(p);
     }
@@ -1205,6 +1349,13 @@ void DirectEndpoint::sendMedia(const MediaMeta& meta, const uint8_t* data, size_
     videoSeq_ += uint32_t(count); // the numbering stays the same for UDP viewers
     return;
   }
+  // parity for the viewers that lose packets (see fecGroup)
+  std::vector<int> groups(ready.size(), 0);
+  bool fec = false;
+  double t = nowMs();
+  for (size_t r = 0; r < ready.size() && video; r++) fec |= (groups[r] = forceFec ? forceFec : fecGroup(*ready[r], t)) > 0;
+  std::vector<std::shared_ptr<Bytes>> pkts;
+  uint32_t seq0 = videoSeq_;
   for (size_t i = 0; i < count; i++) {
     size_t from = i * kMaxData;
     size_t len = std::min(n, from + kMaxData) - std::min(n, from);
@@ -1226,7 +1377,16 @@ void DirectEndpoint::sendMedia(const MediaMeta& meta, const uint8_t* data, size_
       ring_[seq & (RING - 1)] = p;
       ringSeq_[seq & (RING - 1)] = seq;
     }
-    for (Peer* peer : ready) enqueue(*peer, p, !video);
+    if (fec) pkts.push_back(p);
+    for (Peer* peer : ready) enqueue(*peer, p, !video, MEDIA);
+  }
+  // the parity right after the frame's packets, in the same queue (made once for each group size)
+  std::map<int, std::vector<std::shared_ptr<const Bytes>>> parity;
+  for (size_t r = 0; r < ready.size() && fec; r++) {
+    if (groups[r] <= 0) continue;
+    auto& par = parity[groups[r]];
+    if (par.empty()) par = makeParity(pkts, frameId, seq0, meta, groups[r]);
+    for (auto& b : par) enqueue(*ready[r], b, false, FEC);
   }
   drain();
 }
@@ -1265,10 +1425,10 @@ void DirectEndpoint::sendWhole(Peer& p, const MediaMeta& meta, uint32_t frameId,
   p.tcp->sendBinary(packet.data(), packet.size());
 }
 
-void DirectEndpoint::enqueue(Peer& p, std::shared_ptr<const Bytes> payload, bool urgent) {
+void DirectEndpoint::enqueue(Peer& p, std::shared_ptr<const Bytes> payload, bool urgent, uint8_t type) {
   if (urgent) {
     // audio and retransmissions jump the queue
-    send(p, MEDIA, payload->data(), payload->size());
+    send(p, type, payload->data(), payload->size());
     return;
   }
   if (p.outBytes > (8u << 20)) {
@@ -1279,7 +1439,7 @@ void DirectEndpoint::enqueue(Peer& p, std::shared_ptr<const Bytes> payload, bool
     return;
   }
   p.outBytes += payload->size();
-  p.out.push_back(std::move(payload));
+  p.out.push_back({type, std::move(payload)});
 }
 
 void DirectEndpoint::drain() {
@@ -1293,12 +1453,13 @@ void DirectEndpoint::drain() {
     p.tokens = std::min(lan ? 256.0 * 1024 : 64.0 * 1024, p.tokens + (t - p.lastFill) * rate);
     p.lastFill = t;
     while (!p.out.empty() && p.tokens > 0) {
-      std::shared_ptr<const Bytes> b = std::move(p.out.front());
+      uint8_t type = p.out.front().first;
+      std::shared_ptr<const Bytes> b = std::move(p.out.front().second);
       p.out.pop_front();
       p.outBytes -= b->size();
       p.tokens -= double(b->size() + kHeader + kTag + 28);
       p.sentBytes += b->size();
-      send(p, MEDIA, b->data(), b->size());
+      send(p, type, b->data(), b->size());
     }
     if (!p.out.empty()) pending = true;
   }
@@ -1320,7 +1481,7 @@ void DirectEndpoint::onNack(Peer& p, const uint8_t* body, size_t n) {
     if (!b || ringSeq_[seq & (RING - 1)] != seq) continue;
     auto again = std::make_shared<Bytes>(*b);
     (*again)[1] |= 2; // retransmission
-    enqueue(p, again, true);
+    enqueue(p, again, true, MEDIA);
   }
 }
 
@@ -1368,6 +1529,8 @@ void DirectEndpoint::report(Peer& p, double t) {
   double span = std::max(1.0, t - prev.at);
   Json out = Json::object();
   out.set("loss", packets + lost > 0 ? std::round(lost / (packets + lost) * 1000) / 10 : 0.0);
+  double lostAll = double(s.lost - prev.lost);
+  out.set("lossRaw", packets + lostAll > 0 ? std::round(lostAll / (packets + lostAll) * 1000) / 10 : 0.0);
   out.set("kbps", std::round(double(s.bytes - prev.bytes) * 8 / span));
   out.set("fps", std::round(double(s.frames - prev.frames) * 1000 / span));
   out.set("skips", double(s.skips - prev.skips));

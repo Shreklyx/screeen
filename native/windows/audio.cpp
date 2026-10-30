@@ -267,6 +267,26 @@ struct AudioPlayer::Impl {
       return false;
     WAVEFORMATEX* mix = nullptr;
     if (FAILED(client->GetMixFormat(&mix))) return false;
+    // The engine's shortest period where the device has one (Windows 10+: often 2.7–3 ms instead of
+    // 10): the sound comes ~10 ms sooner. Only in the engine's own format (no conversion in this
+    // mode) – float at 48 kHz, what most devices mix in; otherwise the usual way below.
+    bool lowLatency = false;
+    UINT32 period = 480;
+    bool float48 = mix->nSamplesPerSec == UINT32(kRate) && mix->wBitsPerSample == 32 &&
+                   (mix->wFormatTag == WAVE_FORMAT_IEEE_FLOAT || (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE && reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mix)->SubFormat == kFloatFormat));
+    ComPtr<IAudioClient3> c3;
+    if (float48 && SUCCEEDED(client.As(&c3))) {
+      UINT32 def = 0, fundamental = 0, minP = 0, maxP = 0;
+      if (SUCCEEDED(c3->GetSharedModeEnginePeriod(mix, &def, &fundamental, &minP, &maxP)) && minP && minP < def) {
+        if (SUCCEEDED(c3->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, minP, mix, nullptr))) {
+          lowLatency = true;
+          period = minP;
+        } else if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client))) { // (a fresh one for the usual way)
+          CoTaskMemFree(mix);
+          return false;
+        }
+      }
+    }
     // our own format: float at 48 kHz with the device's channels (Windows converts if needed)
     WAVEFORMATEXTENSIBLE fmt = {};
     fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
@@ -282,9 +302,9 @@ struct AudioPlayer::Impl {
     int outs = mix->nChannels;
     CoTaskMemFree(mix);
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    HRESULT hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, 100000, 0,
-                                    &fmt.Format, nullptr);
+    HRESULT hr = lowLatency ? S_OK
+                            : client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                                 100000, 0, &fmt.Format, nullptr);
     if (FAILED(hr)) {
       CloseHandle(event);
       return false;
@@ -301,8 +321,9 @@ struct AudioPlayer::Impl {
       if (WaitForSingleObject(event, 200) != WAIT_OBJECT_0) continue;
       UINT32 padding = 0;
       if (FAILED(client->GetCurrentPadding(&padding))) break; // the device went away
-      // keep the device's own buffer short: about 10 ms queued
-      UINT32 want = std::min<UINT32>(bufferFrames - padding, padding < 480 ? 480 - padding : 0);
+      // keep the device's own buffer short: about 10 ms queued – two short periods in the low-latency way
+      UINT32 queued = lowLatency ? std::max<UINT32>(2 * period, 192) : 480;
+      UINT32 want = std::min<UINT32>(bufferFrames - padding, padding < queued ? queued - padding : 0);
       if (!want) continue;
       BYTE* data = nullptr;
       if (FAILED(render->GetBuffer(want, &data))) break;

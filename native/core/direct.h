@@ -117,6 +117,12 @@ class DirectEndpoint {
   bool forceRelay = false;
   bool forceTurn = false;
   bool forceTcp = false;
+  // tests: parity for every viewer, one per this many packets (0: as the viewers' losses say); a
+  // packet "lost" on its way in (true: dropped)
+  int forceFec = 0;
+  std::function<bool(uint8_t type, const uint8_t* body, size_t n)> dropIncoming;
+  /** Viewer: packets rebuilt from parity (without waiting for them again). */
+  uint64_t fecRebuilt() const { return fecRebuilt_; }
 
   struct Peer;
   struct Rinfo {
@@ -147,6 +153,9 @@ class DirectEndpoint {
   void onProbeAck(Peer& p, const uint8_t* body, size_t n, const Rinfo& from);
   void onPong(Peer& p, double t1, double t2, double t3);
   void onMedia(Peer& p, const uint8_t* body, size_t n, double t);
+  void onFec(Peer& p, const uint8_t* body, size_t n, double t);
+  bool rebuild(Peer& p, uint32_t frameId, uint16_t first);
+  int fecGroup(const Peer& p, double t) const;
   void trackSequence(Peer& p, uint32_t seq, double t);
   double giveUpMs(Peer& p);
   void deliver(Peer& p, double t);
@@ -154,7 +163,7 @@ class DirectEndpoint {
   void scheduleNack(Peer& p);
   void sendNacks(Peer& p, double t);
   void sendWhole(Peer& p, const MediaMeta& meta, uint32_t frameId, const uint8_t* data, size_t n);
-  void enqueue(Peer& p, std::shared_ptr<const Bytes> payload, bool urgent);
+  void enqueue(Peer& p, std::shared_ptr<const Bytes> payload, bool urgent, uint8_t type);
   void drain();
   void onNack(Peer& p, const uint8_t* body, size_t n);
   void report(Peer& p, double t);
@@ -173,6 +182,7 @@ class DirectEndpoint {
   std::vector<std::function<void()>> turnWaiters_;
   std::map<std::string, std::unique_ptr<Peer>> peers_;
   uint32_t videoSeq_ = 0;
+  uint64_t fecRebuilt_ = 0;
   uint32_t videoFrame_ = 0;
   uint32_t audioSeq_ = 0;
   std::vector<std::shared_ptr<const Bytes>> ring_;

@@ -179,7 +179,7 @@ struct VideoPlayer::Impl {
     if (FAILED(factory->CreateSwapChainForHwnd(dev.Get(), window, &sd, nullptr, nullptr, &swap))) return false;
     factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
     ComPtr<IDXGISwapChain2> sc2;
-    if (SUCCEEDED(swap.As(&sc2))) sc2->SetMaximumFrameLatency(2);
+    if (SUCCEEDED(swap.As(&sc2))) sc2->SetMaximumFrameLatency(1); // (no picture waits behind another one)
     ComPtr<ID3DBlob> vsb, psb;
     if (!compileShader(kShader, "vs", "vs_4_0", vsb) || !compileShader(kShader, "ps", "ps_4_0", psb)) return false;
     dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
