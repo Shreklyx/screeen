@@ -12,6 +12,8 @@
 //
 // The session engine (native/core) does the networking; host.cpp captures and encodes,
 // player.cpp / audio.cpp decode and play. Updates: update.cpp.
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <commctrl.h>
 #include <dpapi.h>
@@ -2783,6 +2785,27 @@ int uiWatch(const std::string& server, const std::string& code, const std::wstri
 
 // --smoke-host <server> <password> <seconds> <log>: captures, encodes and shares the main screen
 // --smoke-view <server> <code> <seconds> <log>: watches a room and decodes what arrives
+/** (CI) This process's TCP connections to `port` – WinHTTP's sockets are handles of this process too –
+ *  and whether Nagle's algorithm is off on them: [{nodelay}], empty when none is found. */
+Json tcpTo(int port) {
+  Json out = Json::array();
+  for (ULONG_PTR h = 4; h < 0x10000; h += 4) {
+    SOCKET s = SOCKET(h);
+    int type = 0, len = sizeof type;
+    if (getsockopt(s, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&type), &len) != 0 || type != SOCK_STREAM) continue;
+    sockaddr_storage sa{};
+    int sl = sizeof sa;
+    if (getpeername(s, reinterpret_cast<sockaddr*>(&sa), &sl) != 0) continue;
+    int p = sa.ss_family == AF_INET ? ntohs(reinterpret_cast<sockaddr_in*>(&sa)->sin_port) : sa.ss_family == AF_INET6 ? ntohs(reinterpret_cast<sockaddr_in6*>(&sa)->sin6_port) : -1;
+    if (p != port) continue;
+    DWORD v = 0;
+    int vl = sizeof v;
+    getsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&v), &vl);
+    out.push(Json::object().set("nodelay", v != 0));
+  }
+  return out;
+}
+
 int smoke(int argc, wchar_t** argv) {
   std::string mode = narrow(argv[1]), server = narrow(argv[2]), secret = narrow(argv[3]);
   int seconds = _wtoi(argv[4]);
@@ -2906,7 +2929,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
   if (argc == 4 && std::wstring(argv[1]) == L"--ws-bench") { // CI: round trips through this WebSocket (WinHTTP)
     FILE* log = _wfopen(argv[3], L"w");
     if (!log) return 1;
-    std::fprintf(log, "BENCH %s\n", wsBench(openWinHttpWebSocket, narrow(argv[2]), 240).dump().c_str());
+    std::string url = narrow(argv[2]);
+    int port = std::atoi(url.substr(url.rfind(':') + 1).c_str());
+    std::fprintf(log, "BENCH %s\n", wsBench(openWinHttpWebSocket, url, 240, [port] { return tcpTo(port); }).dump().c_str());
     std::fclose(log);
     return 0;
   }

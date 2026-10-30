@@ -31,7 +31,7 @@ Json summary(std::vector<double> ms) {
 
 }  // namespace
 
-Json wsBench(const WebSocketFactory& open, const std::string& url, int count) {
+Json wsBench(const WebSocketFactory& open, const std::string& url, int count, const std::function<Json()>& socket) {
   struct State {
     std::mutex mu;
     std::condition_variable cv;
@@ -82,6 +82,7 @@ Json wsBench(const WebSocketFactory& open, const std::string& url, int count) {
     std::memcpy(buf.data(), &t, 8);
     ws->sendBinary(buf.data(), kSizes[i % 4]);
   }
+  if (socket) out.set("socket", socket());
   std::vector<double> all;
   {
     std::unique_lock<std::mutex> l(st->mu);

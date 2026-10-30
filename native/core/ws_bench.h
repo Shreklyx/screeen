@@ -3,6 +3,7 @@
 // message back – Nagle's algorithm waiting for the other side's delayed ACK?)
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "json.h"
@@ -11,7 +12,9 @@
 namespace ss {
 
 /** Sends `count` binary messages to the echo server at `url`, 60 a second, 1 KB … 120 KB in turn,
- *  and times each one's round trip: {sent, back, all: {med, p90, max}, "1000": {…}, …} or {error}. */
-Json wsBench(const WebSocketFactory& open, const std::string& url, int count);
+ *  and times each one's round trip: {sent, back, all: {med, p90, max}, "1000": {…}, …} or {error}.
+ *  `socket`: asked while the connection is open, its answer goes in as "socket" (how the platform's
+ *  TCP socket is set: is Nagle's algorithm off?). */
+Json wsBench(const WebSocketFactory& open, const std::string& url, int count, const std::function<Json()>& socket = nullptr);
 
 }  // namespace ss

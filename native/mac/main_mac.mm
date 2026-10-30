@@ -24,6 +24,11 @@
 #include <unistd.h>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+
 #include "clock.h"
 #include "engine.h"
 #include "host_mac.h"
@@ -2677,6 +2682,27 @@ static int uiRestore(NSArray<NSString*>* args) {
   return 0;
 }
 
+/** (CI) This process's TCP connections to `port` – a socket is one of its files – and whether Nagle's
+ *  algorithm is off on them: [{nodelay}], empty when none is found (the system holds the socket). */
+static Json tcpTo(int port) {
+  Json out = Json::array();
+  for (int fd = 0; fd < 4096; fd++) {
+    int type = 0;
+    socklen_t len = sizeof type;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0 || type != SOCK_STREAM) continue;
+    sockaddr_storage sa{};
+    socklen_t sl = sizeof sa;
+    if (getpeername(fd, reinterpret_cast<sockaddr*>(&sa), &sl) != 0) continue;
+    int p = sa.ss_family == AF_INET ? ntohs(reinterpret_cast<sockaddr_in*>(&sa)->sin_port) : sa.ss_family == AF_INET6 ? ntohs(reinterpret_cast<sockaddr_in6*>(&sa)->sin6_port) : -1;
+    if (p != port) continue;
+    int v = 0;
+    socklen_t vl = sizeof v;
+    getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &v, &vl);
+    out.push(Json::object().set("nodelay", v != 0));
+  }
+  return out;
+}
+
 int main(int argc, const char* argv[]) {
   @autoreleasepool {
     netInit();
@@ -2687,7 +2713,9 @@ int main(int argc, const char* argv[]) {
     if (args.count == 4 && [args[1] isEqualToString:@"--ws-bench"]) { // CI: round trips through this WebSocket
       FILE* log = fopen(args[3].fileSystemRepresentation, "w");
       if (!log) return 1;
-      fprintf(log, "BENCH %s\n", wsBench(openMacWebSocket, U(args[2]), 240).dump().c_str());
+      std::string url = U(args[2]);
+      int port = atoi(url.substr(url.rfind(':') + 1).c_str());
+      fprintf(log, "BENCH %s\n", wsBench(openMacWebSocket, url, 240, [port] { return tcpTo(port); }).dump().c_str());
       fclose(log);
       return 0;
     }

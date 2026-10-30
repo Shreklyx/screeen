@@ -916,109 +916,127 @@ struct Engine::Impl {
 
 Engine::Engine(EngineConfig config, EngineCallbacks callbacks) : impl_(new Impl(std::move(config), std::move(callbacks))) {}
 
+// (Each call goes to the loop's thread with the Impl itself, not this Engine: while the Engine is being
+// destroyed, impl_ may already be empty – libc++ empties a unique_ptr before deleting what it held – and
+// what was posted just before, such as keepRoom(), still runs then.)
 Engine::~Engine() = default;
 
 void Engine::host(const std::string& password, const std::string& resumeCode, const std::string& resumeToken) {
-  impl_->loop.post([this, password, resumeCode, resumeToken] { impl_->startHost(password, resumeCode, resumeToken); });
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, password, resumeCode, resumeToken] { impl->startHost(password, resumeCode, resumeToken); });
 }
 
 void Engine::keepRoom() {
-  impl_->loop.post([this] { impl_->keep = true; });
+  Impl* impl = impl_.get();
+  impl->loop.post([impl] { impl->keep = true; });
 }
 
 void Engine::setLive(bool live) {
-  impl_->loop.post([this, live] {
-    impl_->live = live;
-    impl_->send(Json::object().set("t", "state").set("live", live));
-    impl_->updateStreaming();
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, live] {
+    impl->live = live;
+    impl->send(Json::object().set("t", "state").set("live", live));
+    impl->updateStreaming();
   });
 }
 
 void Engine::stopHosting() {
-  impl_->loop.post([this] {
-    if (impl_->mode != "host") return;
-    impl_->send(Json::object().set("t", "close"));
-    impl_->clearHost();
-    impl_->mode.clear();
-    impl_->closeSignal();
+  Impl* impl = impl_.get();
+  impl->loop.post([impl] {
+    if (impl->mode != "host") return;
+    impl->send(Json::object().set("t", "close"));
+    impl->clearHost();
+    impl->mode.clear();
+    impl->closeSignal();
   });
 }
 
 void Engine::setTargetKbps(double kbps) {
-  impl_->loop.post([this, kbps] {
-    impl_->targetKbps = kbps;
-    if (impl_->kbps) {
-      impl_->kbps = std::min(impl_->kbps, impl_->target());
-      impl_->applyBitrate(true);
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, kbps] {
+    impl->targetKbps = kbps;
+    if (impl->kbps) {
+      impl->kbps = std::min(impl->kbps, impl->target());
+      impl->applyBitrate(true);
     }
   });
 }
 
 void Engine::sendVideo(const uint8_t* data, size_t n, bool key, double captureMs, double tsUs) {
   auto copy = std::make_shared<Bytes>(data, data + n);
-  impl_->loop.post([this, copy, key, captureMs, tsUs] {
-    if (!impl_->ep || impl_->mode != "host") return;
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, copy, key, captureMs, tsUs] {
+    if (!impl->ep || impl->mode != "host") return;
     MediaMeta m;
     m.stream = 0;
     m.key = key;
     m.ts = tsUs;
     m.capture = captureMs;
-    impl_->ep->sendMedia(m, copy->data(), copy->size());
+    impl->ep->sendMedia(m, copy->data(), copy->size());
   });
 }
 
 void Engine::sendAudio(int pair, int channels, const uint8_t* data, size_t n, double tsUs) {
   auto copy = std::make_shared<Bytes>(data, data + n);
-  impl_->loop.post([this, copy, pair, channels, tsUs] {
-    if (!impl_->ep || impl_->mode != "host") return;
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, copy, pair, channels, tsUs] {
+    if (!impl->ep || impl->mode != "host") return;
     MediaMeta m;
     m.stream = 1;
     m.sub = pair | channels << 4;
     m.ts = tsUs;
     m.capture = nowMs();
-    impl_->ep->sendMedia(m, copy->data(), copy->size());
+    impl->ep->sendMedia(m, copy->data(), copy->size());
   });
 }
 
 void Engine::setEncoderStats(double encodeMs, int width, int height) {
-  impl_->loop.post([this, encodeMs, width, height] {
-    impl_->encodeMs = encodeMs;
-    impl_->encW = width;
-    impl_->encH = height;
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, encodeMs, width, height] {
+    impl->encodeMs = encodeMs;
+    impl->encW = width;
+    impl->encH = height;
   });
 }
 
 void Engine::setEncoder(const std::string& name, bool hardware) {
-  impl_->loop.post([this, name, hardware] {
-    impl_->cfg.encoderName = name;
-    impl_->cfg.hardware = hardware;
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, name, hardware] {
+    impl->cfg.encoderName = name;
+    impl->cfg.hardware = hardware;
   });
 }
 
 void Engine::setName(const std::string& name) {
-  impl_->loop.post([this, name] { impl_->setName(name); });
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, name] { impl->setName(name); });
 }
 
 void Engine::sendChat(const std::string& text) {
-  impl_->loop.post([this, text] { impl_->sendChat(text); });
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, text] { impl->sendChat(text); });
 }
 
 void Engine::join(const std::string& code) {
-  impl_->loop.post([this, code] { impl_->startView(code); });
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, code] { impl->startView(code); });
 }
 
 void Engine::leave() {
-  impl_->loop.post([this] { if (impl_->mode == "viewer") impl_->stopView(); });
+  Impl* impl = impl_.get();
+  impl->loop.post([impl] { if (impl->mode == "viewer") impl->stopView(); });
 }
 
 void Engine::requestKeyframe() {
-  impl_->loop.post([this] { if (impl_->ep && impl_->view) impl_->ep->keyframe("host"); });
+  Impl* impl = impl_.get();
+  impl->loop.post([impl] { if (impl->ep && impl->view) impl->ep->keyframe("host"); });
 }
 
 void Engine::reportLatency(double ms, double fps) {
-  impl_->loop.post([this, ms, fps] {
-    impl_->lat = ms;
-    impl_->shownFps = fps;
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, ms, fps] {
+    impl->lat = ms;
+    impl->shownFps = fps;
   });
 }
 
