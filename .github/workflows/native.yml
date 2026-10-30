@@ -395,13 +395,23 @@ jobs:
           build-arm64/ss-cli host --server http://127.0.0.1:8097 --password ci --h264 native/tests/data/test.h264 --seconds 40 --name "Tamás" --chat-reply "Szia, {name}!" > chat-host.log &
           for i in $(seq 1 80); do grep -q '^CODE' chat-host.log 2>/dev/null && break; sleep 0.25; done
           code=$(grep '^CODE' chat-host.log | awk '{print $2}')
-          "dist/Screen Share.app/Contents/MacOS/Screen Share" --ui-chat http://127.0.0.1:8097 "$code" "$PWD/mac-chat.png" mac-chat.log || { cat mac-chat.log; grep '^CHAT' chat-host.log; exit 1; }
-          cat mac-chat.log
+          echo "room $code"
+          status=0
+          "dist/Screen Share.app/Contents/MacOS/Screen Share" --ui-chat http://127.0.0.1:8097 "$code" "$PWD/mac-chat.png" "$PWD/mac-chat.log" || status=$?
+          cat mac-chat.log || true
+          if [ "$status" != 0 ]; then
+            echo "--- the sharer saw:"; grep -E '^(CHAT|EVENT)' chat-host.log | tail -20 || true
+            report=$(ls -t ~/Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i 'screen' | head -1)
+            [ -n "$report" ] && head -120 ~/Library/Logs/DiagnosticReports/"$report"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: screenshare-ui-mac
-          path: mac-chat.png
+          path: |
+            mac-chat.png
+            mac-chat.log
           if-no-files-found: warn
       - name: "Six viewers in one app"
         run: |

@@ -754,6 +754,8 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
 - (void)testWatch:(const std::string&)code server:(const std::string&)server;
 - (void)testSay:(NSString*)text;
 - (NSString*)chatShown;
+- (NSView*)chatPanel;
+- (bool)chatReady;
 @end
 
 @implementation SSWin {
@@ -800,6 +802,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   int _unread;
   NSString* _chatPending;
   NSTimer* _popTimer;
+  bool _chatReady; // in the room (the server told our name)
   std::string _server; // (CI: a local one)
 
   std::unique_ptr<Engine> _engine;
@@ -1464,12 +1467,21 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   return [[self chat] shown];
 }
 
+- (NSView*)chatPanel {
+  return _chatPanel;
+}
+
+- (bool)chatReady {
+  return _chatReady;
+}
+
 /** A new room: its chat starts empty (what was said there comes from the server); our name goes with it. */
 - (void)startChat {
   [_hostChat clear];
   [_viewChat clear];
   _unread = 0;
   _chatPending = nil;
+  _chatReady = false;
   [self updateUnread];
   [self hidePop];
   if (_engine) _engine->setName(U([NSUserDefaults.standardUserDefaults stringForKey:@"chatName"] ?: @""));
@@ -1828,6 +1840,7 @@ static std::string parseCode(NSString* text) {
     [[self chat] note:@"Nincs kapcsolat a szobával – az üzenet nem ment el." lasting:NO];
   } else if (type == "name") {
     [[self chat] serverName:S(e["name"].str())];
+    _chatReady = true;
   }
 }
 
@@ -2341,8 +2354,19 @@ static int smoke(NSArray<NSString*>* args) {
 }
 
 /** --ui-chat <server> <code> <png> <log> (CI): a window of the app watches a room and says something in
- *  its chat – it has to come back as ours, and the sharer's answer has to show there; the window is saved. */
+ *  its chat – it has to come back as ours, and the sharer's answer has to show there; the chat panel is
+ *  saved. Each step goes to the log as it happens (a crash shows where). */
+static FILE* gChatLog = nullptr;
+
+static void chatLog(NSString* text) {
+  if (!gChatLog) return;
+  fprintf(gChatLog, "%s\n", text.UTF8String);
+  fflush(gChatLog);
+}
+
 static int uiChat(NSArray<NSString*>* args) {
+  gChatLog = fopen(args[4].fileSystemRepresentation, "w");
+  NSSetUncaughtExceptionHandler([](NSException* e) { chatLog([NSString stringWithFormat:@"EXCEPTION %@: %@\n%@", e.name, e.reason, e.callStackSymbols]); });
   NSApplication* app = NSApplication.sharedApplication;
   app.activationPolicy = NSApplicationActivationPolicyRegular;
   [app finishLaunching];
@@ -2350,11 +2374,17 @@ static int uiChat(NSArray<NSString*>* args) {
     NSDate* until = [NSDate dateWithTimeIntervalSinceNow:s];
     while ([until timeIntervalSinceNow] > 0) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
   };
+  chatLog(@"window");
   SSWin* w = [[SSWin alloc] initFrom:nil watch:YES];
+  chatLog([NSString stringWithFormat:@"watching %@ on %@", args[2], args[1]]);
   [w testWatch:U(args[2]) server:U(args[1])];
-  runFor(4); // (in the room, the picture coming)
+  double started = nowMs();
+  for (int i = 0; i < 300 && ![w chatReady]; i++) runFor(0.05);
+  chatLog([NSString stringWithFormat:@"in the room: %s after %.1f s; the chat shows: %@", [w chatReady] ? "yes" : "no", (nowMs() - started) / 1000, [w chatShown]]);
+  runFor(1);
   NSString* said = @"Szia a Mac appból! 👋";
   [w testSay:said];
+  chatLog(@"said");
   bool came = false, answered = false;
   for (int i = 0; i < 100 && !(came && answered); i++) {
     runFor(0.1);
@@ -2362,17 +2392,21 @@ static int uiChat(NSArray<NSString*>* args) {
     came = [shown containsString:said];
     answered = [shown containsString:@"Szia, "]; // (the sharer answers everyone: "Szia, <name>!")
   }
+  chatLog([NSString stringWithFormat:@"RESULT {\"came\":%s,\"answered\":%s}\n%@", came ? "true" : "false", answered ? "true" : "false", [w chatShown]]);
   runFor(0.5);
-  NSView* v = w.window.contentView;
-  NSBitmapImageRep* rep = [v bitmapImageRepForCachingDisplayInRect:v.bounds];
-  [v cacheDisplayInRect:v.bounds toBitmapImageRep:rep];
-  [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:args[3] atomically:YES];
-  FILE* log = fopen(args[4].fileSystemRepresentation, "w");
-  if (log) {
-    fprintf(log, "RESULT {\"came\":%s,\"answered\":%s}\n%s\n", came ? "true" : "false", answered ? "true" : "false", [w chatShown].UTF8String);
-    fclose(log);
+  @try {
+    NSView* v = [w chatPanel];
+    NSBitmapImageRep* rep = [v bitmapImageRepForCachingDisplayInRect:v.bounds];
+    [v cacheDisplayInRect:v.bounds toBitmapImageRep:rep];
+    [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:args[3] atomically:YES];
+    chatLog(@"saved");
+  } @catch (NSException* e) {
+    chatLog([NSString stringWithFormat:@"not saved: %@", e.reason]);
   }
   [w endSession];
+  chatLog(@"end");
+  fclose(gChatLog);
+  gChatLog = nullptr;
   return came && answered ? 0 : 1;
 }
 
