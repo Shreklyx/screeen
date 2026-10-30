@@ -362,7 +362,7 @@ async function openRoom(password) {
   const signal = hostSignal();
   await signal.whenOpen(8000);
   const resume = store.get('ss-host-room', null, 'session');
-  const res = await signal.request({ t: 'host', password, resume: resume || undefined }, ['hosted']);
+  const res = await signal.request({ t: 'host', password, resume: resume || undefined, name: chatName() }, ['hosted']);
   applyHosted(res);
   return Boolean(resume && res.code === resume.code);
 }
@@ -370,7 +370,7 @@ async function openRoom(password) {
 // After a lost server connection: take the room back with its token (password as fallback).
 async function reclaimRoom() {
   try {
-    const res = await host.signal.request({ t: 'host', password: host.password, resume: { code: host.code, token: host.token } }, ['hosted']);
+    const res = await host.signal.request({ t: 'host', password: host.password, resume: { code: host.code, token: host.token }, name: chatName() }, ['hosted']);
     const changed = res.code !== host.code;
     applyHosted(res);
     if (changed) toast('A korábbi szoba lejárt, új link készült – küldd el újra a nézőknek.', 'warn', 8000);
@@ -392,7 +392,8 @@ function applyHosted(res) {
   host.signal.send({ t: 'state', live: isLive() });
   const present = new Set((res.viewers || []).map((v) => v.id));
   for (const id of [...host.viewers.keys()]) if (!present.has(id)) dropViewer(id);
-  for (const v of res.viewers || []) ensureViewer(v.id, v.caps);
+  for (const v of res.viewers || []) ensureViewer(v.id, v.caps, v.name);
+  hostChat().joined(res, 'host');
 }
 
 async function startHosting(e) {
@@ -462,7 +463,14 @@ function setSignalStatus(text, kind = '') {
 
 function onHostMessage(msg) {
   switch (msg.t) {
-    case 'viewer': ensureViewer(msg.id, msg.caps); break;
+    case 'viewer': ensureViewer(msg.id, msg.caps, msg.name); break;
+    case 'viewer-name': {
+      const v = host.viewers.get(msg.id);
+      if (v && typeof msg.name === 'string') { v.name = msg.name; renderViewers(); }
+      break;
+    }
+    case 'chat': hostChat().message(msg, 'host'); break;
+    case 'chat-limit': chatTooFast(); break;
     case 'viewer-left': dropViewer(msg.id); break;
     case 'signal': onViewerSignal(msg.from, msg.data); break;
     case 'direct': onDirectSession(msg); break;
@@ -481,11 +489,12 @@ function onHostMessage(msg) {
 
 /* ---- the viewers ---- */
 
-function ensureViewer(id, caps) {
+function ensureViewer(id, caps, name) {
   let v = host.viewers.get(id);
+  if (v && typeof name === 'string' && name) v.name = name;
   if (v?.direct && !['failed', 'lost', 'closed'].includes(v.direct.state)) return;
   if (!v) {
-    v = { id, n: ++host.seq, caps: caps || null, stats: null, direct: null, remote: null };
+    v = { id, n: ++host.seq, caps: caps || null, name: typeof name === 'string' ? name : '', stats: null, direct: null, remote: null };
     host.viewers.set(id, v);
   }
   if (!v.caps?.direct || !host.serverDirect) {
@@ -734,7 +743,7 @@ function renderViewers() {
     const head = document.createElement('div');
     head.className = 'viewer-head';
     const name = document.createElement('span');
-    name.textContent = `Néző #${v.n}`;
+    name.textContent = v.name || `Néző #${v.n}`;
     const state = document.createElement('span');
     if (!isLive()) { state.textContent = 'vár (szünet)'; state.className = 'viewer-state'; }
     else if (v.direct?.state === 'connected') { state.textContent = `néz · ${PATH_LABEL[v.direct.path] || ''}`; state.className = 'viewer-state ok'; }
@@ -793,6 +802,7 @@ async function copyLink() {
 }
 
 async function initHostUi() {
+  hostChat(); // (its form works from the start)
   const fields = { setRes: 'res', setFps: 'fps', setKbps: 'kbps', setMode: 'mode' };
   for (const [id, key] of Object.entries(fields)) {
     const el = $(`#${id}`);
@@ -1397,6 +1407,7 @@ const viewer = {
   hostStats: null, // the sender's encoder info (hardware, encode time)
   direct: null, // the connection to the sharer, see "DIRECT MODE: the viewer"
   tick: 0,
+  unread: 0, // chat messages that came while the panel was closed
 };
 
 const canvas = () => $('#directCanvas');
@@ -1447,8 +1458,9 @@ async function joinRoom() {
   clearTimeout(viewer.retryTimer);
   if (viewer.closed) return;
   try {
-    const res = await viewer.signal.request({ t: 'join', code: viewer.code, caps: viewer.caps }, ['joined']);
+    const res = await viewer.signal.request({ t: 'join', code: viewer.code, caps: viewer.caps, name: chatName() }, ['joined']);
     viewer.id = res.id;
+    viewerChat().joined(res, res.id);
     viewer.iceServers = res.iceServers || [];
     viewer.live = Boolean(res.live);
     viewer.hostPresent = Boolean(res.hostPresent);
@@ -1499,6 +1511,12 @@ function onViewerMessage(msg) {
       break;
     case 'count':
       $('#viewerCountText').textContent = `${msg.n} néző`;
+      break;
+    case 'chat':
+      viewerChat().message(msg, viewer.id);
+      break;
+    case 'chat-limit':
+      chatTooFast();
       break;
     case 'closed':
       viewer.closed = true;
@@ -1590,15 +1608,15 @@ function toggleMute() {
 }
 
 function toggleFullscreen() {
-  const player = $('#player');
+  const watch = $('#watch'); // the picture and the chat next to it (if open)
   if (document.fullscreenElement || document.webkitFullscreenElement) {
     (document.exitFullscreen || document.webkitExitFullscreen).call(document);
-  } else if (player.requestFullscreen) {
-    player.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
-  } else if (player.webkitRequestFullscreen) {
-    player.webkitRequestFullscreen();
+  } else if (watch.requestFullscreen) {
+    watch.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+  } else if (watch.webkitRequestFullscreen) {
+    watch.webkitRequestFullscreen();
   } else {
-    player.classList.toggle('pseudo-full'); // an iPhone: the whole window
+    watch.classList.toggle('pseudo-full'); // an iPhone: the whole window
   }
 }
 
@@ -1623,6 +1641,7 @@ function showControls() {
 
 function initViewerUi() {
   const player = $('#player');
+  viewerChat();
   canvas().addEventListener('dblclick', toggleFullscreen);
   player.addEventListener('pointermove', showControls);
   player.addEventListener('pointerdown', showControls);
@@ -1641,6 +1660,11 @@ function initViewerUi() {
   $('#btnMute').addEventListener('click', toggleMute);
   $('#btnFullscreen').addEventListener('click', toggleFullscreen);
   $('#btnStats').addEventListener('click', toggleStats);
+  $('#btnChat').addEventListener('click', () => toggleChat());
+  $('#btnChatClose').addEventListener('click', () => toggleChat(false));
+  $('#chatPop').addEventListener('click', () => toggleChat(true));
+  // open from the start on a wide screen (unless closed last time); below the picture on a narrow one
+  toggleChat(store.get('ss-chat-open', null) ?? window.matchMedia('(min-width: 1100px)').matches, false);
   $('#btnUnmute').addEventListener('click', () => {
     viewer.muted = false;
     if (viewer.volume === 0) viewer.volume = 1;
@@ -1656,7 +1680,8 @@ function initViewerUi() {
     if (k === 'f') toggleFullscreen();
     else if (k === 'm') toggleMute();
     else if (k === 's') toggleStats();
-    else if (k === 'escape' && player.classList.contains('pseudo-full')) player.classList.remove('pseudo-full');
+    else if (k === 'c') toggleChat();
+    else if (k === 'escape' && $('#watch').classList.contains('pseudo-full')) $('#watch').classList.remove('pseudo-full');
     else return;
     e.preventDefault();
   });
@@ -2013,6 +2038,153 @@ function directStatsTick() {
     ['Kapcsolat', PATH_LABEL[d.path] || '–'],
     ['Hang', !canDirect.audio ? 'ez a böngésző nem tudja lejátszani' : a ? `Opus · ${a.wasm ? own : 'WebCodecs'} · ${a.channels > 2 ? `${a.channels} csatorna → ${a.out} hangszóró` : 'sztereó'}` : 'nincs', !canDirect.audio],
   ]);
+}
+
+/* ============================== the room's chat ============================== */
+// Everyone in the room – the sharer and every viewer – writes to everyone. The server passes it on
+// with the sender's name (the one given here, or its own: Megosztó / Néző N) and keeps the last 50
+// for those who come later. The sharer's chat is a box next to the preview; the viewer's a panel
+// next to the picture (in full screen too), with a count of what came while it was closed.
+
+const CHAT_KEEP = 200; // messages kept on the page
+const chatClock = new Intl.DateTimeFormat('hu-HU', { hour: '2-digit', minute: '2-digit' });
+const chatName = () => store.get('ss-name', '') || undefined;
+
+/** A colour of its own for each writer (the sharer has the accent colour). */
+function chatHue(from) {
+  let h = 0;
+  for (const ch of String(from)) h = (Math.imul(h, 31) + ch.codePointAt(0)) >>> 0;
+  return h % 360;
+}
+
+function chatTooFast() {
+  toast('Lassabban – túl sok üzenet egyszerre. Pár másodperc múlva mehet.', 'warn');
+}
+
+/** One chat on the page: its list, the box to write in, the name. `send` gives a message to the server. */
+function createChat({ list, empty, form, input, nameInput, send, onMessage }) {
+  let me = null;
+  const add = (m) => {
+    const li = document.createElement('li');
+    li.className = `chat-msg${m.from === me ? ' mine' : ''}${m.from === 'host' ? ' from-host' : ''}`;
+    const meta = document.createElement('div');
+    meta.className = 'chat-meta';
+    const name = document.createElement('b');
+    name.textContent = String(m.name || '');
+    if (m.from !== 'host') name.style.color = `hsl(${chatHue(m.from)} 80% 74%)`;
+    const time = document.createElement('time');
+    time.textContent = Number.isFinite(m.at) ? chatClock.format(new Date(m.at)) : '';
+    meta.append(name, time);
+    const text = document.createElement('p');
+    text.textContent = String(m.text || ''); // (as text: never HTML)
+    li.append(meta, text);
+    const atEnd = list.scrollHeight - list.scrollTop - list.clientHeight < 48;
+    list.append(li);
+    while (list.children.length > CHAT_KEEP) list.firstElementChild.remove();
+    empty.hidden = true;
+    if (atEnd || m.from === me) list.scrollTop = list.scrollHeight;
+  };
+  const chat = {
+    /** In the room (again): who we are there, what was said so far, the name the server gave us. */
+    joined(res, id) {
+      me = id;
+      list.replaceChildren();
+      empty.hidden = false;
+      for (const m of Array.isArray(res.chat) ? res.chat : []) add(m);
+      list.scrollTop = list.scrollHeight;
+      if (typeof res.name === 'string') nameInput.placeholder = res.name;
+    },
+    message(m, id) {
+      me = id;
+      add(m);
+      onMessage?.(m, m.from === me);
+    },
+  };
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    if (send({ t: 'chat', text })) input.value = '';
+    else toast('Nincs kapcsolat a szerverrel – az üzenet nem ment el.', 'warn');
+  });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Escape') input.blur(); });
+  nameInput.value = store.get('ss-name', '');
+  nameInput.addEventListener('change', () => {
+    const name = nameInput.value.trim().slice(0, 24);
+    nameInput.value = name;
+    store.set('ss-name', name);
+    if (name) send({ t: 'name', name });
+  });
+  nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); nameInput.blur(); } });
+  return chat;
+}
+
+let hostChatBox = null;
+function hostChat() {
+  hostChatBox ??= createChat({
+    list: $('#hostChatList'),
+    empty: $('#hostChatEmpty'),
+    form: $('#hostChatForm'),
+    input: $('#hostChatInput'),
+    nameInput: $('#hostChatName'),
+    send: (m) => Boolean(host.code && host.signal?.send(m)),
+    onMessage: (m, mine) => { if (!mine && document.visibilityState === 'hidden') toast(`${m.name}: ${m.text}`, 'info', 6000); },
+  });
+  return hostChatBox;
+}
+
+let viewerChatBox = null;
+function viewerChat() {
+  viewerChatBox ??= createChat({
+    list: $('#viewerChatList'),
+    empty: $('#viewerChatEmpty'),
+    form: $('#viewerChatForm'),
+    input: $('#viewerChatInput'),
+    nameInput: $('#viewerChatName'),
+    send: (m) => Boolean(viewer.id && viewer.signal?.send(m)),
+    onMessage: (m, mine) => {
+      if (mine || !$('#viewerChat').hidden) return;
+      viewer.unread = (viewer.unread || 0) + 1;
+      renderChatBadge();
+      popChat(m);
+    },
+  });
+  return viewerChatBox;
+}
+
+function renderChatBadge() {
+  const badge = $('#chatBadge');
+  badge.hidden = !viewer.unread;
+  badge.textContent = viewer.unread > 99 ? '99+' : String(viewer.unread || '');
+}
+
+/** The viewer's chat panel on (true) or off (false), or the other way (no argument). */
+function toggleChat(open = $('#viewerChat').hidden, remember = true) {
+  const panel = $('#viewerChat');
+  panel.hidden = !open;
+  $('#btnChat').setAttribute('aria-pressed', String(open));
+  if (remember) store.set('ss-chat-open', open);
+  if (!open) return;
+  viewer.unread = 0;
+  renderChatBadge();
+  $('#chatPop').replaceChildren();
+  const list = $('#viewerChatList');
+  list.scrollTop = list.scrollHeight;
+  // ready to type – not on a touch screen, where that would push the keyboard up
+  if (remember && window.matchMedia('(hover: hover)').matches) $('#viewerChatInput').focus({ preventScroll: true });
+}
+
+/** With the panel closed, a new message shows over the picture for a few seconds (in full screen too). */
+function popChat(m) {
+  const pop = $('#chatPop');
+  const line = document.createElement('div');
+  const name = document.createElement('b');
+  name.textContent = `${m.name}: `;
+  if (m.from !== 'host') name.style.color = `hsl(${chatHue(m.from)} 80% 74%)`;
+  line.append(name, document.createTextNode(m.text));
+  pop.append(line);
+  while (pop.children.length > 3) pop.firstElementChild.remove();
+  setTimeout(() => line.remove(), 7000);
 }
 
 /* ============================== boot ============================== */

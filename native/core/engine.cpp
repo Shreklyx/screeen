@@ -78,6 +78,7 @@ struct Engine::Impl {
   bool wsOpen = false, wsWanted = false;
   int wsGen = 0, wsAttempt = 0, wsTimer = 0;
   std::string mode; // "", "host", "viewer"
+  std::string myName, myId; // the chat: the name given (""= the server's), who we are in the room ("host" or a viewer's id)
 
   /* ---- sharer */
   struct Viewer {
@@ -95,6 +96,7 @@ struct Engine::Impl {
     std::string why;      // why it is being connected again / not served
     bool unsupported = false;
     Json remote;          // what the viewer measured
+    std::string name;     // its chat name
   };
   std::string password, code, token;
   Json iceServers;
@@ -243,8 +245,55 @@ struct Engine::Impl {
 
   void onSignalMessage(const Json& msg) {
     const std::string& t = msg["t"].str();
+    if (t == "chat" || t == "chat-limit") return onChat(t, msg);
     if (mode == "host") onHostMessage(t, msg);
     else if (mode == "viewer") onViewerMessage(t, msg);
+  }
+
+  /* ------------------------------------------------ the room's chat */
+
+  static Json chatEntry(const Json& m, const std::string& me) {
+    Json o = Json::object();
+    std::string from = m["from"].str();
+    o.set("id", m["id"]).set("from", from).set("name", m["name"].str()).set("text", m["text"].str()).set("at", m["at"]);
+    o.set("host", from == "host").set("mine", !me.empty() && from == me);
+    return o;
+  }
+
+  void onChat(const std::string& t, const Json& msg) {
+    if (mode.empty()) return;
+    Json e = t == "chat" ? chatEntry(msg, myId) : Json::object();
+    e.set("type", t);
+    emit(e);
+  }
+
+  /** In the room (again): who we are in it, and what was said there so far. */
+  void chatJoined(const std::string& id, const Json& msg) {
+    myId = id;
+    Json name = Json::object();
+    name.set("type", "name").set("name", msg["name"].str());
+    emit(name);
+    Json list = Json::array();
+    for (const Json& m : msg["chat"].items()) list.push(chatEntry(m, myId));
+    Json e = Json::object();
+    // (a server from before the chat sends none: what is written would go nowhere – the UI says so)
+    e.set("type", "chat-history").set("list", list).set("supported", msg["chat"].isArray());
+    emit(e);
+  }
+
+  void sendChat(const std::string& text) {
+    if (!mode.empty() && wsOpen && !(mode == "host" && code.empty()) && !(mode == "viewer" && joinPending)) {
+      send(Json::object().set("t", "chat").set("text", text));
+      return;
+    }
+    Json e = Json::object();
+    e.set("type", "chat-offline");
+    emit(e);
+  }
+
+  void setName(const std::string& name) {
+    myName = name;
+    if (!name.empty() && wsOpen && !mode.empty()) send(Json::object().set("t", "name").set("name", name));
   }
 
   /* ------------------------------------------------ sharer */
@@ -291,6 +340,7 @@ struct Engine::Impl {
   void sendHost() {
     Json m = Json::object();
     m.set("t", "host").set("password", password);
+    if (!myName.empty()) m.set("name", myName);
     if (!code.empty() && !token.empty()) m.set("resume", Json::object().set("code", code).set("token", token));
     send(m);
   }
@@ -310,7 +360,8 @@ struct Engine::Impl {
   void onHostMessage(const std::string& t, const Json& msg) {
     if (t == "hosted") applyHosted(msg);
     else if (t == "error" && hostPending) hostFailed(msg["code"].str("error"));
-    else if (t == "viewer") ensureViewer(msg["id"].str(), msg["caps"]);
+    else if (t == "viewer") ensureViewer(msg["id"].str(), msg["caps"], msg["name"].str());
+    else if (t == "viewer-name") renameViewer(msg["id"].str(), msg["name"].str());
     else if (t == "viewer-left") dropViewer(msg["id"].str());
     else if (t == "signal") onViewerSignal(msg["from"].str(), msg["data"]);
     else if (t == "direct") onDirectSession(msg);
@@ -344,18 +395,28 @@ struct Engine::Impl {
     std::vector<std::string> gone;
     for (auto& kv : viewers) if (!present.count(kv.first)) gone.push_back(kv.first);
     for (auto& id : gone) dropViewer(id);
-    for (const Json& v : res["viewers"].items()) ensureViewer(v["id"].str(), v["caps"]);
+    for (const Json& v : res["viewers"].items()) ensureViewer(v["id"].str(), v["caps"], v["name"].str());
+    chatJoined("host", res);
   }
 
-  void ensureViewer(const std::string& id, const Json& caps) {
+  void renameViewer(const std::string& id, const std::string& name) {
+    auto it = viewers.find(id);
+    if (it == viewers.end() || name.empty()) return;
+    it->second.name = name;
+    emitViewers();
+  }
+
+  void ensureViewer(const std::string& id, const Json& caps, const std::string& name = "") {
     if (id.empty()) return;
     auto it = viewers.find(id);
+    if (it != viewers.end() && !name.empty()) it->second.name = name;
     if (it != viewers.end() && it->second.direct && it->second.state != "failed" && it->second.state != "lost" && it->second.state != "closed") return;
     if (it == viewers.end()) {
       Viewer v;
       v.id = id;
       v.n = ++seq;
       v.caps = caps;
+      v.name = name;
       it = viewers.emplace(id, v).first;
     }
     Viewer& v = it->second;
@@ -586,7 +647,7 @@ struct Engine::Impl {
     for (auto& kv : viewers) {
       Viewer& v = kv.second;
       Json o = Json::object();
-      o.set("id", v.id).set("n", v.n);
+      o.set("id", v.id).set("n", v.n).set("name", v.name);
       std::string state = v.unsupported ? "unsupported" : !v.direct ? "retrying" : v.state;
       o.set("state", state).set("path", v.path);
       const Json& r = v.report;
@@ -644,7 +705,10 @@ struct Engine::Impl {
     joinPending = true;
     Json caps = Json::object();
     caps.set("direct", true);
-    send(Json::object().set("t", "join").set("code", viewCode).set("caps", caps));
+    Json m = Json::object();
+    m.set("t", "join").set("code", viewCode).set("caps", caps);
+    if (!myName.empty()) m.set("name", myName);
+    send(m);
   }
 
   void onViewerMessage(const std::string& t, const Json& msg) {
@@ -655,6 +719,7 @@ struct Engine::Impl {
       Json e = Json::object();
       e.set("type", "joined").set("code", msg["code"].str(viewCode));
       emit(e);
+      chatJoined(msg["id"].str(), msg);
       if (!msg["hostPresent"].b(false)) viewState("A megosztó épp nincs bent. Várakozás…");
       else if (!viewLive) viewState("A megosztás szünetel. Amint folytatódik, itt lesz a kép.");
       else if (!(view && view->picture)) viewState("Csatlakozva. Kép betöltése…");
@@ -916,6 +981,14 @@ void Engine::setEncoder(const std::string& name, bool hardware) {
     impl_->cfg.encoderName = name;
     impl_->cfg.hardware = hardware;
   });
+}
+
+void Engine::setName(const std::string& name) {
+  impl_->loop.post([this, name] { impl_->setName(name); });
+}
+
+void Engine::sendChat(const std::string& text) {
+  impl_->loop.post([this, text] { impl_->sendChat(text); });
 }
 
 void Engine::join(const std::string& code) {

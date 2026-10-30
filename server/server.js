@@ -57,6 +57,12 @@ const LIMITS = {
   maxSignal: 32 * 1024, // one signal (keys, addresses, statistics)
   maxBuffered: 1 << 20, // skip sending to a socket that does not keep up
   turnTtlSec: 24 * 3600,
+  // the room's chat
+  chatText: 500, // characters in a message
+  chatName: 24, // characters in a name
+  chatHistory: 50, // messages a room keeps for those who come later
+  chatBurst: 5, // messages one person may send at once …
+  chatPerSec: 1, // … and then this many a second
 };
 
 export function loadConfig(env = process.env) {
@@ -141,6 +147,14 @@ function clientIp(req, trustProxy) {
     if (xff.length) return xff[xff.length - 1];
   }
   return req.socket.remoteAddress || 'unknown';
+}
+
+/** What people type (a chat message, a name): no control characters or bidi overrides (text that
+ *  turns itself around), single spaces, at most `max` characters. */
+export function cleanText(value, max) {
+  if (typeof value !== 'string') return '';
+  const s = value.normalize('NFC').replace(/[\p{Cc}\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, ' ').replace(/\s+/g, ' ').trim();
+  return [...s].slice(0, max).join('').trim();
 }
 
 function sanitizeCaps(caps) {
@@ -343,8 +357,10 @@ export function createApp(config = loadConfig()) {
       token: room.token,
       iceServers: iceServers(config),
       live: room.live,
-      viewers: [...room.viewers.values()].map((v) => ({ id: v.id, caps: v.caps })),
+      viewers: [...room.viewers.values()].map((v) => ({ id: v.id, caps: v.caps, name: v.name })),
       direct: true, // this server sets up the direct mode
+      name: conn.name,
+      chat: room.chat,
     });
     for (const v of room.viewers.values()) send(v, { t: 'host-back', live: room.live });
     broadcastCount(room);
@@ -357,6 +373,7 @@ export function createApp(config = loadConfig()) {
         const room = rooms.get(String(resume.code || ''));
         if (room && typeof resume.token === 'string' && passwordMatches(resume.token, room.token)) {
           if (conn.room && conn.room !== room) leave(conn);
+          conn.name = cleanText(msg.name, LIMITS.chatName) || room.host?.name || 'Megosztó';
           attachHost(conn, room);
           return;
         }
@@ -371,6 +388,7 @@ export function createApp(config = loadConfig()) {
       }
       if (rooms.size >= LIMITS.rooms) return send(conn, { t: 'error', code: 'full' });
       if (conn.room) leave(conn);
+      conn.name = cleanText(msg.name, LIMITS.chatName) || 'Megosztó';
       let code;
       do code = randomCode(); while (rooms.has(code));
       const room = {
@@ -380,6 +398,9 @@ export function createApp(config = loadConfig()) {
         viewers: new Map(),
         live: false,
         awayTimer: null,
+        chat: [], // the last messages: {id, from: 'host' or a viewer's id, name, text, at}
+        chatSeq: 0,
+        viewerSeq: 0, // for the names of those who give none: Néző 1, Néző 2, …
       };
       rooms.set(code, room);
       attachHost(conn, room);
@@ -396,9 +417,19 @@ export function createApp(config = loadConfig()) {
       conn.role = 'viewer';
       conn.room = room;
       conn.caps = sanitizeCaps(msg.caps);
+      conn.name = cleanText(msg.name, LIMITS.chatName) || `Néző ${++room.viewerSeq}`;
       room.viewers.set(conn.id, conn);
-      send(conn, { t: 'joined', id: conn.id, code: room.code, iceServers: iceServers(config), live: room.live, hostPresent: Boolean(room.host) });
-      if (room.host) send(room.host, { t: 'viewer', id: conn.id, caps: conn.caps });
+      send(conn, {
+        t: 'joined',
+        id: conn.id,
+        code: room.code,
+        iceServers: iceServers(config),
+        live: room.live,
+        hostPresent: Boolean(room.host),
+        name: conn.name,
+        chat: room.chat,
+      });
+      if (room.host) send(room.host, { t: 'viewer', id: conn.id, caps: conn.caps, name: conn.name });
       broadcastCount(room);
     },
 
@@ -430,6 +461,34 @@ export function createApp(config = loadConfig()) {
       if (conn.role === 'viewer') leave(conn);
     },
 
+    // the room's chat: everyone in it – the sharer and every viewer – gets every message (the sender
+    // too: that is the delivery), with the name the server knows the sender by
+    chat(conn, msg) {
+      const room = conn.room;
+      if (!room || (conn.role === 'host' && room.host !== conn)) return;
+      const text = cleanText(msg.text, LIMITS.chatText);
+      if (!text) return;
+      const now = Date.now();
+      conn.chatTokens = Math.min(LIMITS.chatBurst, conn.chatTokens + ((now - conn.chatRefill) / 1000) * LIMITS.chatPerSec);
+      conn.chatRefill = now;
+      if (conn.chatTokens < 1) return send(conn, { t: 'chat-limit' });
+      conn.chatTokens -= 1;
+      const entry = { id: ++room.chatSeq, from: conn.role === 'host' ? 'host' : conn.id, name: conn.name, text, at: now };
+      room.chat.push(entry);
+      if (room.chat.length > LIMITS.chatHistory) room.chat.shift();
+      const out = { t: 'chat', ...entry };
+      if (room.host) send(room.host, out);
+      for (const v of room.viewers.values()) send(v, out);
+    },
+
+    name(conn, msg) {
+      const room = conn.room;
+      const name = cleanText(msg.name, LIMITS.chatName);
+      if (!room || !name || (conn.role === 'host' && room.host !== conn)) return;
+      conn.name = name;
+      if (conn.role === 'viewer' && room.host) send(room.host, { t: 'viewer-name', id: conn.id, name });
+    },
+
     // direct mode for one viewer: a session (id + secret) for the UDP registration / relay
     direct(conn, msg) {
       const room = conn.room;
@@ -452,8 +511,11 @@ export function createApp(config = loadConfig()) {
       room: null,
       role: null,
       caps: null,
+      name: '',
       tokens: LIMITS.viewerBurst,
       lastRefill: Date.now(),
+      chatTokens: LIMITS.chatBurst,
+      chatRefill: Date.now(),
     };
 
     ws.isAlive = true;

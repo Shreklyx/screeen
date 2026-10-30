@@ -39,6 +39,12 @@ struct EngineCallbacks {
    *   joined       {code}  view-state {text, picture}      the viewer's overlay text
    *   view-stats   {fps, kbps, rtt, lat, path, loss, encoder}
    *   closed       {reason}                                the room is over
+   *   the room's chat (both sides; viewers' list entries have their names too):
+   *   name         {name}                                  the name the room knows us by
+   *   chat-history {list: [chat…], supported}              what was said so far (in the room again: all of it);
+   *                                                         supported: false – the server has no chat yet
+   *   chat         {id, from, name, text, at, host, mine}  a message (ours too: then it was delivered)
+   *   chat-limit {}  chat-offline {}                       too fast / not in a room right now: not sent
    */
   std::function<void(const Json& event)> event;
   // sharer
@@ -71,6 +77,11 @@ class Engine {
   void setEncoderStats(double encodeMs, int width, int height);
   /** Sharer: which encoder works ("NVENC", "Intel Quick Sync", …) and whether it is the GPU. */
   void setEncoder(const std::string& name, bool hardware);
+
+  /** Both: the name shown with our chat messages ("" = the server's: Megosztó / Néző N). */
+  void setName(const std::string& name);
+  /** Both: a chat message to everyone in the room. */
+  void sendChat(const std::string& text);
 
   /** Viewer: joins a room by its code. */
   void join(const std::string& code);

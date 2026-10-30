@@ -3,10 +3,11 @@
 //
 //   ss-cli host --server http://127.0.0.1:8090 --password titok123 --h264 file.h264 [--fps 60] [--seconds 30]
 //   ss-cli view --server http://127.0.0.1:8090 --code abc123 [--seconds 10] [--out received.h264]
+//   the room's chat, both: [--name NAME] [--chat TEXT (once in the room)] [--chat-reply TEXT ({name}: who wrote)]
 //   ss-cli ws-bench --url ws://127.0.0.1:8095 [--count 240]   (round trips through an echo server)
 //
 // Prints the engine's events as JSON lines; "host" prints "CODE <code>" once the room is open,
-// "view" ends with "RESULT {…}" (frames, keyframes, bytes, latency).
+// "view" ends with "RESULT {…}" (frames, keyframes, bytes, latency); chat messages as "CHAT {…}".
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -54,6 +55,31 @@ static void line(const std::string& s) {
   std::fflush(stdout);
 }
 
+/** The chat options (both modes): prints what is said, says --chat once in the room, answers others
+ *  with --chat-reply. Returns true for the chat's events (printed here). */
+struct Chat {
+  std::string say, reply;
+  bool said = false;
+  Engine* engine = nullptr;
+  Chat(int argc, char** argv) : say(arg(argc, argv, "--chat")), reply(arg(argc, argv, "--chat-reply")) {}
+  bool on(const Json& e) {
+    const std::string& type = e["type"].str();
+    if (type == "name" && !say.empty() && !said && engine) {
+      said = true;
+      engine->sendChat(say);
+    }
+    if (type == "chat" && !reply.empty() && !e["mine"].b(false) && engine) {
+      std::string text = reply;
+      size_t at = text.find("{name}");
+      if (at != std::string::npos) text.replace(at, 6, e["name"].str());
+      engine->sendChat(text);
+    }
+    if (type.compare(0, 4, "chat") != 0) return false;
+    line("CHAT " + e.dump());
+    return true;
+  }
+};
+
 static int host(int argc, char** argv) {
   std::ifstream f(arg(argc, argv, "--h264"), std::ios::binary);
   Bytes data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -71,10 +97,11 @@ static int host(int argc, char** argv) {
   cfg.encoderName = "ss-cli";
   cfg.forceTcp = flag(argc, argv, "--tcp");
   cfg.forceRelay = flag(argc, argv, "--relay");
+  Chat chat(argc, argv);
   EngineCallbacks cb;
-  cb.event = [](const Json& e) {
+  cb.event = [&chat](const Json& e) {
     if (e["type"].str() == "hosted") line("CODE " + e["code"].str());
-    if (e["type"].str() != "viewers") line("EVENT " + e.dump());
+    if (!chat.on(e) && e["type"].str() != "viewers") line("EVENT " + e.dump());
   };
   cb.streaming = [&](bool on) {
     streaming = on;
@@ -83,6 +110,8 @@ static int host(int argc, char** argv) {
   cb.keyframe = [&] { key = true; keyframes++; };
   cb.bitrate = [](double bps) { line("BITRATE " + std::to_string(int(bps))); };
   Engine engine(cfg, cb);
+  chat.engine = &engine;
+  engine.setName(arg(argc, argv, "--name"));
   engine.host(arg(argc, argv, "--password"));
   double start = nowMs(), next = start;
   size_t n = 0;
@@ -103,6 +132,7 @@ static int host(int argc, char** argv) {
     }
   }
   line("SENT " + std::to_string(n) + " keyframe-requests " + std::to_string(keyframes.load()));
+  chat.engine = nullptr;
   return 0;
 }
 
@@ -119,8 +149,9 @@ static int view(int argc, char** argv) {
   EngineConfig cfg;
   cfg.server = arg(argc, argv, "--server", "http://127.0.0.1:8090");
   cfg.forceTcp = flag(argc, argv, "--tcp");
+  Chat chat(argc, argv);
   EngineCallbacks cb;
-  cb.event = [](const Json& e) { line("EVENT " + e.dump()); };
+  cb.event = [&chat](const Json& e) { if (!chat.on(e)) line("EVENT " + e.dump()); };
   cb.media = [&](const MediaMeta& m, const uint8_t* d, size_t n) {
     std::lock_guard<std::mutex> l(mu);
     if (m.stream == 1) {
@@ -140,6 +171,8 @@ static int view(int argc, char** argv) {
   };
   Engine engine(cfg, cb);
   enginePtr = &engine;
+  chat.engine = &engine;
+  engine.setName(arg(argc, argv, "--name"));
   engine.join(arg(argc, argv, "--code"));
   double start = nowMs();
   while (nowMs() - start < seconds * 1000) std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -151,6 +184,7 @@ static int view(int argc, char** argv) {
   r.set("latP90", lat.empty() ? Json() : Json(std::round(lat[lat.size() * 9 / 10] * 10) / 10));
   line("RESULT " + r.dump());
   enginePtr = nullptr;
+  chat.engine = nullptr;
   return 0;
 }
 

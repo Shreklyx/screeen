@@ -40,6 +40,30 @@ jobs:
             node -e "const r=JSON.parse(require('fs').readFileSync('view.log','utf8').split('\n').find(l=>l.startsWith('RESULT ')).slice(7)); if(!(r.frames>100&&r.firstKey)) {console.error('too few frames', r); process.exit(1)}"
             wait $host # (not the server: that one runs on)
           done
+      # The room's chat through the server: a viewer (Anna) writes, the sharer (Tamás) answers; both
+      # see both, with names; someone who comes later gets what was said
+      - name: "Chat: the sharer and a viewer talk"
+        run: |
+          PORT=8096 HOST_PASSWORD=ci DIRECT_PORT=3496 node server/server.js &
+          sleep 2
+          build/ss-cli host --server http://127.0.0.1:8096 --password ci --h264 native/tests/data/test.h264 --seconds 12 --name "Tamás" --chat-reply "Szia, {name}!" > chat-host.log &
+          for i in $(seq 1 50); do grep -q '^CODE' chat-host.log && break; sleep 0.2; done
+          code=$(grep '^CODE' chat-host.log | awk '{print $2}')
+          build/ss-cli view --server http://127.0.0.1:8096 --code "$code" --seconds 4 --name "Anna" --chat "Hali, indulhat?" > chat-view.log
+          build/ss-cli view --server http://127.0.0.1:8096 --code "$code" --seconds 2 > chat-late.log
+          grep -h '^CHAT' chat-host.log chat-view.log chat-late.log
+          node -e '
+            const fs = require("fs");
+            const chat = (f) => fs.readFileSync(f, "utf8").split("\n").filter((l) => l.startsWith("CHAT ")).map((l) => JSON.parse(l.slice(5)));
+            const seen = chat("chat-view.log").filter((m) => m.type === "chat");
+            const mine = seen.find((m) => m.mine), answer = seen.find((m) => m.host);
+            if (!mine || mine.name !== "Anna" || mine.text !== "Hali, indulhat?") throw new Error("the viewer\u0027s message did not come back");
+            if (!answer || answer.name !== "Tamás" || answer.text !== "Szia, Anna!" || answer.mine) throw new Error("no answer from the sharer");
+            if (!chat("chat-host.log").some((m) => m.type === "chat" && m.name === "Anna" && !m.mine)) throw new Error("the sharer did not get it");
+            const history = chat("chat-late.log").find((m) => m.type === "chat-history");
+            if (!history || history.list.map((m) => m.text).join("|") !== "Hali, indulhat?|Szia, Anna!") throw new Error("the one who came later did not get it");
+            console.log("chat ok");
+          '
 
   # The native Windows app: MSVC build, then the real pipeline on this machine – the app shares
   # the screen (capture, encoding, sound) to a native viewer, and watches (decodes) a native sharer –

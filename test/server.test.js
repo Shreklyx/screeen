@@ -317,3 +317,143 @@ test('direct mode: the host gets a UDP session for an app viewer; it ends when t
     await app2.close();
   }
 });
+
+/* ------------------------------------------------------------ the room's chat */
+
+// each on a server of its own: the tests above used up this address's password and join limits
+let chatApp = null;
+async function chatServer() {
+  chatApp = createApp({ port: 0, hostPassword: 'titok123', turnSecret: '', turnHost: '', trustProxy: false });
+  await new Promise((r) => chatApp.server.listen(0, '127.0.0.1', r));
+  base = `127.0.0.1:${chatApp.server.address().port}`;
+}
+const mainBase = () => `127.0.0.1:${app.server.address().port}`;
+async function chatTest(name, fn) {
+  test(name, async () => {
+    await chatServer();
+    try {
+      await fn();
+    } finally {
+      base = mainBase();
+      await chatApp.close();
+    }
+  });
+}
+
+/** A room: the sharer and `n` viewers (joined with the given names, if any). */
+async function room(n, names = []) {
+  const h = await client();
+  h.send({ t: 'host', password: 'titok123' });
+  const hosted = await h.next(is('hosted'));
+  const viewers = [];
+  for (let i = 0; i < n; i++) {
+    const v = await client();
+    v.send({ t: 'join', code: hosted.code, ...(names[i] !== undefined ? { name: names[i] } : {}) });
+    v.joined = await v.next(is('joined'));
+    await h.next(is('viewer'));
+    viewers.push(v);
+  }
+  const close = () => {
+    for (const v of viewers) v.close();
+    h.send({ t: 'close' });
+    h.close();
+  };
+  return { h, hosted, viewers, close };
+}
+
+chatTest('chat: everyone in the room gets every message, with the sender\'s name', async () => {
+  const r = await room(2);
+  const [a, b] = r.viewers;
+  assert.equal(r.hosted.name, 'Megosztó');
+  assert.equal(a.joined.name, 'Néző 1');
+  assert.equal(b.joined.name, 'Néző 2');
+  a.send({ t: 'chat', text: 'Szia!' });
+  for (const c of [r.h, a, b]) {
+    const m = await c.next(is('chat'));
+    assert.equal(m.from, a.joined.id);
+    assert.equal(m.name, 'Néző 1');
+    assert.equal(m.text, 'Szia!');
+    assert.ok(Math.abs(m.at - Date.now()) < 5000);
+  }
+  r.h.send({ t: 'chat', text: 'Indul a film' });
+  for (const c of [r.h, a, b]) {
+    const m = await c.next(is('chat'));
+    assert.equal(m.from, 'host');
+    assert.equal(m.name, 'Megosztó');
+  }
+  r.close();
+});
+
+chatTest('chat: names given at joining, changed later, cleaned', async () => {
+  const r = await room(1, [' ‮Anna‬   K. ']);
+  const [v] = r.viewers;
+  assert.equal(v.joined.name, 'Anna K.');
+  v.send({ t: 'name', name: 'Béla' });
+  assert.deepEqual(await r.h.next(is('viewer-name')), { t: 'viewer-name', id: v.joined.id, name: 'Béla' });
+  v.send({ t: 'chat', text: 'hali' });
+  assert.equal((await v.next(is('chat'))).name, 'Béla');
+  v.send({ t: 'name', name: 'x'.repeat(40) });
+  assert.equal((await r.h.next(is('viewer-name'))).name, 'x'.repeat(24));
+  v.send({ t: 'name', name: ' \n ' }); // nothing left: ignored
+  await r.h.nothing(is('viewer-name'));
+  r.h.send({ t: 'name', name: 'Tamás' });
+  r.h.send({ t: 'chat', text: 'ok' });
+  assert.equal((await v.next(is('chat'))).name, 'Tamás');
+  r.close();
+});
+
+chatTest('chat: text cleaned and capped, empty ones dropped, only in a room', async () => {
+  const r = await room(1);
+  const [v] = r.viewers;
+  v.send({ t: 'chat', text: 'egy\nkettő\t három\u0000' });
+  assert.equal((await v.next(is('chat'))).text, 'egy kettő három');
+  v.send({ t: 'chat', text: 'é'.repeat(600) });
+  assert.equal((await v.next(is('chat'))).text, 'é'.repeat(500));
+  v.send({ t: 'chat', text: '   ' });
+  v.send({ t: 'chat', text: 42 });
+  await v.nothing(is('chat'));
+  const outsider = await client();
+  outsider.send({ t: 'chat', text: 'kívülről' });
+  await r.h.nothing(is('chat'));
+  outsider.close();
+  r.close();
+});
+
+chatTest('chat: too fast is refused, then it goes again', async () => {
+  const r = await room(1);
+  const [v] = r.viewers;
+  for (let i = 0; i < 7; i++) v.send({ t: 'chat', text: `m${i}` });
+  for (let i = 0; i < 5; i++) assert.equal((await r.h.next(is('chat'))).text, `m${i}`);
+  await v.next(is('chat-limit'));
+  await r.h.nothing(is('chat'));
+  await new Promise((res) => setTimeout(res, 1100));
+  v.send({ t: 'chat', text: 'újra' });
+  assert.equal((await r.h.next(is('chat'))).text, 'újra');
+  r.close();
+});
+
+chatTest('chat: those who come later get the last 50 messages; the sharer too, coming back', async () => {
+  const r = await room(11);
+  // eleven viewers, five each (each one's burst): 55 messages
+  for (const [i, v] of r.viewers.entries()) for (let k = 0; k < 5; k++) v.send({ t: 'chat', text: `${i}-${k}` });
+  for (let n = 0; n < 55; n++) await r.h.next(is('chat'));
+  const late = await client();
+  late.send({ t: 'join', code: r.hosted.code });
+  const { chat } = await late.next(is('joined'));
+  assert.equal(chat.length, 50);
+  assert.deepEqual(chat.map((m) => m.id), Array.from({ length: 50 }, (_, i) => i + 6));
+  assert.ok(chat.every((m) => typeof m.text === 'string' && m.name && m.from && !('t' in m)));
+  // the sharer's connection drops and it takes the room back: the chat is there
+  r.h.ws.terminate();
+  const h2 = await client();
+  h2.send({ t: 'host', password: 'titok123', resume: { code: r.hosted.code, token: r.hosted.token } });
+  const back = await h2.next(is('hosted'));
+  assert.equal(back.code, r.hosted.code);
+  assert.equal(back.chat.length, 50);
+  assert.equal(back.viewers.length, 12);
+  assert.ok(back.viewers.every((v) => /^Néző \d+$/.test(v.name)));
+  late.close();
+  for (const v of r.viewers) v.close();
+  h2.send({ t: 'close' });
+  h2.close();
+});

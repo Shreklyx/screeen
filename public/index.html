@@ -149,6 +149,17 @@
           <p id="signalStatus" class="hint">Kapcsolódás a szerverhez…</p>
         </section>
 
+        <section class="box chat-box" aria-labelledby="hostChatTitle">
+          <h3 id="hostChatTitle">Chat</h3>
+          <ol id="hostChatList" class="chat-list" aria-live="polite"></ol>
+          <p id="hostChatEmpty" class="hint chat-empty">Itt beszélgethetsz a nézőkkel – ők is írhatnak.</p>
+          <form id="hostChatForm" class="chat-form" autocomplete="off">
+            <input id="hostChatInput" type="text" maxlength="500" placeholder="Üzenet a nézőknek…" aria-label="Üzenet a nézőknek" enterkeyhint="send">
+            <button class="btn btn-primary" type="submit">Küldés</button>
+          </form>
+          <label class="chat-name-row">Neved <input id="hostChatName" type="text" maxlength="24" placeholder="Megosztó" autocomplete="nickname" spellcheck="false"></label>
+        </section>
+
         <section class="box">
           <h3>Hang</h3>
           <div class="field">
@@ -226,6 +237,7 @@
 
     <!-- ============ VIEWER ============ -->
     <section id="view-viewer" data-view class="viewer" hidden>
+      <div id="watch" class="watch">
       <div id="player" class="player ui-visible">
         <canvas id="directCanvas" hidden></canvas>
 
@@ -243,6 +255,7 @@
         </button>
 
         <div id="stats" class="stats" hidden></div>
+        <div id="chatPop" class="chat-pop" aria-hidden="true"></div>
 
         <div class="controls">
           <span id="viewerLive" class="badge badge-live" hidden>ÉLŐ</span>
@@ -253,6 +266,10 @@
             <svg class="ico-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg>
           </button>
           <input id="volume" class="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Hangerő">
+          <button id="btnChat" class="icon-btn chat-btn" type="button" aria-label="Chat (C)" title="Chat (C)" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 5.5h15v10h-9l-4.5 3.5v-3.5h-1.5z"/></svg>
+            <span id="chatBadge" class="chat-badge" hidden></span>
+          </button>
           <button id="btnStats" class="icon-btn" type="button" aria-label="Statisztika (S)" title="Statisztika (S)">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19V11M10 19V5M15 19v-6M20 19V8"/></svg>
           </button>
@@ -261,7 +278,23 @@
           </button>
         </div>
       </div>
-      <p class="viewer-meta">Szoba: <b id="viewerRoom"></b> · <span id="viewerCountText">–</span><span class="kbd-hints"> · Dupla kattintás: teljes képernyő · M: némítás · S: statisztika</span></p>
+      <aside id="viewerChat" class="chat-panel" hidden aria-labelledby="viewerChatTitle">
+        <div class="chat-head">
+          <h3 id="viewerChatTitle">Chat</h3>
+          <button id="btnChatClose" class="icon-btn" type="button" aria-label="Chat bezárása (C)" title="Chat bezárása (C)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+          </button>
+        </div>
+        <ol id="viewerChatList" class="chat-list" aria-live="polite"></ol>
+        <p id="viewerChatEmpty" class="hint chat-empty">Még senki nem írt. Köszönj a többieknek!</p>
+        <form id="viewerChatForm" class="chat-form" autocomplete="off">
+          <input id="viewerChatInput" type="text" maxlength="500" placeholder="Üzenet…" aria-label="Üzenet" enterkeyhint="send">
+          <button class="btn btn-primary" type="submit">Küldés</button>
+        </form>
+        <label class="chat-name-row">Neved <input id="viewerChatName" type="text" maxlength="24" autocomplete="nickname" spellcheck="false"></label>
+      </aside>
+      </div>
+      <p class="viewer-meta">Szoba: <b id="viewerRoom"></b> · <span id="viewerCountText">–</span><span class="kbd-hints"> · Dupla kattintás: teljes képernyő · M: némítás · S: statisztika · C: chat</span></p>
     </section>
   </main>
 
