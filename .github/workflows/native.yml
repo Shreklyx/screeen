@@ -386,6 +386,23 @@ jobs:
           "
       # the zip for the in-app update, the disk image for people (drag to Applications)
       # Six viewers in one app (as six of its windows): every one gets and shows the picture
+      # The chat in a real window: it watches a room and writes; its message has to come back as its
+      # own, the sharer's answer has to show in the panel; the window is saved to look at
+      - name: "UI: the chat (a window watches and talks)"
+        run: |
+          PORT=8097 HOST_PASSWORD=ci DIRECT_PORT=3497 node server/server.js &
+          sleep 3
+          build-arm64/ss-cli host --server http://127.0.0.1:8097 --password ci --h264 native/tests/data/test.h264 --seconds 40 --name "Tamás" --chat-reply "Szia, {name}!" > chat-host.log &
+          for i in $(seq 1 80); do grep -q '^CODE' chat-host.log 2>/dev/null && break; sleep 0.25; done
+          code=$(grep '^CODE' chat-host.log | awk '{print $2}')
+          "dist/Screen Share.app/Contents/MacOS/Screen Share" --ui-chat http://127.0.0.1:8097 "$code" "$PWD/mac-chat.png" mac-chat.log || { cat mac-chat.log; grep '^CHAT' chat-host.log; exit 1; }
+          cat mac-chat.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshare-ui-mac
+          path: mac-chat.png
+          if-no-files-found: warn
       - name: "Six viewers in one app"
         run: |
           PORT=8094 HOST_PASSWORD=ci DIRECT_PORT=3484 node server/server.js &

@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iterator>
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -492,7 +493,8 @@ static NSColor* latencyColor(double ms) {
   std::string state = v["state"].str("");
   bool connected = state == "connected";
   setDotColor(_dot, connected ? NSColor.systemGreenColor : state == "unsupported" ? NSColor.systemRedColor : state == "retrying" ? NSColor.systemOrangeColor : NSColor.tertiaryLabelColor);
-  _name.stringValue = [NSString stringWithFormat:@"Néző #%d", int(v["n"].num())];
+  std::string name = v["name"].str("");
+  _name.stringValue = name.empty() ? [NSString stringWithFormat:@"Néző #%d", int(v["n"].num())] : S(name);
   _sub.stringValue = connected                 ? [@"közvetlen mód · " stringByAppendingString:pathName(v["path"].str(""))]
                      : state == "unsupported" ? [@"nem tud nézni: " stringByAppendingString:S(v["whyText"].str(""))]
                      : state == "retrying"    ? [@"kapcsolat újra… " stringByAppendingString:S(v["whyText"].str(""))]
@@ -514,6 +516,214 @@ static NSColor* latencyColor(double ms) {
     }
   }
   _stats.attributedStringValue = s;
+}
+@end
+
+/* ------------------------------------------------ the room's chat */
+
+/** A colour of its own for each writer – the website's and the Windows app's: hsl(hash, 80%, 74%). */
+static NSColor* nameColor(const std::string& from) {
+  uint32_t h = 0;
+  for (unsigned char ch : from) h = h * 31 + ch;
+  h *= 2654435761u; // (the golden angle apart: viewers v7 and v8 far apart)
+  double hue = std::floor(double(h) / 4294967296.0 * 360.0) / 60.0, l = 0.74, c = (1 - std::fabs(2 * l - 1)) * 0.8;
+  double x = c * (1 - std::fabs(std::fmod(hue, 2.0) - 1)), m = l - c / 2;
+  const double v[6][3] = {{c, x, 0}, {x, c, 0}, {0, c, x}, {0, x, c}, {x, 0, c}, {c, 0, x}};
+  const double* p = v[std::min(5, int(hue))];
+  return [NSColor colorWithSRGBRed:p[0] + m green:p[1] + m blue:p[2] + m alpha:1];
+}
+
+static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 green:0x4F / 255.0 blue:0x9F / 255.0 alpha:1]; }
+
+/** The chat (sharing and watching): the messages – the newest at the bottom, selectable –, the box to
+ *  write in with a send button, the name under it, a note (too fast, not sent…). */
+@interface SSChatView : NSView <NSTextFieldDelegate>
+@property(nonatomic, copy) void (^onSend)(NSString* text);
+@property(nonatomic, copy) void (^onName)(NSString* name);
+- (instancetype)initWithEmpty:(NSString*)empty;
+- (void)history:(const Json&)list;
+- (void)add:(const Json&)m;
+- (void)note:(NSString*)text lasting:(BOOL)lasting;
+- (void)serverName:(NSString*)name;
+- (void)restore:(NSString*)text;
+- (void)clear;
+- (void)focusInput;
+- (NSString*)shown;
+- (void)typeAndSend:(NSString*)text;
+@end
+
+@implementation SSChatView {
+  NSScrollView* _scroll;
+  NSTextView* _list;
+  NSTextField *_input, *_name, *_note, *_empty;
+  std::deque<NSUInteger> _lengths; // each message's characters in the list (the oldest go after 200)
+  NSTimer* _noteTimer;
+  NSDateFormatter* _clock;
+}
+
+- (instancetype)initWithEmpty:(NSString*)empty {
+  if (!(self = [super initWithFrame:NSZeroRect])) return nil;
+  self.translatesAutoresizingMaskIntoConstraints = NO;
+  _clock = [NSDateFormatter new];
+  _clock.dateFormat = @"HH:mm";
+  _scroll = [NSScrollView new];
+  _scroll.translatesAutoresizingMaskIntoConstraints = NO;
+  _scroll.drawsBackground = NO;
+  _scroll.hasVerticalScroller = YES;
+  _scroll.autohidesScrollers = YES;
+  _list = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 300, 100)];
+  _list.editable = NO;
+  _list.selectable = YES;
+  _list.drawsBackground = NO;
+  _list.textContainerInset = NSMakeSize(8, 8);
+  _list.verticallyResizable = YES;
+  _list.horizontallyResizable = NO;
+  _list.autoresizingMask = NSViewWidthSizable;
+  _list.textContainer.widthTracksTextView = YES;
+  _scroll.documentView = _list;
+  _empty = label(empty, 12.5, NSFontWeightRegular, NSColor.secondaryLabelColor, 250);
+  _empty.alignment = NSTextAlignmentCenter;
+  _input = [NSTextField new];
+  _input.placeholderString = @"Üzenet…";
+  _input.bezelStyle = NSTextFieldRoundedBezel;
+  _input.delegate = self;
+  _input.target = self;
+  _input.action = @selector(send);
+  NSButton* send = iconButton(@"paperplane.fill", self, @selector(send));
+  send.toolTip = @"Küldés (Enter)";
+  NSStackView* inputRow = hstack(@[ _input, send ], 8);
+  _name = [NSTextField new];
+  _name.placeholderString = @"a neved a chatben";
+  _name.bezelStyle = NSTextFieldRoundedBezel;
+  _name.controlSize = NSControlSizeSmall;
+  _name.font = [NSFont systemFontOfSize:12];
+  _name.delegate = self;
+  _name.stringValue = [NSUserDefaults.standardUserDefaults stringForKey:@"chatName"] ?: @"";
+  NSStackView* nameRow = hstack(@[ label(@"Neved", 12, NSFontWeightRegular, NSColor.secondaryLabelColor), _name ], 8);
+  _note = label(@"", 11.5, NSFontWeightRegular, NSColor.systemOrangeColor, 260);
+  _note.hidden = YES;
+  NSStackView* bottom = vstack(@[ inputRow, nameRow, _note ], 8);
+  bottom.alignment = NSLayoutAttributeLeading;
+  stretch(inputRow, bottom);
+  stretch(nameRow, bottom);
+  for (NSView* v in @[ _scroll, _empty, bottom ]) [self addSubview:v];
+  [NSLayoutConstraint activateConstraints:@[
+    [_scroll.topAnchor constraintEqualToAnchor:self.topAnchor], [_scroll.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+    [_scroll.trailingAnchor constraintEqualToAnchor:self.trailingAnchor], [_scroll.bottomAnchor constraintEqualToAnchor:bottom.topAnchor constant:-10],
+    [bottom.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12], [bottom.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
+    [bottom.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12], [_empty.centerXAnchor constraintEqualToAnchor:_scroll.centerXAnchor],
+    [_empty.centerYAnchor constraintEqualToAnchor:_scroll.centerYAnchor]
+  ]];
+  return self;
+}
+
+- (void)send {
+  NSString* text = [_input.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (!text.length) return;
+  _input.stringValue = @"";
+  if (self.onSend) self.onSend(text);
+}
+
+- (void)typeAndSend:(NSString*)text { // (CI)
+  _input.stringValue = text;
+  [self send];
+}
+
+/** Esc leaves the boxes (back to the picture's keys); the name is kept when it is left. */
+- (BOOL)control:(NSControl*)c textView:(NSTextView*)tv doCommandBySelector:(SEL)command {
+  if (command == @selector(cancelOperation:)) {
+    [self.window makeFirstResponder:self.window.contentView];
+    return YES;
+  }
+  return NO;
+}
+
+- (void)controlTextDidEndEditing:(NSNotification*)n {
+  if (n.object != _name) return;
+  NSString* name = [_name.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  if (name.length > 24) name = [name substringToIndex:24];
+  _name.stringValue = name;
+  NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
+  if ([name isEqualToString:[ud stringForKey:@"chatName"] ?: @""]) return;
+  [ud setObject:name forKey:@"chatName"];
+  if (self.onName) self.onName(name);
+}
+
+- (NSAttributedString*)line:(const Json&)m first:(BOOL)first {
+  std::string from = m["from"].str();
+  bool host = m["host"].b(false), mine = m["mine"].b(false);
+  NSMutableParagraphStyle* para = [NSMutableParagraphStyle new];
+  para.paragraphSpacingBefore = first ? 0 : 9;
+  NSMutableAttributedString* s = [NSMutableAttributedString new];
+  auto add = [&](NSString* text, NSDictionary* attrs) {
+    NSMutableDictionary* a = [attrs mutableCopy];
+    a[NSParagraphStyleAttributeName] = para;
+    [s appendAttributedString:[[NSAttributedString alloc] initWithString:text attributes:a]];
+  };
+  if (!first) add(@"\n", @{NSFontAttributeName : [NSFont systemFontOfSize:4]});
+  add(S(m["name"].str()), @{NSFontAttributeName : [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold], NSForegroundColorAttributeName : host ? chatAccent() : nameColor(from)});
+  NSString* tag = host ? (mine ? @"  megosztó (te)" : @"  megosztó") : mine ? @"  (te)" : @"";
+  NSDictionary* small = @{NSFontAttributeName : [NSFont systemFontOfSize:10.5], NSForegroundColorAttributeName : NSColor.tertiaryLabelColor};
+  add(tag, small);
+  if (m["at"].isNumber()) add([@"  " stringByAppendingString:[_clock stringFromDate:[NSDate dateWithTimeIntervalSince1970:m["at"].num() / 1000]]], small);
+  add([@"\n" stringByAppendingString:S(m["text"].str())],
+      @{NSFontAttributeName : [NSFont systemFontOfSize:13], NSForegroundColorAttributeName : mine ? NSColor.labelColor : [NSColor.labelColor colorWithAlphaComponent:0.88]});
+  return s;
+}
+
+- (void)history:(const Json&)list {
+  [self clear];
+  for (const Json& m : list.items()) [self add:m];
+}
+
+- (void)add:(const Json&)m {
+  BOOL atEnd = NSMaxY(_scroll.documentVisibleRect) >= NSMaxY(_list.bounds) - 40;
+  NSAttributedString* s = [self line:m first:_lengths.empty()];
+  [_list.textStorage appendAttributedString:s];
+  _lengths.push_back(s.length);
+  if (_lengths.size() > 200) { // the oldest go (the next one's newline with it)
+    NSUInteger cut = _lengths.front() + (_lengths.size() > 1 ? 1 : 0);
+    _lengths.pop_front();
+    if (!_lengths.empty()) _lengths.front() -= 1;
+    [_list.textStorage deleteCharactersInRange:NSMakeRange(0, std::min<NSUInteger>(cut, _list.textStorage.length))];
+  }
+  _empty.hidden = YES;
+  if (atEnd || m["mine"].b(false)) [_list scrollToEndOfDocument:nil];
+}
+
+- (void)note:(NSString*)text lasting:(BOOL)lasting {
+  [_noteTimer invalidate];
+  _noteTimer = nil;
+  _note.stringValue = text ?: @"";
+  _note.hidden = text.length == 0;
+  if (!lasting && text.length) {
+    __weak SSChatView* weak = self;
+    _noteTimer = [NSTimer scheduledTimerWithTimeInterval:6 repeats:NO block:^(NSTimer*) { [weak note:nil lasting:NO]; }];
+  }
+}
+
+- (void)serverName:(NSString*)name {
+  _name.placeholderString = name.length ? name : @"a neved a chatben";
+}
+
+- (void)restore:(NSString*)text {
+  if (text.length && !_input.stringValue.length) _input.stringValue = text;
+}
+
+- (void)clear {
+  [_list.textStorage setAttributedString:[NSAttributedString new]];
+  _lengths.clear();
+  _empty.hidden = NO;
+  [self note:nil lasting:NO];
+  _name.stringValue = [NSUserDefaults.standardUserDefaults stringForKey:@"chatName"] ?: @""; // (maybe changed in another window)
+}
+
+- (void)focusInput {
+  [self.window makeFirstResponder:_input];
+}
+
+- (NSString*)shown { // (CI: what the list shows)
+  return _list.textStorage.string;
 }
 @end
 
@@ -540,6 +750,10 @@ static NSColor* latencyColor(double ms) {
 - (void)ask:(NSString*)title text:(NSString*)text ok:(NSString*)ok cancel:(NSString*)cancel danger:(BOOL)danger action:(void (^)(void))action;
 - (void)showUpdate:(NSString*)version;
 - (void)updateBusy:(BOOL)busy failed:(BOOL)failed;
+// CI (--ui-chat): watch on this server, say something in the chat, what the chat shows
+- (void)testWatch:(const std::string&)code server:(const std::string&)server;
+- (void)testSay:(NSString*)text;
+- (NSString*)chatShown;
 @end
 
 @implementation SSWin {
@@ -576,6 +790,17 @@ static NSColor* latencyColor(double ms) {
   NSSlider* _volume;
   NSButton* _muteButton;
   double _lastMove;
+  // the room's chat: the sharer's box, the viewer's panel at the right of the picture (in full screen
+  // too); closed, a count on its button and the newest message over the picture for a few seconds
+  SSChatView *_hostChat, *_viewChat;
+  NSView *_chatPanel, *_chatBadge, *_pop;
+  NSTextField *_chatBadgeText, *_popText;
+  NSLayoutConstraint* _chatShift;
+  bool _chatOpen;
+  int _unread;
+  NSString* _chatPending;
+  NSTimer* _popTimer;
+  std::string _server; // (CI: a local one)
 
   std::unique_ptr<Engine> _engine;
   std::unique_ptr<MacHost> _hostPipe;
@@ -649,8 +874,10 @@ static NSColor* latencyColor(double ms) {
 - (NSEvent*)key:(NSEvent*)e {
   if (e.modifierFlags & NSEventModifierFlagCommand) return e;
   if (e.window != _window || _window.attachedSheet || _current != _viewer) return e;
+  if ([_window.firstResponder isKindOfClass:NSText.class]) return e; // (typing in the chat)
   NSString* k = e.charactersIgnoringModifiers.lowercaseString;
-  if ([k isEqualToString:@"f"]) [_window toggleFullScreen:nil];
+  if ([k isEqualToString:@"c"]) [self setChatOpen:!_chatOpen focus:YES];
+  else if ([k isEqualToString:@"f"]) [_window toggleFullScreen:nil];
   else if ([k isEqualToString:@"s"]) {
     _stats = !_stats;
     [self tick];
@@ -983,7 +1210,18 @@ static NSColor* latencyColor(double ms) {
   NSButton* stop = button(@"Megosztás vége", nil, self, @selector(askStop));
   stop.hasDestructiveAction = YES;
   NSStackView* buttons = hstack(@[ _pauseButton, stop ], 10);
-  _hostContent = vstack(@[ _livePill, caption, _roomCode, _link, _copyButton, status, viewersHead, _viewersGroup, buttons ], 4);
+  // the chat with the viewers
+  NSStackView* chatHead = hstack(@[ label(@"Chat", 13, NSFontWeightSemibold, NSColor.labelColor), spacer() ], 8);
+  chatHead.edgeInsets = NSEdgeInsetsMake(0, 4, 0, 4);
+  _hostChat = [self chatViewWithEmpty:@"Itt beszélgethetsz a nézőkkel – ők is írhatnak."];
+  [_hostChat.heightAnchor constraintEqualToConstant:290].active = YES;
+  SSGroup* chatGroup = [SSGroup new];
+  [chatGroup setRows:@[ _hostChat ]];
+  _hostContent = vstack(@[ _livePill, caption, _roomCode, _link, _copyButton, status, chatHead, chatGroup, viewersHead, _viewersGroup, buttons ], 4);
+  [_hostContent setCustomSpacing:7 afterView:chatHead];
+  [_hostContent setCustomSpacing:22 afterView:chatGroup];
+  stretch(chatHead, _hostContent);
+  stretch(chatGroup, _hostContent);
   [_hostContent setCustomSpacing:14 afterView:_livePill];
   [_hostContent setCustomSpacing:0 afterView:caption];
   [_hostContent setCustomSpacing:14 afterView:_link];
@@ -1007,7 +1245,39 @@ static NSColor* latencyColor(double ms) {
   _video.onDoubleClick = ^{ [weak fullScreen]; };
   _video.onMouseMove = ^{ [weak moved]; };
   [_viewer addSubview:_video];
-  pin(_video, _viewer);
+  _video.translatesAutoresizingMaskIntoConstraints = NO;
+  // the chat panel at the right (pushed out of the window when closed); the picture beside it
+  _viewChat = [self chatViewWithEmpty:@"Még senki nem írt. Köszönj a többieknek!"];
+  NSView* panel = [NSView new];
+  panel.translatesAutoresizingMaskIntoConstraints = NO;
+  panel.wantsLayer = YES;
+  panel.layer.backgroundColor = [NSColor colorWithWhite:0.115 alpha:1].CGColor;
+  NSView* edge = [NSView new];
+  edge.translatesAutoresizingMaskIntoConstraints = NO;
+  edge.wantsLayer = YES;
+  edge.layer.backgroundColor = [NSColor colorWithWhite:1 alpha:0.09].CGColor;
+  NSButton* close = iconButton(@"xmark", self, @selector(closeChat));
+  close.toolTip = @"Chat bezárása (C)";
+  NSStackView* head = hstack(@[ label(@"Chat", 13, NSFontWeightSemibold, NSColor.labelColor), spacer(), close ], 8);
+  head.edgeInsets = NSEdgeInsetsMake(0, 16, 0, 10);
+  for (NSView* v in @[ edge, head, _viewChat ]) [panel addSubview:v];
+  [_viewer addSubview:panel];
+  _chatPanel = panel;
+  _chatOpen = ![NSUserDefaults.standardUserDefaults objectForKey:@"chatOpen"] || [NSUserDefaults.standardUserDefaults boolForKey:@"chatOpen"];
+  _chatShift = [panel.trailingAnchor constraintEqualToAnchor:_viewer.trailingAnchor constant:_chatOpen ? 0 : 300];
+  panel.hidden = !_chatOpen;
+  [NSLayoutConstraint activateConstraints:@[
+    [_video.leadingAnchor constraintEqualToAnchor:_viewer.leadingAnchor], [_video.topAnchor constraintEqualToAnchor:_viewer.topAnchor],
+    [_video.bottomAnchor constraintEqualToAnchor:_viewer.bottomAnchor], [_video.trailingAnchor constraintEqualToAnchor:panel.leadingAnchor],
+    [panel.topAnchor constraintEqualToAnchor:_viewer.topAnchor], [panel.bottomAnchor constraintEqualToAnchor:_viewer.bottomAnchor],
+    [panel.widthAnchor constraintEqualToConstant:300], _chatShift,
+    [edge.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor], [edge.topAnchor constraintEqualToAnchor:panel.topAnchor],
+    [edge.bottomAnchor constraintEqualToAnchor:panel.bottomAnchor], [edge.widthAnchor constraintEqualToConstant:1],
+    [head.topAnchor constraintEqualToAnchor:panel.topAnchor constant:30], [head.heightAnchor constraintEqualToConstant:34],
+    [head.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor], [head.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor],
+    [_viewChat.topAnchor constraintEqualToAnchor:head.bottomAnchor constant:4], [_viewChat.bottomAnchor constraintEqualToAnchor:panel.bottomAnchor],
+    [_viewChat.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor], [_viewChat.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor]
+  ]];
   // while there is no picture: a spinner and what is happening
   _overlaySpinner = [NSProgressIndicator new];
   _overlaySpinner.style = NSProgressIndicatorStyleSpinning;
@@ -1018,7 +1288,7 @@ static NSColor* latencyColor(double ms) {
   _overlay = vstack(@[ _overlaySpinner, _overlayText ], 14);
   [_viewer addSubview:_overlay];
   [NSLayoutConstraint activateConstraints:@[
-    [_overlay.centerXAnchor constraintEqualToAnchor:_viewer.centerXAnchor], [_overlay.centerYAnchor constraintEqualToAnchor:_viewer.centerYAnchor]
+    [_overlay.centerXAnchor constraintEqualToAnchor:_video.centerXAnchor], [_overlay.centerYAnchor constraintEqualToAnchor:_viewer.centerYAnchor]
   ]];
   // the controls: a floating glass capsule at the bottom, it fades away while the mouse rests
   _viewDot = makeDot(NSColor.systemOrangeColor);
@@ -1037,7 +1307,35 @@ static NSColor* latencyColor(double ms) {
   more.toolTip = @"Új ablak – még egy szoba nézése (⌘N)";
   NSButton* leave = button(@"Kilépés", nil, self, @selector(stopToHome));
   leave.hasDestructiveAction = YES;
-  NSStackView* row = hstack(@[ _viewDot, _viewTitle, _viewInfo, more, _muteButton, _volume, full, leave ], 10);
+  // the chat's button, with the count of what came while the panel was closed
+  NSButton* chat = iconButton(@"bubble.left.and.bubble.right", self, @selector(toggleChat));
+  chat.toolTip = @"Chat (C)";
+  NSView* chatBox = [NSView new];
+  chatBox.translatesAutoresizingMaskIntoConstraints = NO;
+  [chatBox addSubview:chat];
+  pin(chat, chatBox);
+  _chatBadgeText = label(@"", 10, NSFontWeightBold, NSColor.whiteColor);
+  _chatBadgeText.alignment = NSTextAlignmentCenter;
+  _chatBadge = [NSView new];
+  _chatBadge.translatesAutoresizingMaskIntoConstraints = NO;
+  _chatBadge.wantsLayer = YES;
+  _chatBadge.layer.backgroundColor = chatAccent().CGColor;
+  _chatBadge.layer.cornerRadius = 8;
+  _chatBadge.hidden = YES;
+  [_chatBadge addSubview:_chatBadgeText];
+  [chatBox addSubview:_chatBadge];
+  [NSLayoutConstraint activateConstraints:@[
+    [_chatBadge.heightAnchor constraintEqualToConstant:16], [_chatBadge.widthAnchor constraintGreaterThanOrEqualToConstant:16],
+    [_chatBadge.widthAnchor constraintGreaterThanOrEqualToAnchor:_chatBadgeText.widthAnchor constant:8],
+    [_chatBadge.centerXAnchor constraintEqualToAnchor:chat.trailingAnchor constant:-2], [_chatBadge.centerYAnchor constraintEqualToAnchor:chat.topAnchor constant:3],
+    [_chatBadgeText.centerXAnchor constraintEqualToAnchor:_chatBadge.centerXAnchor], [_chatBadgeText.centerYAnchor constraintEqualToAnchor:_chatBadge.centerYAnchor]
+  ]];
+  NSStackView* row = hstack(@[ _viewDot, _viewTitle, _viewInfo, chatBox, more, _muteButton, _volume, full, leave ], 10);
+  // a narrow picture (the chat beside it): the less needed ones step aside first
+  [row setVisibilityPriority:600 forView:_viewInfo];
+  [row setVisibilityPriority:700 forView:_volume];
+  [row setVisibilityPriority:800 forView:more];
+  [row setVisibilityPriority:900 forView:_viewTitle];
   [row setCustomSpacing:14 afterView:_viewInfo];
   [row setCustomSpacing:4 afterView:_muteButton];
   [row setCustomSpacing:14 afterView:full];
@@ -1045,10 +1343,136 @@ static NSColor* latencyColor(double ms) {
   _bar = glassCapsule(row, 25);
   [_viewer addSubview:_bar];
   [NSLayoutConstraint activateConstraints:@[
-    [_bar.heightAnchor constraintEqualToConstant:50], [_bar.centerXAnchor constraintEqualToAnchor:_viewer.centerXAnchor],
+    [_bar.heightAnchor constraintEqualToConstant:50], [_bar.centerXAnchor constraintEqualToAnchor:_video.centerXAnchor],
     [_bar.bottomAnchor constraintEqualToAnchor:_viewer.bottomAnchor constant:-22],
-    [_bar.widthAnchor constraintLessThanOrEqualToAnchor:_viewer.widthAnchor constant:-40]
+    [_bar.widthAnchor constraintLessThanOrEqualToAnchor:_video.widthAnchor constant:-40]
   ]];
+  // with the panel closed, the newest message over the picture for a few seconds (a click opens the chat)
+  _popText = label(@"", 13, NSFontWeightRegular, NSColor.labelColor, 400);
+  NSStackView* popRow = hstack(@[ _popText ], 0);
+  popRow.edgeInsets = NSEdgeInsetsMake(9, 14, 9, 14);
+  _pop = glassCapsule(popRow, 14);
+  _pop.alphaValue = 0;
+  [_pop addGestureRecognizer:[[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(openChat)]];
+  [_viewer addSubview:_pop];
+  [NSLayoutConstraint activateConstraints:@[
+    [_pop.leadingAnchor constraintEqualToAnchor:_video.leadingAnchor constant:22], [_pop.bottomAnchor constraintEqualToAnchor:_bar.topAnchor constant:-12],
+    [_pop.widthAnchor constraintLessThanOrEqualToConstant:440]
+  ]];
+}
+
+/* ---- the room's chat */
+
+- (SSChatView*)chatViewWithEmpty:(NSString*)empty {
+  SSChatView* chat = [[SSChatView alloc] initWithEmpty:empty];
+  __weak SSWin* weak = self;
+  chat.onSend = ^(NSString* text) { [weak sendChat:text]; };
+  chat.onName = ^(NSString* name) { [weak nameChanged:name]; };
+  return chat;
+}
+
+/** The chat of what this window shows now. */
+- (SSChatView*)chat {
+  return _current == _viewer ? _viewChat : _hostChat;
+}
+
+- (void)sendChat:(NSString*)text {
+  if (!_engine) {
+    [[self chat] restore:text];
+    [[self chat] note:@"Nem vagy szobában – az üzenet nem ment el." lasting:NO];
+    return;
+  }
+  _chatPending = text; // (back in the box if it could not go)
+  _engine->sendChat(U(text));
+}
+
+- (void)nameChanged:(NSString*)name {
+  if (_engine && name.length) _engine->setName(U(name));
+}
+
+- (void)setChatOpen:(bool)open focus:(bool)focus {
+  _chatOpen = open;
+  [NSUserDefaults.standardUserDefaults setBool:open forKey:@"chatOpen"];
+  if (open) {
+    _unread = 0;
+    [self updateUnread];
+    [self hidePop];
+    _chatPanel.hidden = NO;
+  }
+  NSView* panel = _chatPanel;
+  [NSAnimationContext
+      runAnimationGroup:^(NSAnimationContext* ctx) {
+        ctx.duration = 0.22;
+        ctx.allowsImplicitAnimation = YES;
+        self->_chatShift.animator.constant = open ? 0 : 300;
+        [self->_viewer layoutSubtreeIfNeeded];
+      }
+      completionHandler:^{
+        if (!self->_chatOpen) panel.hidden = YES;
+      }];
+  if (open && focus) [_viewChat focusInput];
+  else if (!open) [_window makeFirstResponder:_window.contentView];
+}
+
+- (void)toggleChat {
+  [self setChatOpen:!_chatOpen focus:YES];
+}
+
+- (void)openChat {
+  [self setChatOpen:true focus:YES];
+}
+
+- (void)closeChat {
+  [self setChatOpen:false focus:NO];
+}
+
+- (void)updateUnread {
+  _chatBadge.hidden = _unread == 0 || _chatOpen;
+  _chatBadgeText.stringValue = _unread > 99 ? @"99+" : [NSString stringWithFormat:@"%d", _unread];
+}
+
+- (void)pop:(const Json&)m {
+  NSMutableAttributedString* s = [NSMutableAttributedString new];
+  NSColor* color = m["host"].b(false) ? chatAccent() : nameColor(m["from"].str());
+  [s appendAttributedString:[[NSAttributedString alloc] initWithString:[S(m["name"].str()) stringByAppendingString:@": "]
+                                                            attributes:@{NSFontAttributeName : [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold], NSForegroundColorAttributeName : color}]];
+  [s appendAttributedString:[[NSAttributedString alloc] initWithString:S(m["text"].str())
+                                                            attributes:@{NSFontAttributeName : [NSFont systemFontOfSize:13], NSForegroundColorAttributeName : NSColor.labelColor}]];
+  _popText.attributedStringValue = s;
+  animateAlpha(_pop, 1, 0.15);
+  [_popTimer invalidate];
+  __weak SSWin* weak = self;
+  _popTimer = [NSTimer scheduledTimerWithTimeInterval:6 repeats:NO block:^(NSTimer*) { [weak hidePop]; }];
+}
+
+- (void)hidePop {
+  [_popTimer invalidate];
+  _popTimer = nil;
+  if (_pop.alphaValue > 0) animateAlpha(_pop, 0, 0.5);
+}
+
+- (void)testWatch:(const std::string&)code server:(const std::string&)server {
+  _server = server;
+  [self watch:code];
+}
+
+- (void)testSay:(NSString*)text {
+  [[self chat] typeAndSend:text];
+}
+
+- (NSString*)chatShown {
+  return [[self chat] shown];
+}
+
+/** A new room: its chat starts empty (what was said there comes from the server); our name goes with it. */
+- (void)startChat {
+  [_hostChat clear];
+  [_viewChat clear];
+  _unread = 0;
+  _chatPending = nil;
+  [self updateUnread];
+  [self hidePop];
+  if (_engine) _engine->setName(U([NSUserDefaults.standardUserDefaults stringForKey:@"chatName"] ?: @""));
 }
 
 - (void)moved {
@@ -1091,6 +1515,7 @@ static NSColor* latencyColor(double ms) {
 
 - (void)endSession {
   _session++;
+  [self hidePop];
   if (_player) _player->detach(); // its decoder thread calls the engine no more
   if (_hostPipe) _hostPipe->stop();
   _engine.reset();
@@ -1124,7 +1549,7 @@ static NSColor* latencyColor(double ms) {
   [self endSession];
   int session = ++_session;
   EngineConfig cfg;
-  cfg.server = kServer;
+  cfg.server = _server.empty() ? kServer : _server;
   cfg.webSocket = openMacWebSocket;
   cfg.encoderName = "VideoToolbox";
   EngineCallbacks cb = [self callbacks:session];
@@ -1157,6 +1582,7 @@ static NSColor* latencyColor(double ms) {
   _pauseButton.image = symbol(@"pause.fill", 13);
   _window.title = @"Megosztás";
   [self show:_host];
+  [self startChat];
   _engine->host(U(pw));
 }
 
@@ -1184,7 +1610,7 @@ static std::string parseCode(NSString* text) {
   [self endSession];
   int session = ++_session;
   EngineConfig cfg;
-  cfg.server = kServer;
+  cfg.server = _server.empty() ? kServer : _server;
   cfg.webSocket = openMacWebSocket;
   _player.reset(new MacPlayer(_video.layer));
   _audioOut.reset(new MacAudioOut());
@@ -1209,6 +1635,7 @@ static std::string parseCode(NSString* text) {
   _viewInfo.stringValue = @"";
   setDotColor(_viewDot, NSColor.systemOrangeColor);
   [self show:_viewer];
+  [self startChat];
   engine->join(code);
 }
 
@@ -1378,6 +1805,29 @@ static std::string parseCode(NSString* text) {
     if (!picture) _overlayText.stringValue = S(e["text"].str());
   } else if (type == "view-stats") {
     _viewStats = e;
+  } else if (type == "chat-history") {
+    [[self chat] history:e["list"]];
+    if (!e["supported"].b(true)) [[self chat] note:@"A szerver még nem tud chatet – frissíteni kell (sudo bash deploy/install.sh)." lasting:YES];
+  } else if (type == "chat") {
+    [[self chat] add:e];
+    if (e["mine"].b(false)) {
+      _chatPending = nil;
+    } else {
+      if (_current == _viewer && !_chatOpen) {
+        _unread++;
+        [self updateUnread];
+        [self pop:e];
+      }
+      if (!NSApp.active) [NSApp requestUserAttention:NSInformationalRequest]; // (the Dock icon bounces once)
+    }
+  } else if (type == "chat-limit") {
+    [[self chat] note:@"Lassabban – túl sok üzenet egyszerre. Pár másodperc múlva mehet." lasting:NO];
+  } else if (type == "chat-offline") {
+    [[self chat] restore:_chatPending];
+    _chatPending = nil;
+    [[self chat] note:@"Nincs kapcsolat a szobával – az üzenet nem ment el." lasting:NO];
+  } else if (type == "name") {
+    [[self chat] serverName:S(e["name"].str())];
   }
 }
 
@@ -1890,10 +2340,47 @@ static int smoke(NSArray<NSString*>* args) {
   return 0;
 }
 
+/** --ui-chat <server> <code> <png> <log> (CI): a window of the app watches a room and says something in
+ *  its chat – it has to come back as ours, and the sharer's answer has to show there; the window is saved. */
+static int uiChat(NSArray<NSString*>* args) {
+  NSApplication* app = NSApplication.sharedApplication;
+  app.activationPolicy = NSApplicationActivationPolicyRegular;
+  [app finishLaunching];
+  auto runFor = [](double s) {
+    NSDate* until = [NSDate dateWithTimeIntervalSinceNow:s];
+    while ([until timeIntervalSinceNow] > 0) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+  };
+  SSWin* w = [[SSWin alloc] initFrom:nil watch:YES];
+  [w testWatch:U(args[2]) server:U(args[1])];
+  runFor(4); // (in the room, the picture coming)
+  NSString* said = @"Szia a Mac appból! 👋";
+  [w testSay:said];
+  bool came = false, answered = false;
+  for (int i = 0; i < 100 && !(came && answered); i++) {
+    runFor(0.1);
+    NSString* shown = [w chatShown];
+    came = [shown containsString:said];
+    answered = [shown containsString:@"Szia, "]; // (the sharer answers everyone: "Szia, <name>!")
+  }
+  runFor(0.5);
+  NSView* v = w.window.contentView;
+  NSBitmapImageRep* rep = [v bitmapImageRepForCachingDisplayInRect:v.bounds];
+  [v cacheDisplayInRect:v.bounds toBitmapImageRep:rep];
+  [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:args[3] atomically:YES];
+  FILE* log = fopen(args[4].fileSystemRepresentation, "w");
+  if (log) {
+    fprintf(log, "RESULT {\"came\":%s,\"answered\":%s}\n%s\n", came ? "true" : "false", answered ? "true" : "false", [w chatShown].UTF8String);
+    fclose(log);
+  }
+  [w endSession];
+  return came && answered ? 0 : 1;
+}
+
 int main(int argc, const char* argv[]) {
   @autoreleasepool {
     netInit();
     NSArray<NSString*>* args = NSProcessInfo.processInfo.arguments;
+    if (args.count == 6 && [args[1] isEqualToString:@"--ui-chat"]) return uiChat(args);
     if (args.count == 6 && ([args[1] isEqualToString:@"--smoke-host"] || [args[1] isEqualToString:@"--smoke-view"])) return smoke(args);
     if (args.count == 4 && [args[1] isEqualToString:@"--ws-bench"]) { // CI: round trips through this WebSocket
       FILE* log = fopen(args[3].fileSystemRepresentation, "w");
