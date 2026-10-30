@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -211,7 +212,7 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
     }
     freeaddrinfo(res);
     int one = 1;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
+    if (!std::getenv("SS_NAGLE")) setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one); // (tests: SS_NAGLE=1, as a control)
     sock_ = s;
     {
       std::lock_guard<std::mutex> lock(mu_);

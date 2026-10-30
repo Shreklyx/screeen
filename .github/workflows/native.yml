@@ -275,12 +275,21 @@ jobs:
       # back shows here as long round trips for the big messages.
       - name: "WebSocket round trips: WinHTTP and ours"
         shell: bash
+        timeout-minutes: 3
         run: |
           node -e "const {WebSocketServer}=require('ws'); const s=new WebSocketServer({port:8095}); s.on('connection',w=>w.on('message',(d,b)=>w.send(d,{binary:b})));" &
           sleep 2
           build/windows/ScreenShare.exe --ws-bench ws://127.0.0.1:8095 bench-app.log || true
           echo "WinHTTP: $(cat bench-app.log)"
           echo "ours:    $(build/ss-cli.exe ws-bench --url ws://127.0.0.1:8095)"
+          # the same through a server that acknowledges late: a client with Nagle's algorithm on waits for
+          # that (~200 ms) at the end of a message – ours with it on, as a control, shows what that looks like
+          build/ss-cli.exe ws-echo --port 8195 --slow-acks &
+          sleep 1
+          build/windows/ScreenShare.exe --ws-bench ws://127.0.0.1:8195 bench-late.log || true
+          echo "WinHTTP, late ACKs:          $(cat bench-late.log)"
+          echo "ours, late ACKs:             $(build/ss-cli.exe ws-bench --url ws://127.0.0.1:8195)"
+          echo "ours + Nagle, late ACKs:     $(SS_NAGLE=1 build/ss-cli.exe ws-bench --url ws://127.0.0.1:8195)"
       - name: Installer
         shell: bash
         run: |
@@ -556,6 +565,7 @@ jobs:
             if (!(r.viewers && r.viewers.length === 6 && r.fewestReceived > 100 && r.slowestFps > 10)) { console.error('not every viewer got and showed the picture'); process.exit(1); }
           "
       - name: "WebSocket round trips: NSURLSession and ours"
+        timeout-minutes: 3
         run: |
           node -e "const {WebSocketServer}=require('ws'); const s=new WebSocketServer({port:8095}); s.on('connection',w=>w.on('message',(d,b)=>w.send(d,{binary:b})));" &
           sleep 2

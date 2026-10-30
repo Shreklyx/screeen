@@ -17,4 +17,11 @@ namespace ss {
  *  TCP socket is set: is Nagle's algorithm off?). */
 Json wsBench(const WebSocketFactory& open, const std::string& url, int count, const std::function<Json()>& socket = nullptr);
 
+/** An echo server for wsBench on 127.0.0.1:port, a client at a time each on a thread, until the process
+ *  ends. slowAcks (Windows): its TCP acknowledges only every 255 segments or when the delayed-ACK timer
+ *  runs out (~200 ms) – a client that holds back a message's end until what it sent before is
+ *  acknowledged (Nagle's algorithm) then shows ~200 ms round trips, one without it does not.
+ *  False when the port cannot be had. */
+bool wsEchoServe(uint16_t port, bool slowAcks);
+
 }  // namespace ss

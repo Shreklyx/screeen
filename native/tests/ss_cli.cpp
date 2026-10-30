@@ -6,7 +6,9 @@
 //   the room's chat, both: [--name NAME] [--chat TEXT (once in the room)] [--chat-reply TEXT ({name}: who wrote)]
 //   host: [--resume CODE:TOKEN (take that room back)] [--keep (leave the room open at the end, as an app quitting)]
 //         [--kbps N (frames padded to that bitrate)] [--relay] [--tcp]; view: [--tcp] [--no-acks (frames not confirmed)]
-//   ss-cli ws-bench --url ws://127.0.0.1:8095 [--count 240]   (round trips through an echo server)
+//   ss-cli ws-bench --url ws://127.0.0.1:8095 [--count 240]   (round trips through an echo server; SS_NAGLE=1:
+//                                                             with Nagle's algorithm on, as a control)
+//   ss-cli ws-echo --port 8195 [--slow-acks]                   (that echo server, acknowledging late on Windows)
 //
 // Prints the engine's events as JSON lines; "host" prints "CODE <code>" and "TOKEN <token>" once the room is open,
 // "view" ends with "RESULT {…}" (frames, keyframes, bytes, latency); chat messages as "CHAT {…}".
@@ -228,5 +230,6 @@ int main(int argc, char** argv) {
     line("BENCH " + wsBench(openPlainWebSocket, arg(argc, argv, "--url"), std::atoi(arg(argc, argv, "--count", "240").c_str())).dump());
     return 0;
   }
+  if (mode == "ws-echo") return wsEchoServe(uint16_t(std::atoi(arg(argc, argv, "--port", "8195").c_str())), flag(argc, argv, "--slow-acks")) ? 0 : 1;
   return 2;
 }
