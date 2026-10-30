@@ -2365,7 +2365,9 @@ static void chatLog(NSString* text) {
 }
 
 static int uiChat(NSArray<NSString*>* args) {
-  gChatLog = fopen(args[4].fileSystemRepresentation, "w");
+  // (args: the app, --ui-chat, then the server, the room, the picture's and the log's paths)
+  NSString *server = args[2], *code = args[3], *png = args[4];
+  gChatLog = fopen(args[5].fileSystemRepresentation, "w");
   NSSetUncaughtExceptionHandler([](NSException* e) { chatLog([NSString stringWithFormat:@"EXCEPTION %@: %@\n%@", e.name, e.reason, e.callStackSymbols]); });
   NSApplication* app = NSApplication.sharedApplication;
   app.activationPolicy = NSApplicationActivationPolicyRegular;
@@ -2376,8 +2378,8 @@ static int uiChat(NSArray<NSString*>* args) {
   };
   chatLog(@"window");
   SSWin* w = [[SSWin alloc] initFrom:nil watch:YES];
-  chatLog([NSString stringWithFormat:@"watching %@ on %@", args[2], args[1]]);
-  [w testWatch:U(args[2]) server:U(args[1])];
+  chatLog([NSString stringWithFormat:@"watching %@ on %@", code, server]);
+  [w testWatch:U(code) server:U(server)];
   double started = nowMs();
   for (int i = 0; i < 300 && ![w chatReady]; i++) runFor(0.05);
   chatLog([NSString stringWithFormat:@"in the room: %s after %.1f s; the chat shows: %@", [w chatReady] ? "yes" : "no", (nowMs() - started) / 1000, [w chatShown]]);
@@ -2398,7 +2400,7 @@ static int uiChat(NSArray<NSString*>* args) {
     NSView* v = [w chatPanel];
     NSBitmapImageRep* rep = [v bitmapImageRepForCachingDisplayInRect:v.bounds];
     [v cacheDisplayInRect:v.bounds toBitmapImageRep:rep];
-    [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:args[3] atomically:YES];
+    [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:png atomically:YES];
     chatLog(@"saved");
   } @catch (NSException* e) {
     chatLog([NSString stringWithFormat:@"not saved: %@", e.reason]);
