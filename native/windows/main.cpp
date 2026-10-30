@@ -218,6 +218,14 @@ struct App {
   int aboutHover = ID_NONE, aboutPressed = ID_NONE;
   bool aboutTimer = false, aboutTracking = false, paintingAbout = false;
 
+  // the room this window is in, kept in the registry (Rooms) while it is: after a crash, an update or
+  // the computer restarting the app goes back into it (see restoreRooms)
+  std::string savedCode, savedToken;
+  bool savedHost = false;
+  double savedAt = 0;
+  bool restoring = false; // this session goes back into a kept room (gone: home, with a note)
+  bool keepRooms = false; // the app goes away but its room stays (the server keeps it 10 minutes)
+
   bool shots = false;            // --ui-shot, --ui-watch (CI): no update check
   std::string server = kServer;  // (CI: a local server)
 };
@@ -273,6 +281,64 @@ std::wstring loadString(const wchar_t* name) {
 
 void saveString(const wchar_t* name, const std::wstring& v) {
   RegSetKeyValueW(HKEY_CURRENT_USER, kKey, name, REG_SZ, v.c_str(), DWORD((v.size() + 1) * sizeof(wchar_t)));
+}
+
+/* ---- the rooms this app is in: Rooms\<code> = "h|w;<process>;<time>;<token>" */
+
+const wchar_t* kRoomsKey = L"Software\\ScreenShare\\Rooms";
+const long long kRoomKeepS = 600; // the server keeps a room this long for its sharer
+
+struct SavedRoom {
+  std::string code, token;
+  bool host = false;
+  DWORD pid = 0;
+  long long at = 0;
+};
+
+void saveRoom(const std::string& code, bool host, const std::string& token) {
+  std::wstring v = std::wstring(host ? L"h;" : L"w;") + std::to_wstring(GetCurrentProcessId()) + L";" + std::to_wstring((long long)std::time(nullptr)) + L";" + widen(token);
+  RegSetKeyValueW(HKEY_CURRENT_USER, kRoomsKey, widen(code).c_str(), REG_SZ, v.c_str(), DWORD((v.size() + 1) * sizeof(wchar_t)));
+}
+
+void forgetRoom(const std::string& code) {
+  if (!code.empty()) RegDeleteKeyValueW(HKEY_CURRENT_USER, kRoomsKey, widen(code).c_str());
+}
+
+std::vector<SavedRoom> savedRooms() {
+  std::vector<SavedRoom> out;
+  HKEY key;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, kRoomsKey, 0, KEY_READ, &key) != ERROR_SUCCESS) return out;
+  for (DWORD i = 0;; i++) {
+    wchar_t name[64], data[256] = {};
+    DWORD nameLen = 64, dataLen = sizeof data - sizeof(wchar_t), type = 0;
+    if (RegEnumValueW(key, i, name, &nameLen, nullptr, &type, reinterpret_cast<BYTE*>(data), &dataLen) != ERROR_SUCCESS) break;
+    if (type != REG_SZ) continue;
+    std::string v = narrow(data);
+    SavedRoom r;
+    r.code = narrow(name);
+    size_t a = v.find(';'), b = a == std::string::npos ? a : v.find(';', a + 1), c = b == std::string::npos ? b : v.find(';', b + 1);
+    if (c == std::string::npos) continue;
+    r.host = v[0] == 'h';
+    r.pid = DWORD(std::strtoul(v.c_str() + a + 1, nullptr, 10));
+    r.at = std::strtoll(v.c_str() + b + 1, nullptr, 10);
+    r.token = v.substr(c + 1);
+    out.push_back(r);
+  }
+  RegCloseKey(key);
+  return out;
+}
+
+/** Is that process a window of this app, still running? */
+bool ourProcess(DWORD pid) {
+  if (pid == GetCurrentProcessId()) return true;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!h) return false;
+  wchar_t path[MAX_PATH], self[MAX_PATH];
+  DWORD n = MAX_PATH, code = 0;
+  bool ours = QueryFullProcessImageNameW(h, 0, path, &n) && GetModuleFileNameW(nullptr, self, MAX_PATH) && _wcsicmp(path, self) == 0 && GetExitCodeProcess(h, &code) &&
+              code == STILL_ACTIVE;
+  CloseHandle(h);
+  return ours;
 }
 
 /** The sharing password, encrypted for this Windows user (DPAPI). */
@@ -1287,13 +1353,15 @@ void openMenu(int id) {
 
 /* ------------------------------------------------ more windows: each its own process, a little offset */
 
-/** Another window (to watch one more room – on its Nézés tab): this program once more, near this window. */
-void newWindow(bool watch = true) {
+/** Another window (to watch one more room – on its Nézés tab): this program once more, near this window.
+ *  `restore`: that window goes back into this kept room. */
+void newWindow(bool watch = true, const std::string& restore = "") {
   wchar_t exe[MAX_PATH];
   if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return;
   RECT wr;
   GetWindowRect(g.wnd, &wr);
   std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --from " + std::to_wstring(wr.left) + L" " + std::to_wstring(wr.top) + (watch ? L" --watch" : L"");
+  if (!restore.empty()) cmd += L" --restore " + widen(restore);
   STARTUPINFOW si{};
   si.cb = sizeof si;
   PROCESS_INFORMATION pi{};
@@ -1458,6 +1526,25 @@ void commitName() {
   if (g.engine && !n.empty()) g.engine->setName(narrow(n.c_str()));
 }
 
+/** This window's room into the registry – and again now and then (how fresh it is says whether the
+ *  server still keeps it). */
+void rememberRoom(const std::string& code, bool host, const std::string& token) {
+  if (!g.savedCode.empty() && g.savedCode != code) forgetRoom(g.savedCode);
+  g.savedCode = code;
+  g.savedHost = host;
+  g.savedToken = token;
+  g.savedAt = nowMs();
+  saveRoom(code, host, token);
+}
+
+/** Done with the room (ended, left): the app does not go back into it. */
+void forgetSaved() {
+  forgetRoom(g.savedCode);
+  g.savedCode.clear();
+  g.savedToken.clear();
+  g.restoring = false;
+}
+
 /** A new room: its chat starts empty (what was said there comes from the server). */
 void resetChat() {
   g.chat.clear();
@@ -1492,9 +1579,11 @@ void setError(std::wstring& where, const std::wstring& text, const char* animKey
   relayout();
 }
 
-void startSharing() {
+/** Sharing; `resumeCode` / `resumeToken`: going back into that room (kept by the server for its sharer:
+ *  the same code and link – the token does, no password needed). */
+void startSharing(const std::string& resumeCode = "", const std::string& resumeToken = "") {
   std::wstring pw = getText(g.pass);
-  if (pw.empty()) {
+  if (pw.empty() && resumeCode.empty()) {
     setError(g.shareErr, L"Add meg a megosztási jelszót.", "shareErr");
     SetFocus(g.pass);
     return;
@@ -1542,7 +1631,7 @@ void startSharing() {
   resetChat();
   show(Screen::Hosting);
   g.engine->setName(narrow(loadString(L"ChatName").c_str()));
-  g.engine->host(narrow(pw.c_str()));
+  g.engine->host(narrow(pw.c_str()), resumeCode, resumeToken);
 }
 
 std::string parseCode(std::wstring s) {
@@ -1597,10 +1686,52 @@ void toggleFullscreen();
 
 void stopToHome(const std::wstring& message = L"") {
   if (g.fullscreen) toggleFullscreen();
+  forgetSaved();
   endSession();
   setTitle(L"");
   show(Screen::Home);
   if (!message.empty()) setError(g.joinErr, message, "joinErr");
+}
+
+/** Back into a kept room: sharing it again (with its token – the same code and link), or watching it. */
+void restoreInto(const SavedRoom& r) {
+  g.restoring = true;
+  g.savedCode = r.code; // (gone, it is forgotten)
+  g.savedHost = r.host;
+  g.savedToken = r.token;
+  if (r.host) startSharing(r.code, r.token);
+  else startWatching(r.code);
+}
+
+/** The rooms this app was in when it went away – a crash, an update, the computer restarting, the
+ *  sharer's window closed (each kept 10 minutes by the server): back into them, the sharing in this
+ *  window, each room watched in a window of its own. Not the ones another window is in. */
+void restoreRooms() {
+  long long now = std::time(nullptr);
+  std::vector<SavedRoom> todo;
+  for (const SavedRoom& r : savedRooms()) {
+    if (now - r.at > kRoomKeepS || r.code.size() < 4) {
+      forgetRoom(r.code);
+      continue;
+    }
+    if (!ourProcess(r.pid)) todo.push_back(r);
+  }
+  std::stable_sort(todo.begin(), todo.end(), [](const SavedRoom& a, const SavedRoom& b) { return a.host > b.host; });
+  bool here = false, shared = false;
+  for (const SavedRoom& r : todo) {
+    if (r.host && shared) { // (one sharing at a time)
+      forgetRoom(r.code);
+      continue;
+    }
+    shared = shared || r.host;
+    if (!here) {
+      here = true;
+      saveRoom(r.code, r.host, r.token); // (this window has it now)
+      restoreInto(r);
+    } else {
+      newWindow(true, r.code);
+    }
+  }
 }
 
 /* ------------------------------------------------ engine events (UI thread) */
@@ -1614,11 +1745,15 @@ void onEngineEvent(const Json& e) {
     g.roomCode = toW(e["code"].str());
     g.roomLink = e["link"].str();
     setTitle(L"Megosztás · " + g.roomCode);
+    rememberRoom(e["code"].str(), true, e["token"].str());
+    g.restoring = false;
     if (e["changed"].b()) ask(L"Új link készült", L"A korábbi szoba lejárt, ezért új kód és link készült – küldd el újra a nézőknek.", L"Rendben", L"", false, nullptr);
   } else if (type == "host-error") {
     std::string c = e["code"].str();
     std::wstring text = c == "auth" ? L"Hibás megosztási jelszó." : c == "rate" ? L"Túl sok próbálkozás, várj egy kicsit." : c == "full" ? L"A szerver megtelt, próbáld később."
                                                                                                                                         : L"Nem érem el a szervert (" + toW(c) + L").";
+    if (g.restoring && c == "auth") text = L"A korábbi szoba közben bezárult – indítsd újra a megosztást.";
+    forgetSaved();
     endSession();
     setTitle(L"");
     show(Screen::Home);
@@ -1672,13 +1807,22 @@ void onEngineEvent(const Json& e) {
     SendMessageW(g.nameEdit, EM_SETCUEBANNER, TRUE, LPARAM(cue.c_str()));
   } else if (type == "view-stats") {
     g.viewStats = e;
+  } else if (type == "joined") {
+    rememberRoom(e["code"].str(), false, "");
+    g.restoring = false;
+  } else if (type == "join-error" && g.restoring && e["code"].str() == "notfound") {
+    std::wstring code = toW(g.savedCode);
+    stopToHome(L"A szoba (" + code + L"), amit néztél, közben bezárult.");
+    setTab(1); // (the note is on the Nézés tab)
   } else if (type == "closed" && g.screen == Screen::Viewing) {
     g.picture = false;
+    forgetSaved(); // (the sharer ended it)
   }
   animate();
 }
 
 void tick() {
+  if (!g.savedCode.empty() && nowMs() - g.savedAt > 20000) rememberRoom(g.savedCode, g.savedHost, g.savedToken);
   if (!g.chatNote.empty() && g.chatNoteAt > 0 && nowMs() - g.chatNoteAt > 6000) {
     g.chatNote.clear();
     relayout();
@@ -2168,7 +2312,8 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       fitWindow();
       return 0;
     case WM_CLOSE_FOR_UPDATE:
-      DestroyWindow(h); // (the session ends there)
+      g.keepRooms = true; // (the new version goes back into the room)
+      DestroyWindow(h);
       return 0;
     case WM_GETMINMAXINFO: {
       if (g.screen == Screen::Viewing) reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {px(640), px(400)};
@@ -2316,12 +2461,28 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       return DefWindowProcW(h, msg, wp, lp);
     case WM_CLOSE:
       if (g.screen == Screen::Hosting) {
-        ask(L"Kilépsz?", L"A megosztás befejeződik: a nézőknél megáll a kép, és a szoba bezárul.", L"Kilépés", L"Mégse", true, [h] { DestroyWindow(h); });
+        ask(L"Bezárod?", L"A szoba 10 percig megmarad, a nézők várnak benne: ha addig újra elindítod a Screen Share-t, ugyanott folytatódik a megosztás. "
+                         L"Végleg a Megosztás vége gombbal zárhatod be.",
+            L"Bezárás", L"Mégse", false, [h] {
+              g.keepRooms = true;
+              DestroyWindow(h);
+            });
         return 0;
       }
+      forgetSaved(); // (a viewer's window closed: leaving the room)
       DestroyWindow(h);
       return 0;
+    case WM_QUERYENDSESSION:
+      return TRUE;
+    case WM_ENDSESSION:
+      // the computer shuts down or restarts: the room stays, the app goes back into it when it starts
+      if (wp) {
+        g.keepRooms = true;
+        if (g.engine) g.engine->keepRoom();
+      }
+      return 0;
     case WM_DESTROY:
+      if (g.keepRooms && g.engine) g.engine->keepRoom(); // (the room is not closed: the app will be back)
       endSession();
       Sleep(150); // the goodbye to the server leaves before the process ends
       PostQuitMessage(0);
@@ -2612,6 +2773,7 @@ int uiWatch(const std::string& server, const std::string& code, const std::wstri
     std::fputs(report, f);
     std::fclose(f);
   }
+  forgetSaved(); // (a test room: not one to go back into)
   endSession();
   DestroyWindow(g.wnd);
   return pictured && share > 0.3 && bars >= 5 && chatted ? 0 : 1;
@@ -2749,6 +2911,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
     return 0;
   }
   g.shots = (argc == 3 && std::wstring(argv[1]) == L"--ui-shot") || (argc == 5 && std::wstring(argv[1]) == L"--ui-watch");
+  if (const char* e = std::getenv("SS_SERVER")) g.server = e; // (tests, troubleshooting: another server)
   darkMenus();
   // compact (as the Mac's): as tall as the home screen, not resized by hand; watching makes it large
   HWND wnd = CreateWindowExW(0, L"ScreenShare", L"Screen Share", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -2767,7 +2930,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
   }
   // the command line: --from <x> <y> (another window's corner: this one goes near it), --watch
   // (the Nézés tab), a room link (screenshare://abc123, or the code)
-  std::wstring link;
+  std::wstring link, restore;
   bool watch = false, from = false;
   POINT at{};
   for (int i = 1; i < argc; i++) {
@@ -2776,6 +2939,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
       at = {_wtoi(argv[i + 1]), _wtoi(argv[i + 2])};
       from = true;
       i += 2;
+    } else if (a == L"--restore" && i + 1 < argc) { // (a kept room to go back into: see restoreRooms)
+      restore = argv[++i];
     } else if (a == L"--watch") {
       watch = true;
     } else if (!a.empty() && a[0] != L'-' && a[0] != L'/') {
@@ -2813,6 +2978,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
   if (!link.empty()) {
     std::string code = parseCode(link);
     if (code.size() >= 4) startWatching(code);
+  } else if (!restore.empty()) {
+    SavedRoom r;
+    r.code = parseCode(restore);
+    if (r.code.size() >= 4) {
+      saveRoom(r.code, false, "");
+      restoreInto(r);
+    }
+  } else if (argc == 1) {
+    restoreRooms(); // (started on its own: the rooms it was in, if they are still kept)
   }
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0)) {

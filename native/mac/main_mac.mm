@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "clock.h"
@@ -47,6 +48,9 @@ static std::string U(NSString* s) { return s.UTF8String ?: ""; }
 static const char* const kServer = "https://mozizas.hu";
 static NSString* const kFeed = @"https://github.com/Shreklyx/screeen/releases/download/desktop-latest";
 static NSString* const kSite = @"https://mozizas.hu";
+// closing the sharing's window, quitting while sharing: its room waits for the app
+static NSString* const kKeptText = @"A szoba 10 percig megmarad, a nézők várnak benne: ha addig újra elindítod a Screen Share-t, ugyanott folytatódik a megosztás. "
+                                   @"Végleg a Megosztás vége gombbal zárhatod be.";
 
 // the compact window: content width, margins (the title bar is part of the window's content)
 static const CGFloat kHomeWidth = 420, kHostWidth = 440, kSide = 30, kTop = 46, kBottom = 26;
@@ -151,6 +155,67 @@ static void dropOldPassword() {
   SecItemDelete((__bridge CFDictionaryRef)q);
   SecKeychainSetUserInteractionAllowed(ui);
 #pragma clang diagnostic pop
+}
+
+/* ------------------------------------------------ the rooms this app is in: rooms = {code: {host, token, pid, at}} */
+
+// kept in its settings while it is in them: after a crash, an update or the Mac restarting the app goes
+// back into them (the server keeps a room this long for its sharer)
+static const double kRoomKeepS = 600;
+
+struct SavedRoom {
+  std::string code, token;
+  bool host = false;
+  int pid = 0;
+  double at = 0; // (seconds since 1970: when the app was last surely in it)
+};
+
+static void saveRoom(const std::string& code, bool host, const std::string& token) {
+  NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
+  NSMutableDictionary* rooms = [[ud dictionaryForKey:@"rooms"] mutableCopy] ?: [NSMutableDictionary dictionary];
+  rooms[S(code)] = @{@"host" : @(host), @"token" : S(token), @"pid" : @(getpid()), @"at" : @(NSDate.date.timeIntervalSince1970)};
+  [ud setObject:rooms forKey:@"rooms"];
+}
+
+static void forgetRoom(const std::string& code) {
+  NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
+  NSMutableDictionary* rooms = [[ud dictionaryForKey:@"rooms"] mutableCopy];
+  if (code.empty() || !rooms[S(code)]) return;
+  [rooms removeObjectForKey:S(code)];
+  [ud setObject:rooms forKey:@"rooms"];
+}
+
+static std::vector<SavedRoom> savedRooms() {
+  std::vector<SavedRoom> out;
+  NSDictionary* rooms = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"rooms"];
+  for (NSString* code in rooms) {
+    NSDictionary* r = rooms[code];
+    if (![r isKindOfClass:NSDictionary.class]) continue;
+    SavedRoom s;
+    s.code = U(code);
+    s.host = [r[@"host"] boolValue];
+    s.token = [r[@"token"] isKindOfClass:NSString.class] ? U(r[@"token"]) : "";
+    s.pid = [r[@"pid"] intValue];
+    s.at = [r[@"at"] doubleValue];
+    out.push_back(s);
+  }
+  return out;
+}
+
+/** Is that process another copy of this app, still running (its rooms are its own)? */
+static bool otherCopy(int pid) {
+  if (pid <= 0 || pid == getpid()) return false;
+  NSRunningApplication* a = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+  return a && !a.terminated && [a.bundleIdentifier isEqualToString:NSBundle.mainBundle.bundleIdentifier];
+}
+
+/** Quitting because the Mac shuts down, restarts or logs out (not ⌘Q): the quit event's reason. */
+static bool systemQuit() {
+  auto code = [](const char* s) { return FourCharCode(uint8_t(s[0])) << 24 | FourCharCode(uint8_t(s[1])) << 16 | FourCharCode(uint8_t(s[2])) << 8 | FourCharCode(uint8_t(s[3])); };
+  NSAppleEventDescriptor* e = NSAppleEventManager.sharedAppleEventManager.currentAppleEvent;
+  if (!e || e.eventClass != code("aevt") || e.eventID != code("quit")) return false;
+  FourCharCode why = [e attributeDescriptorForKeyword:code("why?")].typeCodeValue;
+  return why == code("shut") || why == code("rest") || why == code("rlgo") || why == code("logo");
 }
 
 /* ------------------------------------------------ this Mac's own signature (sign_local.sh) */
@@ -738,6 +803,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
 - (void)newWindowFrom:(SSWin*)from watch:(BOOL)watch;
 - (void)windowClosed:(SSWin*)w;
 - (void)installUpdate;
+- (void)openWindows;
 @end
 
 /** One window: home, sharing, watching. */
@@ -748,8 +814,16 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
 - (void)endSession;
 - (bool)busy;
 - (void)ask:(NSString*)title text:(NSString*)text ok:(NSString*)ok cancel:(NSString*)cancel danger:(BOOL)danger action:(void (^)(void))action;
+- (void)ask:(NSString*)title text:(NSString*)text ok:(NSString*)ok cancel:(NSString*)cancel danger:(BOOL)danger action:(void (^)(void))action otherwise:(void (^)(void))otherwise;
 - (void)showUpdate:(NSString*)version;
 - (void)updateBusy:(BOOL)busy failed:(BOOL)failed;
+// the room kept (the app goes back into it when it starts again)
+- (void)restore:(const SavedRoom&)room;
+- (bool)holds:(const std::string&)code;
+- (bool)sharing;
+- (void)goAway:(bool)all;
+- (void)leave;
+- (std::string)describe; // (CI: what the window shows)
 // CI (--ui-chat): watch on this server, say something in the chat, what the chat shows
 - (void)testWatch:(const std::string&)code server:(const std::string&)server;
 - (void)testSay:(NSString*)text;
@@ -804,6 +878,12 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   NSTimer* _popTimer;
   bool _chatReady; // in the room (the server told our name)
   std::string _server; // (CI: a local one)
+  // the room this window is in, kept in the app's settings while it is (see -[SSApp restoreRooms:])
+  std::string _savedCode, _savedToken;
+  bool _savedHost;
+  double _savedAt;
+  bool _restoring; // this session goes back into a kept room (gone: home, with a note)
+  bool _keepRoom;  // the window closes but its room stays (the server keeps it 10 minutes)
 
   std::unique_ptr<Engine> _engine;
   std::unique_ptr<MacHost> _hostPipe;
@@ -842,6 +922,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   [root addSubview:_stage];
   pin(_stage, root);
   _live = true;
+  if (const char* e = getenv("SS_SERVER")) _server = e; // (tests, troubleshooting: another server)
   [self makeHome];
   [self makeHost];
   [self makeViewer];
@@ -1001,6 +1082,10 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
 /* ---- questions: a sheet on the window */
 
 - (void)ask:(NSString*)title text:(NSString*)text ok:(NSString*)ok cancel:(NSString*)cancel danger:(BOOL)danger action:(void (^)(void))action {
+  [self ask:title text:text ok:ok cancel:cancel danger:danger action:action otherwise:nil];
+}
+
+- (void)ask:(NSString*)title text:(NSString*)text ok:(NSString*)ok cancel:(NSString*)cancel danger:(BOOL)danger action:(void (^)(void))action otherwise:(void (^)(void))otherwise {
   NSAlert* a = [NSAlert new];
   a.messageText = title;
   a.informativeText = text ?: @"";
@@ -1011,7 +1096,11 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   [self moved];
   [a beginSheetModalForWindow:_window
             completionHandler:^(NSModalResponse r) {
-              if (r == NSAlertFirstButtonReturn && action) action();
+              if (r == NSAlertFirstButtonReturn) {
+                if (action) action();
+              } else if (otherwise) {
+                otherwise();
+              }
             }];
 }
 
@@ -1538,13 +1627,21 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
 }
 
 - (void)share {
+  [self share:"" token:""];
+}
+
+/** Sharing; `resumeCode` / `resumeToken`: going back into that room (kept by the server for its sharer:
+ *  the same code and link – the token does, no password needed). */
+- (void)share:(const std::string&)resumeCode token:(const std::string&)resumeToken {
   NSString* pw = _password.stringValue;
-  if (!pw.length) {
+  bool resume = !resumeCode.empty();
+  if (!pw.length && !resume) {
     [self setError:_shareError text:@"Add meg a megosztási jelszót."];
     [_window makeFirstResponder:_password];
     return;
   }
   if (_displays.empty()) {
+    if (resume) [self forgetSaved];
     [self setError:_shareError text:@"Nem találok képernyőt."];
     return;
   }
@@ -1555,8 +1652,9 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   [ud setBool:_audio.state == NSControlStateValueOn forKey:@"audio"];
   [ud setBool:_remember.state == NSControlStateValueOn forKey:@"rememberPassword"];
   // into the keychain once the server took it (a mistyped one is not remembered), only when it changes
-  _passwordToSave = _remember.state == NSControlStateValueOn ? pw : @"";
-  if (!_passwordToSave.length) [self savePasswordNow];
+  // (going back into a room: the token let us in, the password field says nothing)
+  _passwordToSave = resume ? nil : _remember.state == NSControlStateValueOn ? pw : @"";
+  if (_passwordToSave && !_passwordToSave.length) [self savePasswordNow];
   _shareError.hidden = YES;
   [self endSession];
   int session = ++_session;
@@ -1595,7 +1693,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   _window.title = @"Megosztás";
   [self show:_host];
   [self startChat];
-  _engine->host(U(pw));
+  _engine->host(U(pw), resumeCode, resumeToken);
 }
 
 static std::string parseCode(NSString* text) {
@@ -1652,6 +1750,7 @@ static std::string parseCode(NSString* text) {
 }
 
 - (void)stopToHome {
+  [self forgetSaved];
   [self endSession];
   _window.title = @"Screen Share";
   [_overlaySpinner stopAnimation:nil];
@@ -1661,6 +1760,69 @@ static std::string parseCode(NSString* text) {
     return;
   }
   [self show:_home];
+}
+
+/* ---- the room kept: the app goes back into it */
+
+/** This window's room into the settings – and again now and then (how fresh it is says whether the
+ *  server still keeps it). */
+- (void)rememberRoom:(const std::string&)code host:(bool)host token:(const std::string&)token {
+  if (!_savedCode.empty() && _savedCode != code) forgetRoom(_savedCode);
+  _savedCode = code;
+  _savedHost = host;
+  _savedToken = token;
+  _savedAt = nowMs();
+  saveRoom(code, host, token);
+}
+
+/** Done with the room (ended, left): the app does not go back into it. */
+- (void)forgetSaved {
+  forgetRoom(_savedCode);
+  _savedCode.clear();
+  _savedToken.clear();
+  _restoring = false;
+}
+
+/** Back into a kept room: sharing it again (with its token – the same code and link), or watching it. */
+- (void)restore:(const SavedRoom&)r {
+  _restoring = true;
+  _savedCode = r.code; // (gone, it is forgotten)
+  _savedHost = r.host;
+  _savedToken = r.token;
+  _savedAt = nowMs();
+  saveRoom(r.code, r.host, r.token); // (this window has it now)
+  if (r.host) [self share:r.code token:r.token];
+  else [self watch:r.code];
+}
+
+- (bool)holds:(const std::string&)code {
+  return _savedCode == code;
+}
+
+- (bool)sharing {
+  return _current == _host && _engine;
+}
+
+/** The app quits: the sharing's room is kept (the server waits 10 minutes; the app goes back into it
+ *  when it starts again), a watched one too when `all` (the Mac restarting, an update) – else it is left. */
+- (void)goAway:(bool)all {
+  if (_engine && !_savedCode.empty() && (all || _current == _host)) _engine->keepRoom();
+  else [self forgetSaved];
+  [self endSession];
+}
+
+/** (CI) Out of the room for good. */
+- (void)leave {
+  [self forgetSaved];
+  [self endSession];
+}
+
+- (std::string)describe {
+  NSTextField* note = !_joinError.hidden ? _joinError : !_shareError.hidden ? _shareError : nil;
+  Json d = Json::object();
+  d.set("screen", _current == _host ? "host" : _current == _viewer ? "viewer" : "home").set("room", _savedCode).set("link", _roomLink);
+  d.set("picture", _picture).set("title", U(_window.title)).set("note", note ? U(note.stringValue) : "").set("tab", int(_tabs.selectedSegment));
+  return d.dump();
 }
 
 - (void)askStop {
@@ -1784,12 +1946,16 @@ static std::string parseCode(NSString* text) {
     _link.stringValue = S(_roomLink);
     _window.title = [@"Megosztás · " stringByAppendingString:S(e["code"].str())];
     _copyButton.enabled = YES;
+    [self rememberRoom:e["code"].str() host:true token:e["token"].str()];
+    _restoring = false;
     if (e["changed"].b())
       [self ask:@"Új link készült" text:@"A korábbi szoba lejárt, ezért új kód és link készült – küldd el újra a nézőknek." ok:@"Rendben" cancel:nil danger:NO action:nil];
   } else if (type == "host-error") {
     std::string c = e["code"].str();
     NSString* text = c == "auth" ? @"Hibás megosztási jelszó." : c == "rate" ? @"Túl sok próbálkozás, várj egy kicsit." : c == "full" ? @"A szerver megtelt, próbáld később."
                                                                                                                                       : S("Nem érem el a szervert (" + c + ").");
+    if (_restoring && c == "auth") text = @"A korábbi szoba közben bezárult – indítsd újra a megosztást.";
+    [self forgetSaved];
     [self endSession];
     _window.title = @"Screen Share";
     [self show:_home];
@@ -1799,6 +1965,17 @@ static std::string parseCode(NSString* text) {
   } else if (type == "closed" && _current == _host) {
     [self stopToHome];
     [self setError:_shareError text:@"A szobát egy másik ablak vette át."];
+  } else if (type == "closed") {
+    [self forgetSaved]; // (the sharer ended it)
+  } else if (type == "joined") {
+    [self rememberRoom:e["code"].str() host:false token:""];
+    _restoring = false;
+  } else if (type == "join-error" && _restoring && e["code"].str() == "notfound") {
+    std::string code = _savedCode;
+    [self stopToHome];
+    _tabs.selectedSegment = 1; // (the note is on the Nézés tab)
+    [self applyTab];
+    [self setError:_joinError text:S("A szoba (" + code + "), amit néztél, közben bezárult.")];
   } else if (type == "view-state" && _current == _viewer) {
     bool picture = e["picture"].b();
     if (picture != _picture) {
@@ -1845,6 +2022,7 @@ static std::string parseCode(NSString* text) {
 }
 
 - (void)tick {
+  if (!_savedCode.empty() && nowMs() - _savedAt > 20000) [self rememberRoom:_savedCode host:_savedHost token:_savedToken];
   if (_current == _host && _hostPipe) {
     MacHost::Info i = _hostPipe->info();
     std::string s;
@@ -1902,8 +2080,9 @@ static std::string parseCode(NSString* text) {
   if (_current != _host) return YES;
   __weak NSWindow* win = w;
   __weak SSWin* weak = self;
-  [self ask:@"Kilépsz?" text:@"A megosztás befejeződik: a nézőknél megáll a kép, és a szoba bezárul." ok:@"Kilépés" cancel:@"Mégse" danger:YES action:^{
-    [weak endSession];
+  [self ask:@"Bezárod?" text:kKeptText ok:@"Bezárás" cancel:@"Mégse" danger:NO action:^{
+    SSWin* s = weak;
+    if (s) s->_keepRoom = true;
     [win close];
   }];
   return NO;
@@ -1919,6 +2098,8 @@ static std::string parseCode(NSString* text) {
 }
 
 - (void)windowWillClose:(NSNotification*)n {
+  if (_keepRoom && _engine) _engine->keepRoom(); // (the sharing's room waits for the app: see windowShouldClose)
+  else [self forgetSaved];                      // (a viewer's window closed: leaving the room)
   [self endSession];
   [_tickTimer invalidate];
   [_barTimer invalidate];
@@ -1962,13 +2143,12 @@ static std::string parseCode(NSString* text) {
   NSMutableArray<SSWin*>* _windows;
   NSString *_updateFile, *_updateVersion;
   bool _checking;
+  bool _keepRooms; // the app goes away for a while (an update, the Mac restarting): every room stays
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification*)n {
   if ([self signLocallyFirst]) return;
-  _windows = [NSMutableArray array];
-  [self makeMenu];
-  [self newWindowFrom:nil watch:NO];
+  [self openWindows];
   [NSApp activateIgnoringOtherApps:YES];
   [self checkUpdatesLater];
   __weak SSApp* weak = self;
@@ -1984,6 +2164,48 @@ static std::string parseCode(NSString* text) {
 
 - (NSArray<SSWin*>*)windows {
   return _windows;
+}
+
+/** The first window – and back into the rooms the app was in when it went away. */
+- (void)openWindows {
+  _windows = [NSMutableArray array];
+  [self makeMenu];
+  [self newWindowFrom:nil watch:NO];
+  [self restoreRooms:_windows.firstObject];
+}
+
+/** The rooms this app was in when it went away – a crash, an update, the Mac restarting, the sharer's
+ *  window closed (each kept 10 minutes by the server): back into them, the sharing in `first` (a window
+ *  on its home screen), each room watched in a window of its own. Not the ones a window is in. */
+- (void)restoreRooms:(SSWin*)first {
+  double now = NSDate.date.timeIntervalSince1970;
+  std::vector<SavedRoom> todo;
+  for (const SavedRoom& r : savedRooms()) {
+    if (now - r.at > kRoomKeepS || r.code.size() < 4) {
+      forgetRoom(r.code);
+      continue;
+    }
+    bool held = otherCopy(r.pid);
+    for (SSWin* w in _windows) held = held || [w holds:r.code];
+    if (!held) todo.push_back(r);
+  }
+  std::stable_sort(todo.begin(), todo.end(), [](const SavedRoom& a, const SavedRoom& b) { return a.host > b.host; });
+  bool shared = false;
+  for (SSWin* w in _windows) shared = shared || [w sharing];
+  for (const SavedRoom& r : todo) {
+    if (r.host && shared) { // (one sharing at a time)
+      forgetRoom(r.code);
+      continue;
+    }
+    shared = shared || r.host;
+    SSWin* w = first && ![first busy] ? first : nil;
+    first = nil;
+    if (!w) {
+      [self newWindowFrom:[self front] watch:YES];
+      w = _windows.lastObject;
+    }
+    [w restore:r];
+  }
 }
 
 /** Another window – to watch one more room: any number at once, each on its own. */
@@ -2022,6 +2244,7 @@ static std::string parseCode(NSString* text) {
 
 - (BOOL)applicationShouldHandleReopen:(NSApplication*)a hasVisibleWindows:(BOOL)visible {
   if (!_windows.count) [self newWindowFrom:nil watch:NO];
+  [self restoreRooms:nil]; // (started again while it runs: the sharing whose window was closed)
   return YES;
 }
 
@@ -2048,8 +2271,26 @@ static std::string parseCode(NSString* text) {
   return YES;
 }
 
+/** ⌘Q while sharing: the room stays (as when its window closes) – said first. The Mac shutting down,
+ *  restarting, logging out: every room stays, the app goes back into them when it starts again. */
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)a {
+  if (_keepRooms || systemQuit()) {
+    _keepRooms = true;
+    return NSTerminateNow;
+  }
+  SSWin* sharing = nil;
+  for (SSWin* w in _windows)
+    if ([w sharing]) sharing = w;
+  if (!sharing) return NSTerminateNow;
+  [sharing.window makeKeyAndOrderFront:nil];
+  [sharing ask:@"Kilépsz?" text:kKeptText ok:@"Kilépés" cancel:@"Mégse" danger:NO
+      action:^{ [NSApp replyToApplicationShouldTerminate:YES]; }
+      otherwise:^{ [NSApp replyToApplicationShouldTerminate:NO]; }];
+  return NSTerminateLater;
+}
+
 - (void)applicationWillTerminate:(NSNotification*)n {
-  for (SSWin* w in [_windows copy]) [w endSession];
+  for (SSWin* w in [_windows copy]) [w goAway:_keepRooms];
 }
 
 - (void)makeMenu {
@@ -2230,6 +2471,7 @@ static std::string parseCode(NSString* text) {
                                         return;
                                       }
                                       // after we quit: the new app (signed with this Mac's identity) in place of this one, then start it
+                                      self->_keepRooms = true; // (the new version goes back into the rooms)
                                       if (swapAfterQuit(fresh)) {
                                         [NSApp terminate:nil];
                                         return;
@@ -2405,11 +2647,34 @@ static int uiChat(NSArray<NSString*>* args) {
   } @catch (NSException* e) {
     chatLog([NSString stringWithFormat:@"not saved: %@", e.reason]);
   }
-  [w endSession];
+  [w leave];
   chatLog(@"end");
   fclose(gChatLog);
   gChatLog = nullptr;
   return came && answered ? 0 : 1;
+}
+
+/** --ui-restore <seconds> <log> (CI): the app's windows as when it starts – back into the rooms its
+ *  settings keep (the test put them there) – then what each window shows, and what the settings keep. */
+static int uiRestore(NSArray<NSString*>* args) {
+  double seconds = args[2].doubleValue;
+  FILE* log = fopen(args[3].fileSystemRepresentation, "w");
+  if (!log) return 1;
+  NSApplication* app = NSApplication.sharedApplication;
+  app.activationPolicy = NSApplicationActivationPolicyRegular;
+  [app finishLaunching];
+  SSApp* delegate = [SSApp new];
+  app.delegate = delegate; // (after finishLaunching: no signing, no update check)
+  [delegate openWindows];
+  NSDate* until = [NSDate dateWithTimeIntervalSinceNow:seconds];
+  while ([until timeIntervalSinceNow] > 0) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+  for (SSWin* w in delegate.windows) fprintf(log, "WINDOW %s\n", [w describe].c_str());
+  NSDictionary* rooms = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"rooms"] ?: @{};
+  NSData* json = [NSJSONSerialization dataWithJSONObject:rooms options:0 error:nil];
+  fprintf(log, "ROOMS %s\nPID %d\n", json ? [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String : "{}", getpid());
+  for (SSWin* w in delegate.windows) [w leave];
+  fclose(log);
+  return 0;
 }
 
 int main(int argc, const char* argv[]) {
@@ -2417,6 +2682,7 @@ int main(int argc, const char* argv[]) {
     netInit();
     NSArray<NSString*>* args = NSProcessInfo.processInfo.arguments;
     if (args.count == 6 && [args[1] isEqualToString:@"--ui-chat"]) return uiChat(args);
+    if (args.count == 4 && [args[1] isEqualToString:@"--ui-restore"]) return uiRestore(args);
     if (args.count == 6 && ([args[1] isEqualToString:@"--smoke-host"] || [args[1] isEqualToString:@"--smoke-view"])) return smoke(args);
     if (args.count == 4 && [args[1] isEqualToString:@"--ws-bench"]) { // CI: round trips through this WebSocket
       FILE* log = fopen(args[3].fileSystemRepresentation, "w");

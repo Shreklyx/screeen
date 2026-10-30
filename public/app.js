@@ -361,7 +361,10 @@ function hostSignal() {
 async function openRoom(password) {
   const signal = hostSignal();
   await signal.whenOpen(8000);
-  const resume = store.get('ss-host-room', null, 'session');
+  // the last room, if it can still be there (the server keeps one 10 minutes for its sharer): the same
+  // code and link again – after a reload, a closed tab, the browser started again
+  const saved = store.get('ss-host-room', null);
+  const resume = saved && Date.now() - (saved.at || 0) < ROOM_KEEP_MS ? { code: saved.code, token: saved.token } : null;
   const res = await signal.request({ t: 'host', password, resume: resume || undefined, name: chatName() }, ['hosted']);
   applyHosted(res);
   return Boolean(resume && res.code === resume.code);
@@ -379,12 +382,19 @@ async function reclaimRoom() {
   }
 }
 
+const ROOM_KEEP_MS = 10 * 60 * 1000; // as long as the server waits for a sharer
+
+/** The room, for coming back to it: kept on this computer while sharing (the time says how fresh). */
+function keepRoom() {
+  if (host.code && host.token) store.set('ss-host-room', { code: host.code, token: host.token, at: Date.now() });
+}
+
 function applyHosted(res) {
   host.code = res.code;
   host.token = res.token;
   host.iceServers = res.iceServers || [];
   host.serverDirect = res.direct === true;
-  store.set('ss-host-room', { code: res.code, token: res.token }, 'session');
+  keepRoom();
   $('#roomCode').textContent = res.code;
   $('#roomLink').value = `${SITE_URL}#${res.code}`;
   $('#btnCopy').disabled = false;
@@ -414,7 +424,7 @@ async function startHosting(e) {
       host.signal.send({ t: 'close' });
       host.code = null;
       host.token = null;
-      store.remove('ss-host-room', 'session');
+      store.remove('ss-host-room');
     }, () => {});
     showCaptureError(err, showShareError);
     return;
@@ -593,7 +603,7 @@ function closeRoom() {
   if (host.viewers.size && !confirm('Biztosan bezárod a szobát? Minden néző kilép.')) return;
   host.signal?.send({ t: 'close' });
   window.removeEventListener('beforeunload', confirmLeave);
-  store.remove('ss-host-room', 'session');
+  store.remove('ss-host-room');
   stopTracks();
   for (const id of [...host.viewers.keys()]) dropViewer(id);
   setTimeout(() => { location.href = location.pathname; }, 200);
@@ -698,6 +708,10 @@ function updateSetting(key, value) {
 }
 
 function hostStatsTick() {
+  if (Date.now() - (host.keptAt || 0) > 10000) { // (still sharing: the room is fresh to come back to)
+    host.keptAt = Date.now();
+    keepRoom();
+  }
   const s = host.video?.getSettings?.() || {};
   const dims = `${s.width}x${s.height}`;
   if (isLive() && dims !== host.dims) {

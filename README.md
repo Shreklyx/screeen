@@ -31,8 +31,12 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   megosztó nézőlistájában nézőnként látszik.
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).
-- Ha a megosztó újratölti az oldalt vagy megszakad a nete, a szoba (és a link) 2 percig megmarad, a nézők maguktól
-  visszakapják a képet.
+- **A szoba megmarad:** ha a megosztó újratölti az oldalt, bezárja a böngészőt vagy az alkalmazás ablakát, megszakad a
+  nete, összeomlik / frissül az alkalmazás vagy újraindul a gép, a szoba (és a link) **10 percig** megmarad, a nézők
+  benne várnak. Ha addig újra elindítja (a böngészőben újra megosztja), **ugyanabba a szobába** megy vissza – ugyanaz
+  a kód, jelszó sem kell –, és a nézők maguktól visszakapják a képet. Az alkalmazás a nézett szobákba is visszamegy
+  (összeomlás, frissítés, újraindítás után; a **Kilépés** gomb vagy a néző ablakának bezárása után nem). Végleg a
+  **Megosztás vége** gombbal zárul a szoba.
 
 ## Telepítés a szerverre
 

@@ -33,10 +33,11 @@ struct EngineCallbacks {
   /**
    * What the UI shows, as JSON: {"type": …}
    *   status       {text, kind: ok|warn|error|""}         the connection to the server
-   *   hosted       {code, link}                            the room is ready
+   *   hosted       {code, link, token, changed}            the room is ready (token: to take it back later)
    *   host-error   {code: auth|rate|full|offline|…}        sharing could not start
    *   viewers      {list: [{id, n, state, path, fps, kbps, rtt, lat, why}], count}
    *   joined       {code}  view-state {text, picture}      the viewer's overlay text
+   *   join-error   {code: notfound|full|rate|…}            joining failed (it is tried again)
    *   view-stats   {fps, kbps, rtt, lat, path, loss, encoder}
    *   closed       {reason}                                the room is over
    *   the room's chat (both sides; viewers' list entries have their names too):
@@ -62,8 +63,12 @@ class Engine {
   Engine(const Engine&) = delete;
   Engine& operator=(const Engine&) = delete;
 
-  /** Sharer: opens a room with the sharing password (or takes back the last one). */
-  void host(const std::string& password);
+  /** Sharer: opens a room with the sharing password – or takes back the one given (its code and
+   *  token: after the app started again; the server keeps a room 10 minutes for its sharer). */
+  void host(const std::string& password, const std::string& resumeCode = "", const std::string& resumeToken = "");
+  /** Both: when this engine ends, the room is not closed (the sharer's app is going away – it will be
+   *  back) and the viewer does not say goodbye (it will be back too). */
+  void keepRoom();
   /** Sharer: the picture is paused (true) or goes on (false); viewers see "szünetel". */
   void setLive(bool live);
   void stopHosting();

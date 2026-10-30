@@ -4,9 +4,10 @@
 //   ss-cli host --server http://127.0.0.1:8090 --password titok123 --h264 file.h264 [--fps 60] [--seconds 30]
 //   ss-cli view --server http://127.0.0.1:8090 --code abc123 [--seconds 10] [--out received.h264]
 //   the room's chat, both: [--name NAME] [--chat TEXT (once in the room)] [--chat-reply TEXT ({name}: who wrote)]
+//   host: [--resume CODE:TOKEN (take that room back)] [--keep (leave the room open at the end, as an app quitting)]
 //   ss-cli ws-bench --url ws://127.0.0.1:8095 [--count 240]   (round trips through an echo server)
 //
-// Prints the engine's events as JSON lines; "host" prints "CODE <code>" once the room is open,
+// Prints the engine's events as JSON lines; "host" prints "CODE <code>" and "TOKEN <token>" once the room is open,
 // "view" ends with "RESULT {…}" (frames, keyframes, bytes, latency); chat messages as "CHAT {…}".
 #include <algorithm>
 #include <atomic>
@@ -100,7 +101,10 @@ static int host(int argc, char** argv) {
   Chat chat(argc, argv);
   EngineCallbacks cb;
   cb.event = [&chat](const Json& e) {
-    if (e["type"].str() == "hosted") line("CODE " + e["code"].str());
+    if (e["type"].str() == "hosted") {
+      line("CODE " + e["code"].str());
+      line("TOKEN " + e["token"].str());
+    }
     if (!chat.on(e) && e["type"].str() != "viewers") line("EVENT " + e.dump());
   };
   cb.streaming = [&](bool on) {
@@ -112,7 +116,9 @@ static int host(int argc, char** argv) {
   Engine engine(cfg, cb);
   chat.engine = &engine;
   engine.setName(arg(argc, argv, "--name"));
-  engine.host(arg(argc, argv, "--password"));
+  std::string resume = arg(argc, argv, "--resume");
+  size_t colon = resume.find(':');
+  engine.host(arg(argc, argv, "--password"), colon == std::string::npos ? "" : resume.substr(0, colon), colon == std::string::npos ? "" : resume.substr(colon + 1));
   double start = nowMs(), next = start;
   size_t n = 0;
   double lastViewers = 0;
@@ -132,6 +138,7 @@ static int host(int argc, char** argv) {
     }
   }
   line("SENT " + std::to_string(n) + " keyframe-requests " + std::to_string(keyframes.load()));
+  if (flag(argc, argv, "--keep")) engine.keepRoom();
   chat.engine = nullptr;
   return 0;
 }

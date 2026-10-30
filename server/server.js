@@ -44,7 +44,7 @@ const VIEWER_SIGNALS = new Set(['recall', 'stats', 'direct-answer', 'direct-fail
 const LIMITS = {
   rooms: 100,
   viewersPerRoom: 20,
-  hostGraceMs: 2 * 60 * 1000, // the room survives a host reload / network blip this long
+  hostGraceMs: 10 * 60 * 1000, // the room waits this long for its sharer (a reload, a restart, the computer's) – the apps go back into it
   authFailures: 10, // wrong passwords per IP …
   authWindowMs: 15 * 60 * 1000, // … per 15 minutes
   joins: 30, // join attempts per IP …

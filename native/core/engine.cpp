@@ -78,6 +78,7 @@ struct Engine::Impl {
   bool wsOpen = false, wsWanted = false;
   int wsGen = 0, wsAttempt = 0, wsTimer = 0;
   std::string mode; // "", "host", "viewer"
+  bool keep = false; // the room is kept when this engine ends (keepRoom)
   std::string myName, myId; // the chat: the name given (""= the server's), who we are in the room ("host" or a viewer's id)
 
   /* ---- sharer */
@@ -180,8 +181,8 @@ struct Engine::Impl {
   }
 
   void shutdown() {
-    if (mode == "host" && wsOpen) send(Json::object().set("t", "close"));
-    if (mode == "viewer" && wsOpen) send(Json::object().set("t", "leave"));
+    if (mode == "host" && wsOpen && !keep) send(Json::object().set("t", "close"));
+    if (mode == "viewer" && wsOpen && !keep) send(Json::object().set("t", "leave"));
     clearHost();
     closeView();
     if (ep) ep->close();
@@ -323,10 +324,14 @@ struct Engine::Impl {
     if (!ep->open()) status("A közvetlen átvitel nem indult el (UDP).", "error");
   }
 
-  void startHost(const std::string& pw) {
+  void startHost(const std::string& pw, const std::string& resumeCode, const std::string& resumeToken) {
     if (mode == "viewer") stopView();
     mode = "host";
     password = pw;
+    if (!resumeCode.empty() && !resumeToken.empty()) { // (the server gives it back with the token, no password needed)
+      code = resumeCode;
+      token = resumeToken;
+    }
     hostPending = true;
     ensureEndpoint(DirectEndpoint::Role::Host);
     loop.cancel(hostTimer);
@@ -386,7 +391,7 @@ struct Engine::Impl {
     iceServers = res["iceServers"];
     serverDirect = res["direct"].b(false);
     Json e = Json::object();
-    e.set("type", "hosted").set("code", code).set("link", site + "#" + code).set("changed", changed);
+    e.set("type", "hosted").set("code", code).set("link", site + "#" + code).set("changed", changed).set("token", token);
     emit(e);
     status("Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.", "ok");
     send(Json::object().set("t", "state").set("live", live));
@@ -726,6 +731,9 @@ struct Engine::Impl {
     } else if (t == "error" && joinPending) {
       joinPending = false;
       std::string c = msg["code"].str();
+      Json je = Json::object();
+      je.set("type", "join-error").set("code", c); // (an app going back into a room it had: notfound – gone)
+      emit(je);
       std::string text = c == "notfound" ? "Nincs ilyen szoba (lejárt vagy elírtad a kódot)." : c == "full" ? "A szoba megtelt." : c == "rate" ? "Túl sok próbálkozás, várj egy kicsit." : "Nem sikerült csatlakozni.";
       viewState(text + " Újrapróbálom…");
       retryJoin = loop.setTimer(c == "rate" ? 30000 : 5000, [this] { if (mode == "viewer" && wsOpen) sendJoin(); });
@@ -910,8 +918,12 @@ Engine::Engine(EngineConfig config, EngineCallbacks callbacks) : impl_(new Impl(
 
 Engine::~Engine() = default;
 
-void Engine::host(const std::string& password) {
-  impl_->loop.post([this, password] { impl_->startHost(password); });
+void Engine::host(const std::string& password, const std::string& resumeCode, const std::string& resumeToken) {
+  impl_->loop.post([this, password, resumeCode, resumeToken] { impl_->startHost(password, resumeCode, resumeToken); });
+}
+
+void Engine::keepRoom() {
+  impl_->loop.post([this] { impl_->keep = true; });
 }
 
 void Engine::setLive(bool live) {

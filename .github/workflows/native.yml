@@ -40,6 +40,33 @@ jobs:
             node -e "const r=JSON.parse(require('fs').readFileSync('view.log','utf8').split('\n').find(l=>l.startsWith('RESULT ')).slice(7)); if(!(r.frames>100&&r.firstKey)) {console.error('too few frames', r); process.exit(1)}"
             wait $host # (not the server: that one runs on)
           done
+      # A room kept: its sharer's app goes away without closing it (a crash, an update, a restart) and
+      # takes it back with its token – the same code, no password; the viewer in it gets the picture again
+      - name: "A room kept: the sharer goes away and comes back"
+        run: |
+          PORT=8098 HOST_PASSWORD=ci DIRECT_PORT=3498 node server/server.js &
+          sleep 2
+          build/ss-cli host --server http://127.0.0.1:8098 --password ci --h264 native/tests/data/test.h264 --seconds 6 --keep > keep-host1.log &
+          for i in $(seq 1 50); do grep -q '^TOKEN' keep-host1.log && break; sleep 0.2; done
+          code=$(grep '^CODE' keep-host1.log | awk '{print $2}')
+          token=$(grep '^TOKEN' keep-host1.log | awk '{print $2}')
+          build/ss-cli view --server http://127.0.0.1:8098 --code "$code" --seconds 18 > keep-view.log &
+          viewer=$!
+          sleep 8 # (the first sharer is gone; the room waits)
+          build/ss-cli host --server http://127.0.0.1:8098 --password wrong --resume "$code:$token" --h264 native/tests/data/test.h264 --seconds 6 --keep > keep-host2.log
+          wait $viewer
+          node -e '
+            const fs = require("fs");
+            const code1 = fs.readFileSync("keep-host1.log", "utf8").match(/^CODE (\S+)/m)[1];
+            const again = fs.readFileSync("keep-host2.log", "utf8").match(/^CODE (\S+)/m);
+            if (!again || again[1] !== code1) throw new Error("the room was not taken back: " + (again && again[1]));
+            const view = fs.readFileSync("keep-view.log", "utf8");
+            const r = JSON.parse(view.split("\n").find((l) => l.startsWith("RESULT ")).slice(7));
+            if (view.includes("\"type\":\"closed\"")) throw new Error("the viewer was sent away");
+            // one sharer alone sends at most 6 s × 60 frames
+            if (!(r.frames > 400)) throw new Error("the viewer did not get the picture again: " + JSON.stringify(r));
+            console.log("kept and taken back:", code1, JSON.stringify(r));
+          '
       # The room's chat through the server: a viewer (Anna) writes, the sharer (Tamás) answers; both
       # see both, with names; someone who comes later gets what was said
       - name: "Chat: the sharer and a viewer talk"
@@ -405,6 +432,51 @@ jobs:
             [ -n "$report" ] && head -120 ~/Library/Logs/DiagnosticReports/"$report"
             exit 1
           fi
+      # Back into the rooms: the app's settings say it shared one room and watched two (one of them closed
+      # since, and one that is too old) – as after a crash or the Mac restarting. Started again it shares
+      # the same room (its token: the same code), watches the other in a window of its own, and says that
+      # the closed one is gone
+      - name: "UI: back into the rooms (the app started again)"
+        run: |
+          PORT=8092 HOST_PASSWORD=ci DIRECT_PORT=3482 node server/server.js &
+          sleep 3
+          build-arm64/ss-cli host --server http://127.0.0.1:8092 --password ci --h264 native/tests/data/test.h264 --seconds 60 > restore-watched.log &
+          # (the room the app shared: its sharer went away, the server keeps it)
+          build-arm64/ss-cli host --server http://127.0.0.1:8092 --password ci --h264 native/tests/data/test.h264 --seconds 3 --keep > restore-shared.log
+          for i in $(seq 1 80); do grep -q '^CODE' restore-watched.log 2>/dev/null && break; sleep 0.25; done
+          watched=$(grep '^CODE' restore-watched.log | awk '{print $2}')
+          shared=$(grep '^CODE' restore-shared.log | awk '{print $2}')
+          token=$(grep '^TOKEN' restore-shared.log | awk '{print $2}')
+          echo "shared $shared, watched $watched"
+          python3 -c '
+          import plistlib, sys, time
+          shared, token, watched = sys.argv[1:4]
+          now = time.time()
+          room = lambda host, token, ago: {"host": host, "token": token, "pid": 1, "at": now - ago}
+          rooms = {shared: room(True, token, 30), watched: room(False, "", 20), "zzzzzz": room(False, "", 20), "yyyyyy": room(False, "", 900)}
+          plistlib.dump({"rooms": rooms}, open("rooms.plist", "wb"))
+          ' "$shared" "$token" "$watched"
+          defaults import hu.mozizas.screenshare.native rooms.plist
+          defaults read hu.mozizas.screenshare.native rooms
+          SS_SERVER=http://127.0.0.1:8092 "dist/Screen Share.app/Contents/MacOS/Screen Share" --ui-restore 15 "$PWD/mac-restore.log"
+          cat mac-restore.log
+          node -e '
+            const [shared, watched] = process.argv.slice(1);
+            const lines = require("fs").readFileSync("mac-restore.log", "utf8").split("\n");
+            const windows = lines.filter((l) => l.startsWith("WINDOW ")).map((l) => JSON.parse(l.slice(7)));
+            const rooms = JSON.parse(lines.find((l) => l.startsWith("ROOMS ")).slice(6));
+            const problems = [];
+            const host = windows.find((w) => w.screen === "host");
+            if (!host || !host.link.endsWith("#" + shared)) problems.push("the sharing did not go back into its room " + shared + ": " + JSON.stringify(host));
+            const view = windows.find((w) => w.screen === "viewer" && w.room === watched);
+            if (!view || !view.picture) problems.push("the watched room " + watched + " is not shown again: " + JSON.stringify(view));
+            const gone = windows.find((w) => w.screen === "home" && w.note.includes("zzzzzz"));
+            if (!gone) problems.push("no word about the closed room zzzzzz");
+            if (rooms.zzzzzz || rooms.yyyyyy) problems.push("rooms that are gone are still kept: " + JSON.stringify(rooms));
+            for (const code of [shared, watched]) if (!rooms[code] || rooms[code].pid === 1) problems.push("the app did not take " + code + " as its own: " + JSON.stringify(rooms[code]));
+            if (problems.length) { console.error(problems.join("\n")); process.exit(1); }
+            console.log("back in", shared, "(sharing) and", watched, "(watching); zzzzzz said to be gone");
+          ' "$shared" "$watched"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -412,6 +484,7 @@ jobs:
           path: |
             mac-chat.png
             mac-chat.log
+            mac-restore.log
           if-no-files-found: warn
       - name: "Six viewers in one app"
         run: |
