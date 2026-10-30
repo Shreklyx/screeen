@@ -16,8 +16,11 @@ const uint8_t PEER = 0x53; // 'S': packets between the two ends (the relay forwa
 const uint8_t REG = 0x52;  // 'R': registration at the server
 const uint8_t REG_ACK = 0x41;
 // (FEC: parity for a group of a frame's packets – a type of its own, which older viewers ignore)
-enum T : uint8_t { PROBE = 1, PROBE_ACK = 2, MEDIA = 3, NACK = 4, PLI = 5, PING = 6, PONG = 7, REPORT = 8, BYE = 9, FEC = 10 };
+enum T : uint8_t { PROBE = 1, PROBE_ACK = 2, MEDIA = 3, NACK = 4, PLI = 5, PING = 6, PONG = 7, REPORT = 8, BYE = 9, FEC = 10, ACK = 11 };
 const uint8_t WHOLE = 4; // media flag: the whole frame in this one packet (the WebSocket path)
+// the WebSocket path: how long frames may queue on their way to a viewer that confirms them (a keyframe
+// longer: it is big, and what comes after it needs it) – beyond that they are dropped, not delayed
+const double kTcpQueueMs = 120, kKeyQueueMs = 400;
 const size_t RING = 1 << 14; // video packets kept for retransmission
 const size_t MAX_CANDS = 8;
 const char* INFO = "screenshare-direct-v1";
@@ -546,6 +549,17 @@ struct DirectEndpoint::Peer {
   uint64_t sentBytes = 0;
   bool dropping = false;
   uint32_t wholeSeq = 0;
+  // the WebSocket path to a viewer that confirms its frames (ACK): the frames still on their way – a
+  // queue anywhere between (the server, its proxy, the sockets) shows as frames confirmed late
+  struct Sent {
+    uint32_t id;
+    double at;
+    bool key;
+  };
+  std::deque<Sent> inFlight;
+  bool acks = false;
+  double ackMin[2] = {1e9, 1e9}; // the least time a frame took to be confirmed, in two 5 s windows: the path itself
+  double ackWindowAt = 0;
   // receiving video (viewer)
   std::optional<uint32_t> expect;
   std::map<uint32_t, Missing> missing;
@@ -712,9 +726,10 @@ void DirectEndpoint::addPeer(const std::string& id, const PeerInfo& info, std::f
     if (--*left > 0) return;
     auto it = peers_.find(id);
     if (it == peers_.end() || it->second.get() != peer) return done(false, {});
-    bool forced = forceRelay || forceTurn;
+    bool forced = forceRelay || forceTurn || forceTcp;
     Offer o;
     o.pub = base64Encode(peer->kp.pub.data(), 32);
+    o.tcp = forceTcp; // (as a browser: the other end reaches this one only in the WebSocket)
     if (!forced) for (const std::string& ip : localIPv4()) o.cands.push_back({ip, socket_.port(), false});
     // the public address: from the server's UDP port, or from the TURN server
     std::optional<Candidate> pub = peer->publicAddr;
@@ -992,6 +1007,9 @@ void DirectEndpoint::onMessage(const uint8_t* msg, size_t n, const Rinfo& from) 
     case PLI:
       if (role_ == Role::Host && ev_.keyframe) ev_.keyframe(p.id);
       break;
+    case ACK:
+      if (role_ == Role::Host) onAck(p, body.data(), body.size(), t);
+      break;
     case PING:
       if (body.size() >= 8) {
         uint8_t pong[16];
@@ -1067,7 +1085,14 @@ void DirectEndpoint::onMedia(Peer& p, const uint8_t* body, size_t n, double t) {
     }
     return;
   }
-  if (!(flags & WHOLE)) trackSequence(p, seq, t); // a whole frame is never asked for again
+  if (!(flags & WHOLE)) {
+    trackSequence(p, seq, t);
+  } else if (!noAcks) {
+    // the WebSocket path: the sharer learns how far the frames have come (see onAck)
+    uint8_t ack[4];
+    putU32(ack, frameId);
+    send(p, ACK, ack, 4);
+  }
   if (p.next && int32_t(frameId - *p.next) < 0) return; // already delivered or skipped
   auto it = p.frames.find(frameId);
   if (it == p.frames.end()) {
@@ -1398,8 +1423,17 @@ void DirectEndpoint::sendWhole(Peer& p, const MediaMeta& meta, uint32_t frameId,
   // what may wait in the socket: ~150 ms of video; more is only delay
   double limit = std::max(256.0 * 1024, bitrate_ / 8 * 0.15);
   double queued = double(p.tcp->bufferedAmount());
+  double t = nowMs();
   if (video) {
-    if (queued > limit || (p.dropping && !meta.key)) {
+    // a viewer that confirms its frames: how long the oldest one still on its way has waited beyond the
+    // path's own time – what queues between here and the viewer, where this socket does not see it
+    bool late = false;
+    if (p.acks && !p.inFlight.empty()) {
+      double base = std::min(p.ackMin[0], p.ackMin[1]);
+      const Peer::Sent& oldest = p.inFlight.front();
+      late = t - oldest.at - (base < 1e8 ? base : 0) > (oldest.key ? kKeyQueueMs : kTcpQueueMs);
+    }
+    if (queued > limit || late || (p.dropping && !meta.key)) {
       if (!p.dropping && ev_.keyframe) ev_.keyframe(p.id); // the next one goes when there is room
       p.dropping = true;
       return;
@@ -1420,9 +1454,31 @@ void DirectEndpoint::sendWhole(Peer& p, const MediaMeta& meta, uint32_t frameId,
   putF64(&b[16], meta.capture);
   putF64(&b[24], meta.ts);
   if (n) std::memcpy(&b[kMediaHeader], data, n);
-  p.lastSent = nowMs();
+  p.lastSent = t;
   Bytes packet = seal(*p.sendKey, p.sendDir(role_), MEDIA, p.session, ++p.counter, b.data(), b.size());
   p.tcp->sendBinary(packet.data(), packet.size());
+  if (video) {
+    p.inFlight.push_back({frameId, t, meta.key});
+    if (p.inFlight.size() > 600) p.inFlight.pop_front(); // (a viewer that confirms nothing any more)
+  }
+}
+
+/** Host: the viewer has this frame (the WebSocket path) – and every one before it. */
+void DirectEndpoint::onAck(Peer& p, const uint8_t* body, size_t n, double t) {
+  if (n < 4) return;
+  uint32_t id = getU32(body);
+  p.acks = true;
+  while (!p.inFlight.empty() && int32_t(p.inFlight.front().id - id) <= 0) {
+    if (p.inFlight.front().id == id) {
+      if (t - p.ackWindowAt > 5000) {
+        p.ackMin[1] = p.ackMin[0];
+        p.ackMin[0] = 1e9;
+        p.ackWindowAt = t;
+      }
+      p.ackMin[0] = std::min(p.ackMin[0], t - p.inFlight.front().at);
+    }
+    p.inFlight.pop_front();
+  }
 }
 
 void DirectEndpoint::enqueue(Peer& p, std::shared_ptr<const Bytes> payload, bool urgent, uint8_t type) {

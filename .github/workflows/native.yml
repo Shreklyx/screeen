@@ -91,10 +91,12 @@ jobs:
             if (!history || history.list.map((m) => m.text).join("|") !== "Hali, indulhat?|Szia, Anna!") throw new Error("the one who came later did not get it");
             console.log("chat ok");
           '
-      # Every path a frame can take, through a network that holds each packet 20 ms (then also loses 1%
-      # of them), with internet-sized packets (MTU 1500): straight to the viewer (UDP), through the
-      # server's relay (UDP, two legs), in the WebSocket (TCP, two legs, as to a browser) – how long a
-      # frame takes from the sharer to the viewer, beyond what the network itself takes
+      # Every path a frame can take, at a real screen's bitrate (12 Mbit/s), through a network that holds
+      # each packet 20 ms (then also loses 1% of them; then is slower than the picture) with internet-sized
+      # packets (MTU 1500): straight to the viewer (UDP), through the server's relay (UDP, two legs), in the
+      # WebSocket (TCP, two legs, as to a browser) – how long a frame takes from the sharer to the viewer,
+      # beyond what the network itself takes. On a line slower than the picture the viewer's confirmations
+      # keep the delay short (frames are dropped instead); without them it grows.
       - name: "Latency: every path"
         run: |
           PORT=8099 HOST_PASSWORD=ci DIRECT_PORT=3499 node server/server.js &
@@ -102,7 +104,7 @@ jobs:
           sudo ip link set lo mtu 1500
           measure() { # name, netem, legs, host flags, viewer flags
             sudo tc qdisc replace dev lo root netem $2
-            build/ss-cli host --server http://127.0.0.1:8099 --password ci --h264 native/tests/data/test.h264 --seconds 16 $4 > path-host.log &
+            build/ss-cli host --server http://127.0.0.1:8099 --password ci --h264 native/tests/data/test.h264 --seconds 16 --kbps 12000 $4 > path-host.log &
             host=$!
             for i in $(seq 1 80); do grep -q '^CODE' path-host.log 2>/dev/null && break; sleep 0.25; done
             code=$(grep '^CODE' path-host.log | awk '{print $2}')
@@ -111,24 +113,32 @@ jobs:
             sudo tc qdisc del dev lo root
             echo "$1|$3|$(grep '^RESULT' path-view.log | cut -c8-)" >> paths.txt
           }
-          measure "direct (UDP)"   "delay 20ms"         1 ""        ""
-          measure "relay (UDP)"    "delay 20ms"         2 "--relay" ""
-          measure "WebSocket (TCP)" "delay 20ms"        2 ""        "--tcp"
-          measure "direct, 1% lost"    "delay 20ms loss 1%" 1 ""        ""
-          measure "relay, 1% lost"     "delay 20ms loss 1%" 2 "--relay" ""
-          measure "WebSocket, 1% lost" "delay 20ms loss 1%" 2 ""        "--tcp"
+          measure "direct (UDP)"          "delay 20ms"            1 ""        ""
+          measure "relay (UDP)"           "delay 20ms"            2 "--relay" ""
+          measure "WebSocket (TCP)"       "delay 20ms"            2 ""        "--tcp"
+          measure "direct, 1% lost"       "delay 20ms loss 1%"    1 ""        ""
+          measure "relay, 1% lost"        "delay 20ms loss 1%"    2 "--relay" ""
+          measure "WebSocket, 1% lost"    "delay 20ms loss 1%"    2 ""        "--tcp"
+          measure "WebSocket, 8 Mbit/s"   "delay 20ms rate 8mbit" 2 ""        "--tcp"
+          measure "  same, unconfirmed"   "delay 20ms rate 8mbit" 2 ""        "--tcp --no-acks"
           sudo ip link set lo mtu 65536
           node -e '
             const rows = require("fs").readFileSync("paths.txt", "utf8").trim().split("\n").map((l) => l.split("|"));
-            let bad = false;
-            console.log("path                 network  median  (+ ours)   p90   frames  keyframes");
+            const got = {};
+            console.log("path                  network  median  (+ ours)     p90   frames  keyframes");
             for (const [name, legs, json] of rows) {
-              const r = JSON.parse(json || "{}"), net = 20 * Number(legs);
+              const r = (got[name] = JSON.parse(json || "{}")), net = 20 * Number(legs);
               const over = (v) => (v == null ? "  –" : (v - net >= 0 ? "+" : "") + (v - net).toFixed(1));
-              console.log(name.padEnd(21), String(net + " ms").padStart(7), String(r.latMedian).padStart(7), ("(" + over(r.latMedian) + ")").padStart(10), String(r.latP90).padStart(6), String(r.frames).padStart(8), String(r.keyframes).padStart(10));
-              if (!(r.frames > 300)) bad = true;
+              console.log(name.padEnd(21), String(net + " ms").padStart(8), String(r.latMedian).padStart(7), ("(" + over(r.latMedian) + ")").padStart(10), String(r.latP90).padStart(7), String(r.frames).padStart(8), String(r.keyframes).padStart(10));
             }
-            if (bad) { console.error("a path did not carry the picture"); process.exit(1); }
+            const problems = [];
+            for (const [name, legs] of [["direct (UDP)", 1], ["relay (UDP)", 2], ["WebSocket (TCP)", 2]]) {
+              const r = got[name] || {};
+              if (!(r.frames > 600) || !(r.latMedian < 20 * legs + 15)) problems.push(name + ": " + JSON.stringify(r));
+            }
+            const slow = got["WebSocket, 8 Mbit/s"] || {};
+            if (!(slow.latP90 < 600)) problems.push("a slow line made the WebSocket path late: " + JSON.stringify(slow));
+            if (problems.length) { console.error(problems.join("\n")); process.exit(1); }
           '
 
   # The native Windows app: MSVC build, then the real pipeline on this machine – the app shares

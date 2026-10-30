@@ -10,18 +10,24 @@
 // and HMAC, but cannot read the picture.
 // Over the WebSocket a frame goes as one packet (TCP loses nothing, so no NACK); a frame that
 // cannot be sent in time is dropped instead of waiting in a queue, and the viewer asks for a
-// keyframe. The viewer hands every frame to the page the moment it arrives.
+// keyframe. The viewer confirms each frame (ACK): a queue anywhere on the way – the server, its
+// proxy, the sockets – shows at the sharer, which drops frames before the delay grows. The viewer
+// hands every frame to the page the moment it arrives.
 //
 // window.ScreenShareWebDirect: { supported(): Promise<{ ok, keys, audio }>, create({ tcpUrl }) } – the
 // object create() returns has the same calls as the apps' engine.
 
 (() => {
   const PEER = 0x53;
-  const T = { PROBE: 1, PROBE_ACK: 2, MEDIA: 3, NACK: 4, PLI: 5, PING: 6, PONG: 7, REPORT: 8, BYE: 9 };
+  const T = { PROBE: 1, PROBE_ACK: 2, MEDIA: 3, NACK: 4, PLI: 5, PING: 6, PONG: 7, REPORT: 8, BYE: 9, ACK: 11 };
   const ROLE = { host: 1, viewer: 2 };
   const HEADER = 14;
   const MEDIA_HEADER = 32;
   const WHOLE = 4; // media flag: the whole frame in this one packet
+  // how long frames may queue on their way to a viewer that confirms them (a keyframe longer: it is big,
+  // and what comes after it needs it) – beyond that they are dropped, not delayed
+  const QUEUE_MS = 120;
+  const KEY_QUEUE_MS = 400;
   const INFO = new TextEncoder().encode('screenshare-direct-v1');
   const subtle = globalThis.crypto?.subtle;
   const now = () => performance.timeOrigin + performance.now();
@@ -137,6 +143,12 @@
       this.seq = 0;
       this.dropping = false;
       this.bps = 0;
+      // a viewer that confirms its frames (ACK): those still on their way – a queue anywhere between
+      // (the server, its proxy, the sockets) shows as frames confirmed late
+      this.inFlight = []; // { id, at, key }
+      this.acks = false;
+      this.ackMin = [Infinity, Infinity]; // the least time a frame took to be confirmed, in two 5 s windows
+      this.ackWindowAt = 0;
       // receiving video
       this.frames = new Map();
       this.next = null;
@@ -327,6 +339,9 @@
         case T.PLI:
           if (this.role === 'host') this.emit('keyframe', peer.id);
           break;
+        case T.ACK:
+          if (this.role === 'host' && body.length >= 4) this.onAck(peer, bv.getUint32(0), t);
+          break;
         case T.PING:
           if (body.length >= 8) {
             const pong = new Uint8Array(16);
@@ -380,6 +395,10 @@
         if (count === 1) this.emit('media', { stream: 1, sub: body[2], ts, capture, key: true }, data);
         return;
       }
+      // the sharer learns how far the frames have come (see onAck)
+      const ack = new Uint8Array(4);
+      new DataView(ack.buffer).setUint32(0, frameId);
+      peer.send(T.ACK, ack);
       if (peer.next != null && ((frameId - peer.next) | 0) < 0) return;
       let f = peer.frames.get(frameId);
       if (!f) {
@@ -435,6 +454,20 @@
       }
     }
 
+    /** Host: the viewer has this frame – and every one before it. */
+    onAck(peer, id, t) {
+      peer.acks = true;
+      while (peer.inFlight.length && ((peer.inFlight[0].id - id) | 0) <= 0) {
+        const f = peer.inFlight.shift();
+        if (f.id !== id) continue;
+        if (t - peer.ackWindowAt > 5000) {
+          peer.ackMin = [Infinity, peer.ackMin[0]];
+          peer.ackWindowAt = t;
+        }
+        peer.ackMin[0] = Math.min(peer.ackMin[0], t - f.at);
+      }
+    }
+
     requestKeyframe(peer, t = now()) {
       if (!peer?.path || t - peer.lastPli < 150) return;
       peer.lastPli = t;
@@ -452,11 +485,20 @@
       else this.audioSeq = (this.audioSeq + 1) >>> 0;
       // what may wait in the socket: ~150 ms of video; more is only delay
       const limit = Math.max(256 * 1024, (this.bps / 8) * 0.15);
+      const t = now();
       for (const peer of this.peers.values()) {
         if (peer.state !== 'connected' || !peer.ws) continue;
         const queued = peer.ws.bufferedAmount;
         if (video) {
-          if (queued > limit || (peer.dropping && !meta.key)) {
+          // a viewer that confirms its frames: how long the oldest one still on its way has waited beyond
+          // the path's own time – what queues between here and the viewer, where this socket does not see it
+          let late = false;
+          if (peer.acks && peer.inFlight.length) {
+            const base = Math.min(...peer.ackMin);
+            const oldest = peer.inFlight[0];
+            late = t - oldest.at - (Number.isFinite(base) ? base : 0) > (oldest.key ? KEY_QUEUE_MS : QUEUE_MS);
+          }
+          if (queued > limit || late || (peer.dropping && !meta.key)) {
             if (!peer.dropping) this.emit('keyframe', peer.id); // the next one goes when there is room
             peer.dropping = true;
             continue;
@@ -479,6 +521,10 @@
         v.setFloat64(24, Number(meta.ts) || 0);
         p.set(data instanceof Uint8Array ? data : new Uint8Array(data), MEDIA_HEADER);
         peer.send(T.MEDIA, p);
+        if (video) {
+          peer.inFlight.push({ id: frameId, at: t, key: Boolean(meta.key) });
+          if (peer.inFlight.length > 600) peer.inFlight.shift(); // (a viewer that confirms nothing any more)
+        }
       }
     }
 

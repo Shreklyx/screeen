@@ -39,6 +39,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2786,23 +2787,48 @@ int uiWatch(const std::string& server, const std::string& code, const std::wstri
 // --smoke-host <server> <password> <seconds> <log>: captures, encodes and shares the main screen
 // --smoke-view <server> <code> <seconds> <log>: watches a room and decodes what arrives
 /** (CI) This process's TCP connections to `port` – WinHTTP's sockets are handles of this process too –
- *  and whether Nagle's algorithm is off on them: [{nodelay}], empty when none is found. */
+ *  and whether Nagle's algorithm is off on them: [{nodelay}], empty when none is found. A socket call on
+ *  a handle that is no socket can wait (a pipe with a read pending): the search runs on a thread of its
+ *  own, from the newest handles down (the connection is new), past the standard ones, for at most 5 s. */
 Json tcpTo(int port) {
-  Json out = Json::array();
-  for (ULONG_PTR h = 4; h < 0x10000; h += 4) {
-    SOCKET s = SOCKET(h);
-    int type = 0, len = sizeof type;
-    if (getsockopt(s, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&type), &len) != 0 || type != SOCK_STREAM) continue;
-    sockaddr_storage sa{};
-    int sl = sizeof sa;
-    if (getpeername(s, reinterpret_cast<sockaddr*>(&sa), &sl) != 0) continue;
-    int p = sa.ss_family == AF_INET ? ntohs(reinterpret_cast<sockaddr_in*>(&sa)->sin_port) : sa.ss_family == AF_INET6 ? ntohs(reinterpret_cast<sockaddr_in6*>(&sa)->sin6_port) : -1;
-    if (p != port) continue;
-    DWORD v = 0;
-    int vl = sizeof v;
-    getsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&v), &vl);
-    out.push(Json::object().set("nodelay", v != 0));
+  struct Found {
+    std::mutex mu;
+    std::vector<bool> nodelay;
+    bool done = false;
+  };
+  auto found = std::make_shared<Found>();
+  HANDLE standard[3] = {GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE)};
+  std::thread([found, port, standard] {
+    for (ULONG_PTR h = 0x10000; h >= 4; h -= 4) {
+      if (HANDLE(h) == standard[0] || HANDLE(h) == standard[1] || HANDLE(h) == standard[2]) continue;
+      SOCKET s = SOCKET(h);
+      int type = 0, len = sizeof type;
+      if (getsockopt(s, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&type), &len) != 0 || type != SOCK_STREAM) continue;
+      sockaddr_storage sa{};
+      int sl = sizeof sa;
+      if (getpeername(s, reinterpret_cast<sockaddr*>(&sa), &sl) != 0) continue;
+      int p = sa.ss_family == AF_INET ? ntohs(reinterpret_cast<sockaddr_in*>(&sa)->sin_port) : sa.ss_family == AF_INET6 ? ntohs(reinterpret_cast<sockaddr_in6*>(&sa)->sin6_port) : -1;
+      if (p != port) continue;
+      DWORD v = 0;
+      int vl = sizeof v;
+      getsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&v), &vl);
+      std::lock_guard<std::mutex> l(found->mu);
+      found->nodelay.push_back(v != 0);
+    }
+    std::lock_guard<std::mutex> l(found->mu);
+    found->done = true;
+  }).detach();
+  for (int i = 0; i < 100; i++) {
+    {
+      std::lock_guard<std::mutex> l(found->mu);
+      if (found->done) break;
+    }
+    Sleep(50);
   }
+  std::lock_guard<std::mutex> l(found->mu);
+  Json out = Json::array();
+  for (bool v : found->nodelay) out.push(Json::object().set("nodelay", v));
+  if (!found->done) out.push(Json::object().set("search", "stopped after 5 s"));
   return out;
 }
 
@@ -2933,6 +2959,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
     int port = std::atoi(url.substr(url.rfind(':') + 1).c_str());
     std::fprintf(log, "BENCH %s\n", wsBench(openWinHttpWebSocket, url, 240, [port] { return tcpTo(port); }).dump().c_str());
     std::fclose(log);
+    TerminateProcess(GetCurrentProcess(), 0); // (a search thread may still wait)
     return 0;
   }
   g.shots = (argc == 3 && std::wstring(argv[1]) == L"--ui-shot") || (argc == 5 && std::wstring(argv[1]) == L"--ui-watch");

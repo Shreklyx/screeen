@@ -501,3 +501,47 @@ test('browser transport: without WebCrypto X25519 the key exchange is our WebAss
     globalThis.ScreenShareWasm.load = load;
   }
 });
+
+test('browser transport: frames not confirmed in time (a queue on the way) are dropped, not left to wait', async () => {
+  // a browser sharing to a browser: the viewer confirms each frame
+  const { createApp } = await import('../server/server.js');
+  const app = createApp({ port: 0, host: '127.0.0.1', hostPassword: 'x', turnSecret: '', directPort: 0 });
+  await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
+  const tcpUrl = `ws://127.0.0.1:${app.server.address().port}/direct`;
+  const { session, secret } = app.relay.create({ room: 'r', viewer: 'v1' });
+  const api = await loadWebDirect();
+  const host = api.create({ tcpUrl });
+  const viewer = api.create({ tcpUrl });
+  const hostEvents = [];
+  const viewerEvents = [];
+  const got = [];
+  host.onEvent((name, ...args) => hostEvents.push([name, ...args]));
+  viewer.onEvent((name, ...args) => viewerEvents.push([name, ...args]));
+  viewer.onMedia((meta) => { if (meta.stream === 0) got.push(meta.ts); });
+  try {
+    const info = { session, secret, port: 0 };
+    const offer = await host.add('host', 'v1', info);
+    const answer = await viewer.add('viewer', 'host', info);
+    host.connect('v1', answer);
+    viewer.connect('host', offer);
+    const connected = (events) => events.some(([n, , s]) => n === 'state' && s?.state === 'connected');
+    await until(() => connected(hostEvents) && connected(viewerEvents), 8000);
+    for (let n = 0; n < 10; n++) {
+      host.send({ stream: 0, key: n === 0, ts: n, capture: n }, new Uint8Array(frame(n, 20000)));
+      await sleep(20);
+    }
+    await until(() => got.length === 10);
+    await sleep(50);
+    assert.ok(!hostEvents.some(([n]) => n === 'keyframe'), 'nothing dropped while the frames are confirmed');
+    // the viewer's line stalls: no confirmations come, the next frame would only wait behind the last
+    viewer.stop();
+    host.send({ stream: 0, key: false, ts: 10, capture: 10 }, new Uint8Array(frame(10, 20000)));
+    await sleep(300);
+    host.send({ stream: 0, key: false, ts: 11, capture: 11 }, new Uint8Array(frame(11, 20000)));
+    assert.ok(hostEvents.some(([n]) => n === 'keyframe'), 'the late frame is dropped and a keyframe asked for');
+  } finally {
+    host.stop();
+    viewer.stop();
+    await app.close();
+  }
+});

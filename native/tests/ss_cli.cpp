@@ -5,6 +5,7 @@
 //   ss-cli view --server http://127.0.0.1:8090 --code abc123 [--seconds 10] [--out received.h264]
 //   the room's chat, both: [--name NAME] [--chat TEXT (once in the room)] [--chat-reply TEXT ({name}: who wrote)]
 //   host: [--resume CODE:TOKEN (take that room back)] [--keep (leave the room open at the end, as an app quitting)]
+//         [--kbps N (frames padded to that bitrate)] [--relay] [--tcp]; view: [--tcp] [--no-acks (frames not confirmed)]
 //   ss-cli ws-bench --url ws://127.0.0.1:8095 [--count 240]   (round trips through an echo server)
 //
 // Prints the engine's events as JSON lines; "host" prints "CODE <code>" and "TOKEN <token>" once the room is open,
@@ -91,6 +92,14 @@ static int host(int argc, char** argv) {
   }
   int fps = std::stoi(arg(argc, argv, "--fps", "60"));
   double seconds = std::stod(arg(argc, argv, "--seconds", "30"));
+  // --kbps: every frame padded (zeros after its data, as trailing_zero bytes) to carry that many
+  // kilobits a second on average – as a real screen at that bitrate (the viewer does not decode)
+  if (double kbps = std::stod(arg(argc, argv, "--kbps", "0")); kbps > 0) {
+    size_t total = 0;
+    for (const Bytes& f : frames) total += f.size();
+    double avg = double(total) / double(frames.size()), want = kbps * 1000 / 8 / fps;
+    for (Bytes& f : frames) f.resize(f.size() + (want > avg ? size_t(want - avg) : 0), 0);
+  }
   std::atomic<bool> streaming{false}, key{true};
   std::atomic<int> keyframes{0};
   EngineConfig cfg;
@@ -156,6 +165,7 @@ static int view(int argc, char** argv) {
   EngineConfig cfg;
   cfg.server = arg(argc, argv, "--server", "http://127.0.0.1:8090");
   cfg.forceTcp = flag(argc, argv, "--tcp");
+  cfg.noAcks = flag(argc, argv, "--no-acks");
   Chat chat(argc, argv);
   EngineCallbacks cb;
   cb.event = [&chat](const Json& e) { if (!chat.on(e)) line("EVENT " + e.dump()); };

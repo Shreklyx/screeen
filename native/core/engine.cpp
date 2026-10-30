@@ -321,6 +321,7 @@ struct Engine::Impl {
     ep->forceRelay = cfg.forceRelay;
     ep->forceTurn = cfg.forceTurn;
     ep->forceTcp = cfg.forceTcp;
+    ep->noAcks = cfg.noAcks;
     if (!ep->open()) status("A közvetlen átvitel nem indult el (UDP).", "error");
   }
 

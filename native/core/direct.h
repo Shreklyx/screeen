@@ -10,7 +10,8 @@
 // Connection: both ends register at the server's UDP port (the answer is their public address),
 // exchange addresses over signaling and probe each other (UDP hole punching). When no direct path
 // answers, packets go through the server's UDP relay – or the TURN server – or, when no UDP gets
-// through at all, in a WebSocket to the server (wss://…/direct), where a frame is one packet.
+// through at all, in a WebSocket to the server (wss://…/direct), where a frame is one packet and the
+// viewer confirms each one (a queue on the way shows at the sharer, which drops frames instead).
 //
 // Everything runs on the Loop's thread.
 #pragma once
@@ -120,6 +121,7 @@ class DirectEndpoint {
   // tests: parity for every viewer, one per this many packets (0: as the viewers' losses say); a
   // packet "lost" on its way in (true: dropped)
   int forceFec = 0;
+  bool noAcks = false; // tests: a viewer that does not confirm its frames (as an older one)
   std::function<bool(uint8_t type, const uint8_t* body, size_t n)> dropIncoming;
   /** Viewer: packets rebuilt from parity (without waiting for them again). */
   uint64_t fecRebuilt() const { return fecRebuilt_; }
@@ -166,6 +168,7 @@ class DirectEndpoint {
   void enqueue(Peer& p, std::shared_ptr<const Bytes> payload, bool urgent, uint8_t type);
   void drain();
   void onNack(Peer& p, const uint8_t* body, size_t n);
+  void onAck(Peer& p, const uint8_t* body, size_t n, double t);
   void report(Peer& p, double t);
   Peer* bySession(uint32_t s);
 
