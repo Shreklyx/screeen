@@ -427,6 +427,13 @@ void Canvas::icon(Icon i, float cx, float cy, float size, const Color& c, float 
       L(12, 5, 12, 19);
       L(5, 12, 19, 12);
       break;
+    case Icon::Chat: // a speech bubble
+      poly({{4.5f, 5.5f}, {19.5f, 5.5f}, {19.5f, 15.5f}, {11, 15.5f}, {6.5f, 19.5f}, {6.5f, 15.5f}, {4.5f, 15.5f}}, false, true);
+      break;
+    case Icon::Send: // a paper plane
+      poly({{3.5f, 11}, {20.5f, 4}, {14, 20.5f}, {11, 13}}, false, true);
+      L(11, 13, 20.5f, 4);
+      break;
   }
 }
 

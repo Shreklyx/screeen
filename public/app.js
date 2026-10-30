@@ -2050,11 +2050,11 @@ const CHAT_KEEP = 200; // messages kept on the page
 const chatClock = new Intl.DateTimeFormat('hu-HU', { hour: '2-digit', minute: '2-digit' });
 const chatName = () => store.get('ss-name', '') || undefined;
 
-/** A colour of its own for each writer (the sharer has the accent colour). */
+/** A colour of its own for each writer (the sharer has the accent colour); the apps use the same. */
 function chatHue(from) {
   let h = 0;
   for (const ch of String(from)) h = (Math.imul(h, 31) + ch.codePointAt(0)) >>> 0;
-  return h % 360;
+  return Math.floor(((Math.imul(h, 2654435761) >>> 0) / 4294967296) * 360); // (the golden angle apart: v7 and v8 far apart)
 }
 
 function chatTooFast() {

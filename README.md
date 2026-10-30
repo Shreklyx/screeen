@@ -87,6 +87,11 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
 2. Válaszd ki, mit osztasz meg, majd küldd el a kapott linket (vagy a 6 karakteres kódot) a nézőknek.
 3. A nézők megnyitják a linket bármilyen friss böngészőben (telefonon is). Ami nagyon régi (WebCodecs nélküli)
    böngésző, az üzenetet kap, hogy frissítsen vagy használja az alkalmazást.
+4. **Chat:** a szobában mindenki – a megosztó és minden néző, böngészőben és alkalmazásban – ír mindenkinek. A
+   megosztónál a *Chat* doboz a meghívó alatt; a nézőnél a kép mellett (széles ablakban eleve nyitva, keskenyen
+   alatta, teljes képernyőn is látszik), **C**-vel nyílik / csukódik. Csukott chatnél a gombon a számláló mutatja, mi
+   jött, és az új üzenet pár másodpercre a képen is megjelenik. A neved a *Neved* mezőben adhatod meg (a gép
+   megjegyzi); enélkül *Megosztó* / *Néző 1, 2…*. Aki később jön, megkapja az utolsó 50 üzenetet.
 
 ### Hang Windows 10 / 11 alatt
 
@@ -202,6 +207,10 @@ sötét menüivel): kompakt ablak, Megosztás / Nézés kapcsoló, csoportosíto
   sávjában), **Ctrl+N**, vagy a tálcán az ikon jobb gombos menüje → *Új ablak*; Macen *Fájl → Új ablak* (**⌘N**),
   a Dock ikonjának menüje, vagy a nézés sávjának **＋** gombja. Minden ablak külön néz (vagy oszt meg), saját
   hanggal és hangerővel; a címsorban (Macen az *Ablak* menüben) a szoba kódja.
+- **Chat** (megosztáskor és nézéskor is): a megosztó ablakában a *Chat* doboz, nézéskor a kép jobb oldalán a panel
+  (a sáv chat gombja vagy **C**; Esc-kel vissza a kép billentyűihez). Csukott panelnél a gombon a számláló, az új
+  üzenet pedig buborékban a kép bal alsó sarkában (teljes képernyőn is) – rákattintva nyílik a chat; ha az ablak
+  nincs előtérben, a tálcán villog. A név a *Neved* mezőben (a gép megjegyzi), a nézők listájában is látszik.
 - **Hang:** ha menet közben más lesz a gép hangeszköze (fülhallgató, Bluetooth, elalvó monitorhangszóró), a
   megosztás és a nézés is magától átvált rá. A hang nem csúszik a kép mögé: ami egy hálózati akadás után
   felgyűlt, azt átugorja (2 ms-os áttűnéssel, kattanás nélkül), csend / szünet után sem késik jobban, és ha a

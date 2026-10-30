@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -98,9 +99,9 @@ enum class Screen { Home, Hosting, Viewing };
 // what can be clicked (and the text boxes)
 enum Id {
   ID_NONE = 0,
-  ID_PASSWORD = 100, ID_CODE,
+  ID_PASSWORD = 100, ID_CODE, ID_CHAT, ID_NAME,
   B_SHARE = 200, B_JOIN, B_REMEMBER, B_AUDIO, B_UPDATE, B_ABOUT, B_COPY, B_PAUSE, B_STOP, B_FULL, B_LEAVE, B_VOLUME, B_MUTE,
-  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL, B_TAB0, B_TAB1, B_MONITOR, B_QUALITY, B_NEW,
+  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL, B_TAB0, B_TAB1, B_MONITOR, B_QUALITY, B_NEW, B_CHAT, B_CHAT_SEND, B_CHAT_CLOSE,
 };
 const UINT kMenuMonitor0 = 1000, kMenuQuality0 = 2000; // the pop-up menus' items
 
@@ -121,6 +122,14 @@ const Quality kQualities[] = {
 struct Hit {
   Rect r;
   int id;
+};
+
+/** One message of the room's chat, as shown. */
+struct ChatLine {
+  std::wstring name, text, time;
+  std::string from;
+  bool mine = false, host = false;
+  float h = 0, hw = 0; // its height at the width hw (measured once)
 };
 
 struct App {
@@ -167,6 +176,21 @@ struct App {
   float volume = 1.0f;
   WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
   LONG_PTR savedStyle = 0;
+
+  // the room's chat (sharing and watching): what was said, the box to write in and the name under it
+  std::vector<ChatLine> chat;
+  HWND chatEdit = nullptr, nameEdit = nullptr;
+  std::wstring chatPending, chatNote; // what was sent and not delivered yet; a note under the box
+  double chatNoteAt = -1e9;
+  bool chatOpen = true; // the viewer's panel (kept)
+  int unread = 0;       // came while it was closed
+  float chatBackTarget = 0; // scrolled back from the newest (DIPs)
+  Rect chatList;        // where the messages are on the window (for the wheel)
+  // with the panel closed, the newest message over the picture for a few seconds (in full screen too)
+  HWND pop = nullptr;
+  Canvas popCanvas;
+  ChatLine popLine;
+  double popAt = 0;
 
   std::wstring shareErr, joinErr, statusText, roomCode, info, overlayText, viewInfo;
   std::string statusKind, roomLink;
@@ -239,6 +263,17 @@ DWORD loadDword(const wchar_t* name, DWORD fallback) {
 }
 
 void saveDword(const wchar_t* name, DWORD v) { RegSetKeyValueW(HKEY_CURRENT_USER, kKey, name, REG_DWORD, &v, sizeof v); }
+
+std::wstring loadString(const wchar_t* name) {
+  wchar_t buf[256] = {};
+  DWORD size = sizeof buf - sizeof(wchar_t);
+  if (RegGetValueW(HKEY_CURRENT_USER, kKey, name, RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS) return L"";
+  return buf;
+}
+
+void saveString(const wchar_t* name, const std::wstring& v) {
+  RegSetKeyValueW(HKEY_CURRENT_USER, kKey, name, REG_SZ, v.c_str(), DWORD((v.size() + 1) * sizeof(wchar_t)));
+}
 
 /** The sharing password, encrypted for this Windows user (DPAPI). */
 void savePassword(const std::wstring& pw) {
@@ -382,6 +417,16 @@ void toggleSwitch(int id, const Rect& row, bool on) {
   c.fillRound(knob, knob.h / 2, cWhite);
 }
 
+HWND editFor(int id) {
+  switch (id) {
+    case ID_PASSWORD: return g.pass;
+    case ID_CODE: return g.code;
+    case ID_CHAT: return g.chatEdit;
+    case ID_NAME: return g.nameEdit;
+    default: return nullptr;
+  }
+}
+
 /** A text box: drawn here, the Windows edit control sits inside it. */
 void field(int id, const Rect& r) {
   g.fieldRects[id] = r;
@@ -392,7 +437,7 @@ void field(int id, const Rect& r) {
   c.fillRound(r, 6, cField);
   c.strokeRound(r, 6, rgb(0xFFFFFF, 0.14f), 1);
   // while the screens cross-fade the edit control is hidden: its text is drawn instead
-  HWND h = id == ID_PASSWORD ? g.pass : g.code;
+  HWND h = editFor(id);
   if (g.transitioning && h) {
     std::wstring t = getText(h);
     if (id == ID_PASSWORD) t = std::wstring(t.size(), L'\x25CF');
@@ -606,9 +651,131 @@ void viewerRow(const Json& v, const Rect& r) {
                      : state == "retrying"    ? L"kapcsolat újra… " + toW(v["whyText"].str(""))
                                               : L"kapcsolódik…";
   float tw = std::max(40.0f, x - 12 - (r.x + 30));
-  c.text(L"Néző #" + std::to_wstring(int(v["n"].num())), {r.x + 30, r.cy() - 17, tw, 18}, 13, Medium, cText);
+  std::string name = v["name"].str("");
+  c.text(name.empty() ? L"Néző #" + std::to_wstring(int(v["n"].num())) : toW(name), {r.x + 30, r.cy() - 17, tw, 18}, 13, Medium, cText);
   c.text(sub, {r.x + 30, r.cy() + 1, tw, 15}, 11, Regular, cMuted);
   c.popAlpha();
+}
+
+/* ------------------------------------------------ the room's chat (drawing) */
+
+/** A colour of its own for each writer – the website's: hsl(hash % 360, 80%, 74%). */
+Color nameColor(const std::string& from) {
+  uint32_t h = 0;
+  for (unsigned char ch : from) h = h * 31 + ch;
+  h *= 2654435761u; // (the golden angle apart: viewers v7 and v8 far apart)
+  float hue = float(std::floor(double(h) / 4294967296.0 * 360.0)) / 60.0f, l = 0.74f, ch = (1 - std::fabs(2 * l - 1)) * 0.8f;
+  float x = ch * (1 - std::fabs(std::fmod(hue, 2.0f) - 1)), m = l - ch / 2;
+  float rgbv[6][3] = {{ch, x, 0}, {x, ch, 0}, {0, ch, x}, {0, x, ch}, {x, 0, ch}, {ch, 0, x}};
+  const float* v = rgbv[std::min(5, int(hue))];
+  return {v[0] + m, v[1] + m, v[2] + m, 1};
+}
+
+ChatLine chatLine(const Json& m) {
+  ChatLine l;
+  l.name = toW(m["name"].str());
+  l.text = toW(m["text"].str());
+  l.from = m["from"].str();
+  l.mine = m["mine"].b(false);
+  l.host = m["host"].b(false);
+  time_t t = time_t(m["at"].num() / 1000);
+  tm lt{};
+  if (m["at"].isNumber() && localtime_s(&lt, &t) == 0) {
+    wchar_t b[8];
+    swprintf(b, 8, L"%02d:%02d", lt.tm_hour, lt.tm_min);
+    l.time = b;
+  }
+  return l;
+}
+
+/** The messages in r, the newest at the bottom (the wheel scrolls back). */
+void chatMessages(const Rect& r) {
+  g.chatList = {r.x, r.y - (g.screen == Screen::Viewing ? 0 : g.scroll), r.w, r.h};
+  if (g.measuring) return;
+  Canvas& c = C();
+  if (g.chat.empty()) {
+    std::wstring empty = g.screen == Screen::Hosting ? L"Itt beszélgethetsz a nézőkkel – ők is írhatnak." : L"Még senki nem írt. Köszönj a többieknek!";
+    c.text(empty, r.inset(18, 0), 12.5f, Regular, cMuted, Center, true, true);
+    return;
+  }
+  float w = r.w - 28, total = 0;
+  for (ChatLine& m : g.chat) {
+    if (m.hw != w) { // (measured once: a message's height at this width)
+      float th = 0;
+      c.measure(m.text.empty() ? L" " : m.text, 13, Regular, w, &th);
+      m.h = 17 + th;
+      m.hw = w;
+    }
+    total += m.h + 10;
+  }
+  g.chatBackTarget = std::clamp(g.chatBackTarget, 0.0f, std::max(0.0f, total + 8 - r.h));
+  float back = A().to("chatback", g.chatBackTarget, 120);
+  c.pushClip(r);
+  float y = r.bottom() - 8 + back;
+  for (size_t i = g.chat.size(); i-- > 0 && y > r.y;) {
+    const ChatLine& m = g.chat[i];
+    y -= m.h;
+    if (y < r.bottom()) {
+      float x = r.x + 14, nw = c.measure(m.name, 12, Semibold);
+      c.text(m.name, {x, y, nw + 2, 16}, 12, Semibold, m.host ? cAccent : nameColor(m.from));
+      x += nw + 6;
+      std::wstring tag = m.host ? (m.mine ? L"megosztó (te)" : L"megosztó") : m.mine ? L"(te)" : L"";
+      if (!tag.empty()) {
+        float tw = c.measure(tag, 10.5f, Regular);
+        c.text(tag, {x, y, tw + 2, 16}, 10.5f, Regular, cFaint);
+        x += tw + 6;
+      }
+      c.text(m.time, {x, y, 60, 16}, 10.5f, Regular, cFaint);
+      c.text(m.text, {r.x + 14, y + 17, w + 2, m.h - 15}, 13, Regular, m.mine ? cWhite : cText, Left, false, true);
+    }
+    y -= 10;
+  }
+  c.popClip();
+}
+
+/** How tall the box to write in is, with the name and the note under it. */
+float chatInputHeight(float w) {
+  float h = 30 + 8 + 26;
+  if (!g.chatNote.empty()) {
+    float nh = 0;
+    C().measure(g.chatNote, 11.5f, Regular, w - 4, &nh);
+    h += 6 + nh;
+  }
+  return h;
+}
+
+/** The box to write in and the send button; the name under them; a note (too fast, not sent…). */
+void chatInput(float x, float y, float w) {
+  field(ID_CHAT, {x, y, w - 38 - 8, 30});
+  button(B_CHAT_SEND, {x + w - 38, y, 38, 30}, L"", Style::Primary, true, Icon::Send);
+  tip(B_CHAT_SEND, L"Küldés (Enter)");
+  y += 30 + 8;
+  if (!g.measuring) C().text(L"Neved", {x + 2, y, 50, 26}, 12, Regular, cMuted);
+  field(ID_NAME, {x + 52, y, w - 52, 26});
+  y += 26;
+  if (!g.chatNote.empty() && !g.measuring) {
+    float nh = 0;
+    C().measure(g.chatNote, 11.5f, Regular, w - 4, &nh);
+    C().text(g.chatNote, {x + 2, y + 6, w - 4, nh + 2}, 11.5f, Regular, cWarn, Left, false, true);
+  }
+}
+
+const float kChatW = 300; // the viewer's chat panel
+
+/** The viewer's chat, at the right of the picture. */
+void chatPanel(const Rect& p) {
+  Canvas& c = C();
+  c.verticalGradient(p, cWin1, cWin2);
+  c.fillRect({p.x, p.y, 1, p.h}, rgb(0xFFFFFF, 0.08f));
+  c.text(L"Chat", {p.x + 16, p.y, 120, 46}, 13, Semibold, cText);
+  button(B_CHAT_CLOSE, {p.right() - 12 - 30, p.y + 8, 30, 30}, L"", Style::Ghost, true, Icon::Close);
+  tip(B_CHAT_CLOSE, L"Chat bezárása (C)");
+  float ih = chatInputHeight(p.w - 24);
+  Rect list{p.x + 1, p.y + 46, p.w - 1, std::max(40.0f, p.h - 46 - ih - 24)};
+  c.fillRect({p.x + 12, list.y - 1, p.w - 24, 1}, rgb(0xFFFFFF, 0.07f));
+  chatMessages(list);
+  c.fillRect({p.x + 12, list.bottom(), p.w - 24, 1}, rgb(0xFFFFFF, 0.07f));
+  chatInput(p.x + 12, list.bottom() + 12, p.w - 24);
 }
 
 float drawHosting(float W, float) {
@@ -648,6 +815,14 @@ float drawHosting(float W, float) {
     c.text(g.info, {x0 + 12, y + 40 + 9, cw - 24, ih + 2}, 11.5f, Regular, cMuted, Left, false, true);
   }
   y += sh + 22;
+  // the chat with the viewers
+  if (!g.measuring) c.text(L"Chat", {x0 + 4, y, 200, 18}, 13, Semibold, cText);
+  y += 18 + 7;
+  float lh = 170, chh = chatInputHeight(cw - 24);
+  group({x0, y, cw, lh + 12 + chh + 12}, {y + lh});
+  chatMessages({x0, y, cw, lh});
+  chatInput(x0 + 12, y + lh + 12, cw - 24);
+  y += lh + 12 + chh + 12 + 22;
   // the viewers
   int count = int(g.viewers.size());
   if (!g.measuring) {
@@ -684,7 +859,7 @@ const float kBarH = 52;
 
 /** The viewer's bar: where its parts are (the drawing and the volume drag use the same numbers). */
 struct BarLayout {
-  Rect leave, full, volume, mute, more;
+  Rect leave, full, volume, mute, more, chat;
   float textRight;
 };
 
@@ -700,6 +875,8 @@ BarLayout barLayout(float W) {
   b.mute = {right - 34, 11, 34, 30};
   right -= 34 + 8;
   b.more = {right - 34, 11, 34, 30};
+  right -= 34 + 8;
+  b.chat = {right - 34, 11, 34, 30};
   b.textRight = right - 34 - 12;
   return b;
 }
@@ -708,7 +885,8 @@ float drawViewing(float W, float H) {
   Canvas& c = C();
   float barH = g.fullscreen ? 0 : kBarH;
   if (g.measuring) return H;
-  c.fillRect({0, barH, W, H - barH}, rgb(0x000000));
+  float VW = W - (g.chatOpen ? kChatW : 0); // the picture's width (the chat at its right)
+  c.fillRect({0, barH, VW, H - barH}, rgb(0x000000));
   if (!g.fullscreen) {
     BarLayout b = barLayout(W);
     c.verticalGradient({0, 0, W, barH}, cWin1, cWin2);
@@ -719,6 +897,15 @@ float drawViewing(float W, float H) {
     tip(B_FULL, L"Teljes képernyő (F)");
     button(B_NEW, b.more, L"", Style::Ghost, true, Icon::Plus);
     tip(B_NEW, L"Új ablak – még egy szoba nézése (Ctrl+N)");
+    button(B_CHAT, b.chat, L"", g.chatOpen ? Style::Secondary : Style::Ghost, true, Icon::Chat);
+    tip(B_CHAT, g.chatOpen ? L"Chat bezárása (C)" : L"Chat (C)");
+    if (g.unread > 0 && !g.chatOpen) { // what came while it was closed
+      std::wstring n = g.unread > 99 ? L"99+" : std::to_wstring(g.unread);
+      float bw = std::max(17.0f, c.measure(n, 10.5f, Bold) + 9);
+      Rect badge{b.chat.right() - bw + 5, b.chat.y - 4, bw, 17};
+      c.fillRound(badge, 8.5f, cAccent);
+      c.text(n, badge, 10.5f, Bold, cWhite, Center);
+    }
     // volume: the icon mutes, the bar sets it
     hit(B_VOLUME, {b.volume.x - 8, 12, b.volume.w + 16, 28});
     float vol = A().to("vol", g.muted ? 0.0f : g.volume, 90);
@@ -733,10 +920,11 @@ float drawViewing(float W, float H) {
     float hw = c.measure(head, 13, Semibold);
     c.text(g.viewInfo, {38 + hw + 14, 0, std::max(0.0f, b.textRight - (38 + hw + 14)), barH}, 12, Regular, cMuted);
   }
+  if (g.chatOpen) chatPanel({VW, barH, W - VW, H - barH});
   if (!g.picture || g.transitioning || !g.player || !g.player->hasPicture()) {
     float cy = barH + (H - barH) / 2;
-    spinner(W / 2, cy - 28, 15, cMuted);
-    c.text(g.overlayText, {40, cy + 2, W - 80, 60}, 14, Medium, withAlpha(cText, 0.9f), Center, false, true);
+    spinner(VW / 2, cy - 28, 15, cMuted);
+    c.text(g.overlayText, {40, cy + 2, VW - 80, 60}, 14, Medium, withAlpha(cText, 0.9f), Center, false, true);
   }
   return H;
 }
@@ -954,13 +1142,16 @@ void updateChildren() {
   bool home = g.screen == Screen::Home && !g.transitioning;
   placeChild(ID_PASSWORD, g.pass, home && g.tab == 0);
   placeChild(ID_CODE, g.code, home && g.tab == 1);
+  bool chat = !g.transitioning && !g.modal.open && (g.screen == Screen::Hosting || (g.screen == Screen::Viewing && g.chatOpen));
+  placeChild(ID_CHAT, g.chatEdit, chat);
+  placeChild(ID_NAME, g.nameEdit, chat);
   // (the window only once a frame is on it: before that a new swap chain shows whatever was there)
   bool video = g.screen == Screen::Viewing && g.picture && !g.transitioning && g.player && g.player->hasPicture();
   if (video) {
     RECT rc;
     GetClientRect(g.wnd, &rc);
     int top = g.fullscreen ? 0 : px(kBarH);
-    RECT want = {0, top, rc.right, std::max<LONG>(top + 1, rc.bottom)};
+    RECT want = {0, top, std::max<LONG>(1, rc.right - (g.chatOpen ? px(kChatW) : 0)), std::max<LONG>(top + 1, rc.bottom)};
     RECT& was = g.placed[-1];
     if (!EqualRect(&was, &want)) {
       was = want;
@@ -979,6 +1170,7 @@ void paint() {
   A().frame(nowMs());
   g.hits.clear();
   g.tips.clear();
+  g.chatList = {};
   float W = c.width(), H = c.height();
   float t = 1;
   if (g.transitioning) {
@@ -1171,6 +1363,111 @@ void setJumpList() {
 
 /* ------------------------------------------------ sessions */
 
+/* ------------------------------------------------ the room's chat (what it does) */
+
+/** A note under the box to write in (too fast, not sent…); `lasting`: until the next one. */
+void setChatNote(const std::wstring& text, bool lasting = false) {
+  g.chatNote = text;
+  g.chatNoteAt = lasting ? 0 : nowMs();
+  relayout();
+}
+
+/** With the panel closed: the newest message over the picture's bottom left for a few seconds. */
+void hidePop() {
+  g.popAt = 0;
+  if (g.pop) ShowWindow(g.pop, SW_HIDE);
+}
+
+void showPop(const ChatLine& m) {
+  if (IsIconic(g.wnd)) return;
+  if (!g.pop) g.pop = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"SSChatPop", L"", WS_POPUP, 0, 0, 10, 10, g.wnd, nullptr, g.inst, nullptr);
+  if (!g.pop) return;
+  g.popLine = m;
+  // as wide as it needs (at most 380), the text wrapped under the name
+  Canvas& c = g.popCanvas;
+  float w = std::min(380.0f, std::max(c.measure(m.text, 13.5f, Regular), c.measure(m.name, 12.5f, Semibold)) + 30), th = 0;
+  c.measure(m.text, 13.5f, Regular, w - 28, &th);
+  RECT rc;
+  GetClientRect(g.wnd, &rc);
+  int pw = px(w), ph = px(th + 40);
+  POINT at{px(16), rc.bottom - px(18) - ph};
+  ClientToScreen(g.wnd, &at);
+  SetWindowPos(g.pop, HWND_TOP, at.x, at.y, pw, ph, SWP_NOACTIVATE);
+  SetWindowRgn(g.pop, CreateRoundRectRgn(0, 0, pw + 1, ph + 1, px(20), px(20)), TRUE);
+  if (g.popAt == 0) SetLayeredWindowAttributes(g.pop, 0, 0, LWA_ALPHA);
+  g.popAt = nowMs();
+  ShowWindow(g.pop, SW_SHOWNOACTIVATE);
+  InvalidateRect(g.pop, nullptr, FALSE);
+  SetTimer(g.pop, 1, 16, nullptr);
+}
+
+void paintPop() {
+  Canvas& c = g.popCanvas;
+  if (!c.begin(g.pop, float(g.dpi))) return;
+  float W = c.width(), H = c.height();
+  const ChatLine& m = g.popLine;
+  c.clear(rgb(0x1E1E23));
+  c.strokeRound({0.5f, 0.5f, W - 1, H - 1}, 10, rgb(0xFFFFFF, 0.14f), 1);
+  c.text(m.name, {14, 9, W - 28, 18}, 12.5f, Semibold, m.host ? cAccent : nameColor(m.from));
+  c.text(m.text, {14, 28, W - 28, H - 34}, 13.5f, Regular, cText, Left, false, true);
+  c.end();
+}
+
+LRESULT CALLBACK popProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
+
+/** The viewer's chat panel on or off (kept); open, it is ready to type in. */
+void setChatOpen(bool open, bool focus = true) {
+  g.chatOpen = open;
+  saveDword(L"ChatOpen", open);
+  if (open) {
+    g.unread = 0;
+    g.chatBackTarget = 0;
+    hidePop();
+  }
+  g.placed.erase(-1); // the picture gets narrower / wider
+  invalidate();
+  UpdateWindow(g.wnd);
+  if (open && focus) SetFocus(g.chatEdit);
+  else if (!open) SetFocus(g.wnd);
+  animate();
+}
+
+void sendChat() {
+  std::wstring t = getText(g.chatEdit);
+  size_t a = t.find_first_not_of(L" \t"), b = t.find_last_not_of(L" \t");
+  if (a == std::wstring::npos) return;
+  t = t.substr(a, b - a + 1);
+  if (!g.engine) {
+    setChatNote(L"Nem vagy szobában – az üzenet nem ment el.");
+    return;
+  }
+  g.chatPending = t; // (back in the box if it could not go)
+  g.engine->sendChat(narrow(t.c_str()));
+  SetWindowTextW(g.chatEdit, L"");
+  g.chatBackTarget = 0;
+  animate();
+}
+
+/** The name in the chat: kept, and told to the room (empty: the server's – Megosztó, Néző 3…). */
+void commitName() {
+  std::wstring n = getText(g.nameEdit);
+  size_t a = n.find_first_not_of(L" \t"), b = n.find_last_not_of(L" \t");
+  n = a == std::wstring::npos ? L"" : n.substr(a, std::min<size_t>(b - a + 1, 24));
+  if (n == loadString(L"ChatName")) return;
+  saveString(L"ChatName", n);
+  if (g.engine && !n.empty()) g.engine->setName(narrow(n.c_str()));
+}
+
+/** A new room: its chat starts empty (what was said there comes from the server). */
+void resetChat() {
+  g.chat.clear();
+  g.unread = 0;
+  g.chatBackTarget = 0;
+  g.chatPending.clear();
+  g.chatNote.clear();
+  hidePop();
+}
+
 EngineCallbacks callbacks(int session) {
   EngineCallbacks cb;
   HWND wnd = g.wnd;
@@ -1180,6 +1477,7 @@ EngineCallbacks callbacks(int session) {
 
 void endSession() {
   g.session++;
+  hidePop();
   if (g.host) g.host->stop(); // no more frames to the engine
   g.engine.reset();           // says goodbye to the server; no more callbacks after this
   g.host.reset();
@@ -1241,7 +1539,9 @@ void startSharing() {
   g.statusKind.clear();
   g.info.clear();
   setTitle(L"Megosztás");
+  resetChat();
   show(Screen::Hosting);
+  g.engine->setName(narrow(loadString(L"ChatName").c_str()));
   g.engine->host(narrow(pw.c_str()));
 }
 
@@ -1287,7 +1587,9 @@ void startWatching(const std::string& code) {
   g.roomCode = toW(code);
   g.viewInfo.clear();
   setTitle(L"Szoba " + g.roomCode);
+  resetChat();
   show(Screen::Viewing);
+  engine->setName(narrow(loadString(L"ChatName").c_str()));
   engine->join(code);
 }
 
@@ -1336,6 +1638,38 @@ void onEngineEvent(const Json& e) {
   } else if (type == "view-state" && g.screen == Screen::Viewing) {
     g.picture = e["picture"].b();
     if (!g.picture) g.overlayText = toW(e["text"].str());
+  } else if (type == "chat-history") {
+    g.chat.clear();
+    for (const Json& m : e["list"].items()) g.chat.push_back(chatLine(m));
+    g.chatBackTarget = 0;
+    if (!e["supported"].b(true)) setChatNote(L"A szerver még nem tud chatet – frissíteni kell (sudo bash deploy/install.sh).", true);
+  } else if (type == "chat") {
+    ChatLine m = chatLine(e);
+    g.chat.push_back(m);
+    if (g.chat.size() > 200) g.chat.erase(g.chat.begin());
+    if (g.chatBackTarget < 40) g.chatBackTarget = 0; // (one reading back stays where they are)
+    if (m.mine) {
+      g.chatPending.clear();
+    } else {
+      if (g.screen == Screen::Viewing && !g.chatOpen) {
+        g.unread++;
+        showPop(m);
+      }
+      if (GetForegroundWindow() != g.wnd) { // the taskbar button blinks until the window is looked at
+        FLASHWINFO f{sizeof f, g.wnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
+        FlashWindowEx(&f);
+      }
+    }
+  } else if (type == "chat-limit") {
+    setChatNote(L"Lassabban – túl sok üzenet egyszerre. Pár másodperc múlva mehet.");
+  } else if (type == "chat-offline") {
+    if (!g.chatPending.empty() && GetWindowTextLengthW(g.chatEdit) == 0) SetWindowTextW(g.chatEdit, g.chatPending.c_str());
+    g.chatPending.clear();
+    setChatNote(L"Nincs kapcsolat a szobával – az üzenet nem ment el.");
+  } else if (type == "name") {
+    static std::wstring cue; // (the edit control keeps a pointer to it)
+    cue = toW(e["name"].str());
+    SendMessageW(g.nameEdit, EM_SETCUEBANNER, TRUE, LPARAM(cue.c_str()));
   } else if (type == "view-stats") {
     g.viewStats = e;
   } else if (type == "closed" && g.screen == Screen::Viewing) {
@@ -1345,6 +1679,10 @@ void onEngineEvent(const Json& e) {
 }
 
 void tick() {
+  if (!g.chatNote.empty() && g.chatNoteAt > 0 && nowMs() - g.chatNoteAt > 6000) {
+    g.chatNote.clear();
+    relayout();
+  }
   if (g.screen == Screen::Hosting && g.host) {
     HostPipeline::Info i = g.host->info();
     std::string s;
@@ -1654,6 +1992,9 @@ void onClick(int id) {
   switch (id) {
     case B_TAB0: setTab(0); break;
     case B_NEW: newWindow(); break;
+    case B_CHAT: setChatOpen(!g.chatOpen); break;
+    case B_CHAT_CLOSE: setChatOpen(false); break;
+    case B_CHAT_SEND: sendChat(); break;
     case B_TAB1: setTab(1); break;
     case B_SHARE: startSharing(); break;
     case B_JOIN: startWatching(parseCode(getText(g.code))); break;
@@ -1703,9 +2044,16 @@ LRESULT CALLBACK editProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, D
   if (msg == WM_KEYDOWN && wp == VK_RETURN) {
     if (int(id) == ID_PASSWORD) startSharing();
     else if (int(id) == ID_CODE) startWatching(parseCode(getText(g.code)));
+    else if (int(id) == ID_CHAT) sendChat();
+    else if (int(id) == ID_NAME) SetFocus(g.chatEdit); // (keeps the name: it loses the focus)
     return 0;
   }
-  if (msg == WM_CHAR && (wp == VK_RETURN || wp == 10)) return 0; // no beep
+  if (msg == WM_KEYDOWN && wp == VK_ESCAPE && (int(id) == ID_CHAT || int(id) == ID_NAME)) {
+    SetFocus(g.wnd); // back to the picture's keys (F, M, S, C)
+    return 0;
+  }
+  if (msg == WM_CHAR && (wp == VK_RETURN || wp == 10 || wp == VK_ESCAPE)) return 0; // no beep
+  if (msg == WM_KILLFOCUS && int(id) == ID_NAME) commitName();
   if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS) {
     if (msg == WM_SETFOCUS) g.focus = int(id);
     else if (g.focus == int(id)) g.focus = ID_NONE;
@@ -1730,7 +2078,7 @@ void makeEditFont() {
   HFONT old = g.editFont;
   g.editFont = CreateFontW(-px(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
                            L"Segoe UI");
-  for (HWND h : {g.pass, g.code})
+  for (HWND h : {g.pass, g.code, g.chatEdit, g.nameEdit})
     if (h) SendMessageW(h, WM_SETFONT, WPARAM(g.editFont), TRUE);
   if (old) DeleteObject(old);
   g.placed.clear();
@@ -1742,6 +2090,11 @@ void createControls() {
   std::wstring pw = loadPassword();
   g.pass = makeEdit(ID_PASSWORD, ES_PASSWORD, pw, L"megosztási jelszó");
   g.code = makeEdit(ID_CODE, 0, L"", L"abc123 vagy link");
+  g.chatEdit = makeEdit(ID_CHAT, 0, L"", L"Üzenet…");
+  SendMessageW(g.chatEdit, EM_LIMITTEXT, 500, 0);
+  g.nameEdit = makeEdit(ID_NAME, 0, loadString(L"ChatName"), L"a neved a chatben");
+  SendMessageW(g.nameEdit, EM_LIMITTEXT, 24, 0);
+  g.chatOpen = loadDword(L"ChatOpen", 1) != 0;
   g.video = CreateWindowExW(0, L"SSVideo", L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, g.wnd, nullptr, g.inst, nullptr);
   g.remember = loadDword(L"Remember", 1) != 0; // (on unless turned off, as on the Mac)
   g.audio = loadDword(L"Audio", 1) != 0;
@@ -1750,6 +2103,37 @@ void createControls() {
   g.monitor = int(std::min<DWORD>(loadDword(L"Monitor", 0), DWORD(g.monitors.empty() ? 0 : g.monitors.size() - 1)));
   g.volume = float(std::min<DWORD>(loadDword(L"Volume", 100), 100)) / 100.0f;
   g.tab = loadDword(L"Tab", 0) == 1 ? 1 : 0;
+}
+
+/** The bubble over the picture: in quickly, six seconds, out over half a second; a click opens the chat. */
+LRESULT CALLBACK popProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+  switch (msg) {
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      BeginPaint(h, &ps);
+      paintPop();
+      EndPaint(h, &ps);
+      return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_TIMER: {
+      double t = nowMs() - g.popAt;
+      float a = g.popAt == 0 ? 0 : t < 150 ? float(t / 150) : t < 6000 ? 1.0f : float(1 - (t - 6000) / 500);
+      if (a <= 0) {
+        KillTimer(h, 1);
+        ShowWindow(h, SW_HIDE);
+        return 0;
+      }
+      SetLayeredWindowAttributes(h, 0, BYTE(240 * a), LWA_ALPHA);
+      return 0;
+    }
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_LBUTTONDOWN:
+      hidePop();
+      setChatOpen(true);
+      return 0;
+    default: return DefWindowProcW(h, msg, wp, lp);
+  }
 }
 
 LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1776,6 +2160,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_SIZE:
       g.placed.erase(-1);
+      hidePop(); // (it was placed for the old size)
       invalidate();
       return 0;
     case WM_FIT:
@@ -1857,10 +2242,15 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       animate();
       return 0;
     }
-    case WM_MOUSEWHEEL:
-      g.scrollTarget = std::max(0.0f, g.scrollTarget - float(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f * 64.0f);
+    case WM_MOUSEWHEEL: {
+      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      ScreenToClient(h, &pt);
+      float d = float(GET_WHEEL_DELTA_WPARAM(wp)) / 120.0f * 64.0f;
+      if (g.chatList.contains(dip(pt.x), dip(pt.y))) g.chatBackTarget = std::max(0.0f, g.chatBackTarget + d); // the chat: back and forth
+      else g.scrollTarget = std::max(0.0f, g.scrollTarget - d);
       animate();
       return 0;
+    }
     case WM_KEYDOWN:
       if (g.modal.open) {
         if (wp == VK_ESCAPE) closeModal(false);
@@ -1873,6 +2263,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           g.stats = !g.stats;
           tick();
         } else if (wp == 'M') setMuted(!g.muted);
+        else if (wp == 'C') setChatOpen(!g.chatOpen);
       }
       return 0;
     case WM_TIMER:
@@ -2076,7 +2467,16 @@ int uiShots(const std::wstring& dir) {
   g.statusText = L"Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.";
   g.statusKind = "ok";
   g.info = L"Kép: 2560×1440 · NVENC (videókártya) · 60 FPS · 2,1 ms/kép · hang: sztereó";
-  g.viewers = Json::parse(R"([{"id":"a","n":1,"state":"connected","path":"lan","fps":60,"kbps":18400,"rtt":3,"lat":21},{"id":"b","n":2,"state":"connecting"}])");
+  g.viewers = Json::parse(R"([{"id":"a","n":1,"name":"Anna","state":"connected","path":"lan","fps":60,"kbps":18400,"rtt":3,"lat":21},{"id":"b","n":2,"state":"connecting"}])");
+  double at = double(std::time(nullptr)) * 1000;
+  auto said = [&](const char* from, const char* name, const char* text, bool mine, double ago) {
+    Json m = Json::object();
+    m.set("from", from).set("name", name).set("text", text).set("mine", mine).set("host", std::string(from) == "host").set("at", at - ago * 60000);
+    g.chat.push_back(chatLine(m));
+  };
+  said("v1", "Anna", "Hali! Mehet a film?", false, 3);
+  said("host", "Tamás", "Mindjárt indul, hozom a popcornt 🍿", true, 2);
+  said("v2", "Béla", "Itt vagyok én is. Szép a kép, semmi késés!", false, 1);
   show(Screen::Hosting);
   snap(L"4-hosting", g.wnd);
   ask(L"Befejezed a megosztást?", L"A nézőknél megáll a kép, és a szoba bezárul.", L"Befejezés", L"Mégse", true, nullptr);
@@ -2092,6 +2492,18 @@ int uiShots(const std::wstring& dir) {
   g.viewInfo = L"Várakozás a képre…";
   show(Screen::Viewing);
   snap(L"7-viewing", g.wnd);
+  for (ChatLine& m : g.chat) m.mine = false;
+  said("v3", "Cili", "Ez már a nézők chatje – itt is látszik, ki mit írt.", true, 0);
+  setChatOpen(true, false);
+  snap(L"9-viewing-chat", g.wnd);
+  setChatOpen(false);
+  g.unread = 2;
+  showPop(g.chat.back());
+  snap(L"10-viewing-chat-closed", g.wnd);
+  if (g.pop) shoot(g.pop, dir + L"\\11-chat-bubble.png");
+  hidePop();
+  g.unread = 0;
+  g.chat.clear();
   show(Screen::Home);
   pumpFor(300);
   showAbout();
@@ -2139,16 +2551,23 @@ int uiWatch(const std::string& server, const std::string& code, const std::wstri
   while (nowMs() < until && !(g.picture && g.player && g.player->hasPicture())) pumpFor(100);
   bool pictured = g.player && g.player->hasPicture();
   pumpFor(2500); // more frames; the fade-in over
+  // the chat: a message to the room comes back as ours (through the server, the engine, the window)
+  bool chatted = false;
+  if (g.engine) {
+    g.engine->sendChat("Szia a Windows appból! 👋");
+    double chatUntil = nowMs() + 5000;
+    while (nowMs() < chatUntil && !chatted) {
+      pumpFor(100);
+      for (const ChatLine& m : g.chat) chatted = chatted || (m.mine && m.text == L"Szia a Windows appból! 👋");
+    }
+  }
   SetWindowPos(g.wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
   SetForegroundWindow(g.wnd);
   pumpFor(600);
-  // the video's area: the window's client below the bar, on the screen
-  RECT rc;
-  GetClientRect(g.wnd, &rc);
-  POINT tl{0, px(kBarH)}, br{rc.right, rc.bottom};
-  ClientToScreen(g.wnd, &tl);
-  ClientToScreen(g.wnd, &br);
-  RECT area{tl.x + 8, tl.y + 8, br.x - 8, br.y - 8};
+  // the video's area: its own window (the chat panel is beside it), on the screen
+  RECT vr;
+  GetWindowRect(g.video, &vr);
+  RECT area{vr.left + 8, vr.top + 8, vr.right - 8, vr.bottom - 8};
   std::vector<BYTE> pixels;
   bool grabbed = grabScreen(area, pixels);
   size_t bright = 0, total = pixels.size() / 4;
@@ -2187,15 +2606,15 @@ int uiWatch(const std::string& server, const std::string& code, const std::wstri
   shoot(g.wnd, dir + L"\\watch.png");
   VideoPlayer::Stats st = g.player ? g.player->stats() : VideoPlayer::Stats{};
   char report[400];
-  std::snprintf(report, sizeof report, "picture %d, shown %d, grabbed %d, bright %.3f, bars %d/6, %dx%d, %.0f FPS, decoding %s, latency %.1f ms\n", g.picture ? 1 : 0,
-                pictured ? 1 : 0, grabbed ? 1 : 0, share, bars, st.width, st.height, st.fps, st.hardware ? "GPU" : "CPU", st.latencyMs);
+  std::snprintf(report, sizeof report, "picture %d, shown %d, grabbed %d, bright %.3f, bars %d/6, chat %d, %dx%d, %.0f FPS, decoding %s, latency %.1f ms\n", g.picture ? 1 : 0,
+                pictured ? 1 : 0, grabbed ? 1 : 0, share, bars, chatted ? 1 : 0, st.width, st.height, st.fps, st.hardware ? "GPU" : "CPU", st.latencyMs);
   if (FILE* f = _wfopen((dir + L"\\ui-watch.txt").c_str(), L"w")) {
     std::fputs(report, f);
     std::fclose(f);
   }
   endSession();
   DestroyWindow(g.wnd);
-  return pictured && share > 0.3 && bars >= 5 ? 0 : 1;
+  return pictured && share > 0.3 && bars >= 5 && chatted ? 0 : 1;
 }
 
 /* ------------------------------------------------ smoke tests (CI): the real pipeline, no UI */
@@ -2315,6 +2734,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
   ac.hbrBackground = CreateSolidBrush(kBgGdi);
   ac.lpszClassName = L"SSAbout";
   RegisterClassExW(&ac);
+  WNDCLASSEXW pc{sizeof pc};
+  pc.lpfnWndProc = popProc;
+  pc.hInstance = inst;
+  pc.hCursor = LoadCursorW(nullptr, IDC_HAND);
+  pc.lpszClassName = L"SSChatPop";
+  RegisterClassExW(&pc);
   if (argc == 6 && (std::wstring(argv[1]) == L"--smoke-host" || std::wstring(argv[1]) == L"--smoke-view")) return smoke(argc, argv);
   if (argc == 4 && std::wstring(argv[1]) == L"--ws-bench") { // CI: round trips through this WebSocket (WinHTTP)
     FILE* log = _wfopen(argv[3], L"w");
