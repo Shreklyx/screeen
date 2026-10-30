@@ -237,4 +237,123 @@ std::unique_ptr<WebSocket> openWinHttpWebSocket(const std::string& url, WebSocke
   return std::unique_ptr<WebSocket>(new Handle(s));
 }
 
+TlsFactory schannelTls();
+
+namespace {
+
+/** Direct mode's WebSocket: our own connection first (the system's TLS, Nagle's algorithm off – a frame's
+ *  last bytes go at once, not after the server's acknowledgement); WinHTTP's when that one closes before
+ *  it opened (a proxy, …). */
+class DirectSocket : public WebSocket {
+ public:
+  DirectSocket(const std::string& url, WebSocketEvents ev) : st_(std::make_shared<State>()) {
+    st_->url = url;
+    st_->ev = std::move(ev);
+    std::weak_ptr<State> weak = st_;
+    WebSocketEvents own;
+    own.open = [weak] {
+      if (auto st = weak.lock()) {
+        WebSocketEvents ev = st->events(true);
+        if (ev.open) ev.open();
+      }
+    };
+    own.text = [weak](std::string t) {
+      if (auto st = weak.lock()) {
+        WebSocketEvents ev = st->events(false);
+        if (ev.text) ev.text(std::move(t));
+      }
+    };
+    own.binary = [weak](const uint8_t* d, size_t n) {
+      if (auto st = weak.lock()) {
+        WebSocketEvents ev = st->events(false);
+        if (ev.binary) ev.binary(d, n);
+      }
+    };
+    own.closed = [weak] {
+      auto st = weak.lock();
+      if (!st) return;
+      WebSocketEvents ev;
+      bool fallBack;
+      {
+        std::lock_guard<std::mutex> l(st->mu);
+        if (st->closed) return;
+        fallBack = !st->opened && !st->switched;
+        st->switched = st->switched || fallBack;
+        ev = st->ev;
+      }
+      if (!fallBack) {
+        if (ev.closed) ev.closed();
+        return;
+      }
+      std::shared_ptr<WebSocket> next(openWinHttpWebSocket(st->url, ev)); // (its events: the engine's own)
+      std::lock_guard<std::mutex> l(st->mu);
+      st->old = std::move(st->cur); // (not ended here: this runs on its thread)
+      st->cur = next;
+    };
+    std::shared_ptr<WebSocket> first(openOwnWebSocket(url, own, schannelTls()));
+    std::lock_guard<std::mutex> l(st_->mu);
+    if (st_->switched) st_->old = first; // (it failed at once: WinHTTP's is already there)
+    else st_->cur = first;
+  }
+
+  ~DirectSocket() override { close(); }
+
+  void sendText(const std::string& text) override {
+    if (auto c = current()) c->sendText(text);
+  }
+  void sendBinary(const uint8_t* data, size_t n) override {
+    if (auto c = current()) c->sendBinary(data, n);
+  }
+  size_t bufferedAmount() const override {
+    auto c = current();
+    return c ? c->bufferedAmount() : 0;
+  }
+  bool isOpen() const override {
+    auto c = current();
+    return c && c->isOpen();
+  }
+  void close() override {
+    std::shared_ptr<WebSocket> cur, old;
+    {
+      std::lock_guard<std::mutex> l(st_->mu);
+      st_->closed = true;
+      st_->ev = WebSocketEvents{};
+      cur = std::move(st_->cur);
+      old = std::move(st_->old);
+    }
+    // (outside the lock: a socket's close waits for a callback of it under way, which may want the lock)
+    if (cur) cur->close();
+    if (old) old->close();
+  }
+
+ private:
+  struct State {
+    std::mutex mu;
+    std::string url;
+    WebSocketEvents ev; // the engine's
+    std::shared_ptr<WebSocket> cur, old;
+    bool opened = false, switched = false, closed = false;
+    WebSocketEvents events(bool opening) {
+      std::lock_guard<std::mutex> l(mu);
+      if (opening) opened = true;
+      return ev;
+    }
+  };
+
+  std::shared_ptr<WebSocket> current() const {
+    std::lock_guard<std::mutex> l(st_->mu);
+    return st_->cur;
+  }
+
+  std::shared_ptr<State> st_;
+};
+
+}  // namespace
+
+/** The app's WebSockets: the signaling (…/ws) in WinHTTP; direct mode's (…/direct) our own (see DirectSocket). */
+std::unique_ptr<WebSocket> openAppWebSocket(const std::string& url, WebSocketEvents events) {
+  if (url.find("/direct") == std::string::npos) return openWinHttpWebSocket(url, std::move(events));
+  return std::unique_ptr<WebSocket>(new DirectSocket(url, std::move(events)));
+}
+
 }  // namespace ss

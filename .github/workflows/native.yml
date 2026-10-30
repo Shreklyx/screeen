@@ -275,7 +275,7 @@ jobs:
       # back shows here as long round trips for the big messages.
       - name: "WebSocket round trips: WinHTTP and ours"
         shell: bash
-        timeout-minutes: 3
+        timeout-minutes: 6
         run: |
           node -e "const {WebSocketServer}=require('ws'); const s=new WebSocketServer({port:8095}); s.on('connection',w=>w.on('message',(d,b)=>w.send(d,{binary:b})));" &
           sleep 2
@@ -290,6 +290,26 @@ jobs:
           echo "WinHTTP, late ACKs:          $(cat bench-late.log)"
           echo "ours, late ACKs:             $(build/ss-cli.exe ws-bench --url ws://127.0.0.1:8195)"
           echo "ours + Nagle, late ACKs:     $(SS_NAGLE=1 build/ss-cli.exe ws-bench --url ws://127.0.0.1:8195)"
+          # direct mode's own WebSocket (the app's, Nagle off) on this machine
+          build/windows/ScreenShare.exe --ws-bench-own ws://127.0.0.1:8095 bench-own.log || true
+          echo "ours in the app:             $(cat bench-own.log)"
+          # over the internet (a public echo server, a real round trip and Windows' own TCP sending): WinHTTP,
+          # and direct mode's own WebSocket over the system's TLS
+          for i in 1 2; do build/windows/ScreenShare.exe --ws-bench wss://echo.websocket.org/ bench-net-winhttp.log && break; done || true
+          for i in 1 2; do build/windows/ScreenShare.exe --ws-bench-own wss://echo.websocket.org/ bench-net-own.log && break; done || true
+          echo "WinHTTP, internet:           $(cat bench-net-winhttp.log 2>/dev/null)"
+          echo "ours (TLS), internet:        $(cat bench-net-own.log 2>/dev/null)"
+          # our TLS checks the server's certificate as WinHTTP does: a good one trusted, bad ones refused
+          tls() { build/windows/ScreenShare.exe --tls-check "$1" tls.log || true; cat tls.log 2>/dev/null; }
+          good=$(tls sha256.badssl.com); echo "$good"
+          if echo "$good" | grep -q trusted; then
+            for h in wrong.host.badssl.com self-signed.badssl.com expired.badssl.com untrusted-root.badssl.com; do
+              r=$(tls "$h"); echo "$r"
+              echo "$r" | grep -q refused || { echo "::error::our TLS trusted a bad certificate ($h)"; exit 1; }
+            done
+          else
+            echo "::warning::badssl.com could not be reached: the certificate checks were not made"
+          fi
       - name: Installer
         shell: bash
         run: |

@@ -12,6 +12,8 @@
 //
 // The session engine (native/core) does the networking; host.cpp captures and encodes,
 // player.cpp / audio.cpp decode and play. Updates: update.cpp.
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <commctrl.h>
 #include <dpapi.h>
@@ -63,6 +65,8 @@
 
 namespace ss {
 std::unique_ptr<WebSocket> openWinHttpWebSocket(const std::string& url, WebSocketEvents events);
+std::unique_ptr<WebSocket> openAppWebSocket(const std::string& url, WebSocketEvents events);
+TlsFactory schannelTls();
 }
 
 using namespace ss;
@@ -1602,7 +1606,7 @@ void startSharing(const std::string& resumeCode = "", const std::string& resumeT
   int session = ++g.session;
   EngineConfig cfg;
   cfg.server = g.server;
-  cfg.webSocket = openWinHttpWebSocket;
+  cfg.webSocket = openAppWebSocket;
   EngineCallbacks cb = callbacks(session);
   // the pipeline exists before the engine can call it
   auto host = std::make_shared<HostPipeline*>(nullptr);
@@ -1656,7 +1660,7 @@ void startWatching(const std::string& code) {
   int session = ++g.session;
   EngineConfig cfg;
   cfg.server = g.server;
-  cfg.webSocket = openWinHttpWebSocket;
+  cfg.webSocket = openAppWebSocket;
   g.player.reset(new VideoPlayer(g.video));
   g.audioOut.reset(new AudioPlayer());
   g.audioOut->setVolume(g.muted ? 0.0f : g.volume);
@@ -2793,7 +2797,7 @@ int smoke(int argc, wchar_t** argv) {
   };
   EngineConfig cfg;
   cfg.server = server;
-  cfg.webSocket = openWinHttpWebSocket;
+  cfg.webSocket = openAppWebSocket;
   cfg.forceTcp = GetEnvironmentVariableA("SS_FORCE_TCP", nullptr, 0) > 0; // (CI: the WebSocket path, as to a browser)
   EngineCallbacks cb;
   cb.event = [&](const Json& e) {
@@ -2903,10 +2907,32 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int showCmd) {
   pc.lpszClassName = L"SSChatPop";
   RegisterClassExW(&pc);
   if (argc == 6 && (std::wstring(argv[1]) == L"--smoke-host" || std::wstring(argv[1]) == L"--smoke-view")) return smoke(argc, argv);
-  if (argc == 4 && std::wstring(argv[1]) == L"--ws-bench") { // CI: round trips through this WebSocket (WinHTTP)
+  if (argc == 4 && std::wstring(argv[1]) == L"--tls-check") { // CI: our TLS to host:443 – trusted or refused
+    std::string host = narrow(argv[2]);
+    netInit();
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    bool ok = false;
+    if (getaddrinfo(host.c_str(), "443", &hints, &res) == 0 && res) {
+      SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+      if (s != INVALID_SOCKET && connect(s, res->ai_addr, int(res->ai_addrlen)) == 0) ok = schannelTls()()->handshake(uintptr_t(s), host);
+      if (s != INVALID_SOCKET) closesocket(s);
+      freeaddrinfo(res);
+    }
+    if (FILE* log = _wfopen(argv[3], L"w")) {
+      std::fprintf(log, "TLS %s %s\n", host.c_str(), ok ? "trusted" : "refused");
+      std::fclose(log);
+    }
+    return ok ? 0 : 1;
+  }
+  if (argc == 4 && (std::wstring(argv[1]) == L"--ws-bench" || std::wstring(argv[1]) == L"--ws-bench-own")) {
+    // CI: round trips through WinHTTP's WebSocket – or our own over the system's TLS (direct mode's)
     FILE* log = _wfopen(argv[3], L"w");
     if (!log) return 1;
-    std::fprintf(log, "BENCH %s\n", wsBench(openWinHttpWebSocket, narrow(argv[2]), 240).dump().c_str());
+    WebSocketFactory own = [](const std::string& url, WebSocketEvents ev) { return openOwnWebSocket(url, std::move(ev), schannelTls()); };
+    bool ours = std::wstring(argv[1]) == L"--ws-bench-own";
+    std::fprintf(log, "BENCH %s\n", wsBench(ours ? own : WebSocketFactory(openWinHttpWebSocket), narrow(argv[2]), 240).dump().c_str());
     std::fclose(log);
     return 0;
   }

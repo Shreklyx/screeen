@@ -1,4 +1,5 @@
-// Plain ws:// client (RFC 6455): a thread that connects and reads, one that writes.
+// Our own WebSocket client (RFC 6455): a thread that connects and reads, one that writes; ws://, and
+// wss:// through a TlsChannel (the platform's TLS). TCP_NODELAY: a message's end is not held back.
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -52,7 +53,7 @@ void shutdownSock(Sock s) { shutdown(s, SHUT_RDWR); }
 
 class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<PlainWebSocket> {
  public:
-  PlainWebSocket(std::string url, WebSocketEvents ev) : url_(std::move(url)), ev_(std::move(ev)) {}
+  PlainWebSocket(std::string url, WebSocketEvents ev, TlsFactory tls) : url_(std::move(url)), ev_(std::move(ev)), tlsFactory_(std::move(tls)) {}
 
   void start() {
     // the threads keep the object alive (it may end on one of them): never joined, detached at once
@@ -112,6 +113,7 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
   }
 
   bool sendAll(const uint8_t* p, size_t n) {
+    if (tls_) return tls_->send(uintptr_t(sock_.load()), p, n);
     while (n) {
       int r = int(send(sock_, reinterpret_cast<const char*>(p), int(n > (1 << 20) ? 1 << 20 : n), 0));
       if (r <= 0) return false;
@@ -121,9 +123,15 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
     return true;
   }
 
+  /** Some of what came (decrypted on wss://): > 0 bytes, else closed or an error. */
+  int readSome(uint8_t* p, size_t n) {
+    if (tls_) return tls_->recv(uintptr_t(sock_.load()), p, n);
+    return int(recv(sock_, reinterpret_cast<char*>(p), int(n), 0));
+  }
+
   bool recvAll(uint8_t* p, size_t n) {
     while (n) {
-      int r = int(recv(sock_, reinterpret_cast<char*>(p), int(n), 0));
+      int r = readSome(p, n);
       if (r <= 0) return false;
       p += r;
       n -= size_t(r);
@@ -188,12 +196,14 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
   }
 
   void readLoop() {
-    // ws://host[:port]/path
+    // ws://host[:port]/path, wss://… (with the platform's TLS)
+    bool secure = url_.compare(0, 6, "wss://") == 0;
+    if (secure && !tlsFactory_) return finish();
     std::string rest = url_.substr(url_.find("://") + 3);
     std::string hostport = rest.substr(0, rest.find('/'));
     std::string path = rest.find('/') == std::string::npos ? "/" : rest.substr(rest.find('/'));
     std::string host = hostport;
-    std::string port = "80";
+    std::string port = secure ? "443" : "80";
     if (hostport.find(':') != std::string::npos) {
       host = hostport.substr(0, hostport.find(':'));
       port = hostport.substr(hostport.find(':') + 1);
@@ -218,6 +228,11 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
       std::lock_guard<std::mutex> lock(mu_);
       if (closing_) return finish();
     }
+    if (secure) {
+      std::unique_ptr<TlsChannel> tls = tlsFactory_();
+      if (!tls || !tls->handshake(uintptr_t(s), host)) return finish();
+      tls_ = std::move(tls); // (the writer starts only once the socket is open)
+    }
     uint8_t keyRaw[16];
     randomBytes(keyRaw, 16);
     std::string key = base64Encode(keyRaw, 16);
@@ -227,7 +242,7 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
     std::string head;
     char c;
     while (head.size() < 8192 && head.find("\r\n\r\n") == std::string::npos) {
-      if (recv(s, &c, 1, 0) != 1) return finish();
+      if (readSome(reinterpret_cast<uint8_t*>(&c), 1) != 1) return finish();
       head += c;
     }
     std::string accept = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -281,6 +296,8 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
 
   std::string url_;
   WebSocketEvents ev_;
+  TlsFactory tlsFactory_;
+  std::unique_ptr<TlsChannel> tls_;
   mutable std::mutex mu_;
   std::recursive_mutex gate_; // held while a callback runs
   std::condition_variable cv_;
@@ -309,7 +326,11 @@ class PlainHandle : public WebSocket {
 }  // namespace
 
 std::unique_ptr<WebSocket> openPlainWebSocket(const std::string& url, WebSocketEvents events) {
-  auto ws = std::make_shared<PlainWebSocket>(url, std::move(events));
+  return openOwnWebSocket(url, std::move(events), nullptr);
+}
+
+std::unique_ptr<WebSocket> openOwnWebSocket(const std::string& url, WebSocketEvents events, TlsFactory tls) {
+  auto ws = std::make_shared<PlainWebSocket>(url, std::move(events), std::move(tls));
   ws->start();
   return std::unique_ptr<WebSocket>(new PlainHandle(ws));
 }
