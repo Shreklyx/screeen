@@ -281,13 +281,17 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     [stream startCaptureWithCompletionHandler:^(NSError* error) {
       if (error) self->fail(error.code == -3801 ? "permission" : "capture-failed");
     }];
-    // a keyframe asked for while the screen stands still: the last image again
+    // the screen stands still (ScreenCaptureKit sends no new image): the last one again at its turn – a
+    // steady frame rate (the viewers' FPS does not fall to 0; a still picture costs a few hundred bytes a
+    // frame), a keyframe asked for goes at once
     timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, videoQueue);
-    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), 20 * NSEC_PER_MSEC, 2 * NSEC_PER_MSEC);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), uint64_t(interval / 3 * NSEC_PER_MSEC), NSEC_PER_MSEC);
     std::weak_ptr<Impl> weak = self;
     dispatch_source_set_event_handler(timer, ^{
       auto s = weak.lock();
-      if (s && s->streaming && s->wantKey && s->lastImage && nowMs() - s->lastEncode >= s->interval) s->encode(s->lastImage, nowMs());
+      if (!s || !s->streaming || !s->lastImage) return;
+      double since = nowMs() - s->lastEncode;
+      if (since >= s->interval * 0.95 || (s->wantKey && since >= s->interval * 0.5)) s->encode(s->lastImage, nowMs());
     });
     dispatch_resume(timer);
   }
@@ -353,7 +357,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     if (now - statsAt >= 1000) {
       info.encodeMs = encSum / std::max(1, encoded);
       info.fps = statsAt ? encoded * 1000.0 / (now - statsAt) : 0;
-      engine.setEncoderStats(info.encodeMs, info.width, info.height);
+      engine.setEncoderStats(info.encodeMs, info.width, info.height, opts.fps);
       encSum = 0;
       encoded = 0;
       statsAt = now;

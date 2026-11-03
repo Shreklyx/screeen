@@ -11,7 +11,8 @@
 //   ss-cli ws-echo --port 8195 [--slow-acks]                   (that echo server, acknowledging late on Windows)
 //
 // Prints the engine's events as JSON lines; "host" prints "CODE <code>" and "TOKEN <token>" once the room is open,
-// "view" ends with "RESULT {…}" (frames, keyframes, bytes, latency); chat messages as "CHAT {…}".
+// "view" ends with "RESULT {…}" (frames, keyframes, bytes, latency, the longest time without a frame
+// and the time since the last one); chat messages as "CHAT {…}".
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -156,7 +157,7 @@ static int host(int argc, char** argv) {
     n++;
     if (nowMs() - lastViewers > 2000) {
       lastViewers = nowMs();
-      engine.setEncoderStats(1.0, 1280, 720);
+      engine.setEncoderStats(1.0, 1280, 720, fps);
     }
   }
   line("SENT " + std::to_string(n) + " keyframe-requests " + std::to_string(keyframes.load()));
@@ -171,6 +172,7 @@ static int view(int argc, char** argv) {
   std::mutex mu;
   uint64_t frames = 0, keys = 0, bytes = 0, audio = 0;
   bool firstKey = false, sawFrame = false;
+  double lastFrameAt = 0, maxGap = 0; // (a picture that stood still: the longest time without a frame)
   std::vector<double> lat;
   std::ofstream file;
   if (!out.empty()) file.open(out, std::ios::binary);
@@ -195,6 +197,9 @@ static int view(int argc, char** argv) {
     frames++;
     keys += m.key;
     bytes += n;
+    double at = nowMs();
+    if (lastFrameAt) maxGap = std::max(maxGap, at - lastFrameAt);
+    lastFrameAt = at;
     if (file) file.write(reinterpret_cast<const char*>(d), std::streamsize(n));
     double off = enginePtr ? enginePtr->clockOffset() : NAN;
     if (!std::isnan(off)) lat.push_back(nowMs() + off - m.capture);
@@ -212,6 +217,7 @@ static int view(int argc, char** argv) {
   r.set("frames", double(frames)).set("keyframes", double(keys)).set("bytes", double(bytes)).set("audio", double(audio)).set("firstKey", firstKey);
   r.set("latMedian", lat.empty() ? Json() : Json(std::round(lat[lat.size() / 2] * 10) / 10));
   r.set("latP90", lat.empty() ? Json() : Json(std::round(lat[lat.size() * 9 / 10] * 10) / 10));
+  r.set("maxGap", std::round(maxGap)).set("lastGap", lastFrameAt ? Json(std::round(nowMs() - lastFrameAt)) : Json());
   line("RESULT " + r.dump());
   enginePtr = nullptr;
   chat.engine = nullptr;

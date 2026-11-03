@@ -78,8 +78,9 @@ class Engine {
   void sendVideo(const uint8_t* data, size_t n, bool key, double captureMs, double tsUs);
   /** Sharer: one Opus packet of channel pair `pair` (of `channels`) – any thread. */
   void sendAudio(int pair, int channels, const uint8_t* data, size_t n, double tsUs);
-  /** Sharer: what the encoder measured, for the viewers' statistics. */
-  void setEncoderStats(double encodeMs, int width, int height);
+  /** Sharer: what the encoder measured, for the viewers' statistics – and the picture's size and frame
+   *  rate, which set its bitrate (0: 60 FPS). */
+  void setEncoderStats(double encodeMs, int width, int height, int fps = 0);
   /** Sharer: which encoder works ("NVENC", "Intel Quick Sync", …) and whether it is the GPU. */
   void setEncoder(const std::string& name, bool hardware);
 

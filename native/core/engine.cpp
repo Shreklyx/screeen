@@ -93,6 +93,7 @@ struct Engine::Impl {
     std::string path;
     double rtt = NAN, minRtt = INFINITY;
     Json report;
+    int troubled = 0; // its reports in a row that told of trouble (see onHostReport)
     int directTimer = 0, retryTimer = 0, retries = 0;
     std::string why;      // why it is being connected again / not served
     bool unsupported = false;
@@ -107,12 +108,11 @@ struct Engine::Impl {
   int seq = 0;
   std::unique_ptr<DirectEndpoint> ep;
   double kbps = 0, lastCut = 0, lastRaise = 0, targetKbps = 0, sentKbps = 0;
-  double encodedBytes = 0, encodedAt = 0, encodedKbps = 0; // what the encoder makes (kbit/s, each second)
   bool streaming = false;
   double lastKey = -1e9;
   int keyTimer = 0;
   double encodeMs = NAN;
-  int encW = 0, encH = 0;
+  int encW = 0, encH = 0, encFps = 0;
   int statsTimer = 0, hostTick = 0;
 
   /* ---- viewer */
@@ -460,6 +460,7 @@ struct Engine::Impl {
     v.path.clear();
     v.rtt = NAN;
     v.minRtt = INFINITY;
+    v.troubled = 0;
     v.report = Json();
     send(Json::object().set("t", "direct").set("to", v.id));
     std::string id = v.id;
@@ -544,7 +545,7 @@ struct Engine::Impl {
     v.rtt = info["rtt"].num(NAN);
     if (state == "connected") {
       loop.cancel(v.directTimer);
-      if (!kbps) kbps = v.path == "lan" ? target() : std::min(target(), 25000.0);
+      if (!kbps) kbps = target();
       applyBitrate(true);
       updateStreaming();
       encoderKeyframe();
@@ -567,6 +568,10 @@ struct Engine::Impl {
     Viewer& v = it->second;
     v.report = r;
     if (r["rtt"].isNumber()) v.minRtt = std::min(v.minRtt, r["rtt"].num());
+    // in trouble: frames it had to skip, its round trip grown by queues filling up, heavy loss (a little
+    // loss is what parity and asking again are for)
+    bool trouble = r["skips"].num() > 0 || r["loss"].num() > 8 || (r["rtt"].isNumber() && std::isfinite(v.minRtt) && r["rtt"].num() > v.minRtt + 80);
+    v.troubled = trouble ? v.troubled + 1 : 0;
     if (r["fps"].num() > 0) {
       v.retries = 0;
       v.why.clear();
@@ -574,53 +579,44 @@ struct Engine::Impl {
     adaptBitrate();
   }
 
+  // The bitrate the picture needs – fixed, the same quality all the time: ~0.12 bit a pixel a frame in
+  // H.264 (sharp text, clean motion), on the local network up to 100 Mbit/s, across the internet up to 40.
+  // (Asked for: setTargetKbps.)
   double target() const {
     if (targetKbps > 0) return targetKbps;
-    return cfg.hardware ? 120000 : 20000; // the most beautiful picture the network allows
+    double need = encW > 0 && encH > 0 ? double(encW) * encH * (encFps > 0 ? encFps : 60) * 0.12 / 1000 : 20000;
+    bool lan = false;
+    for (auto& kv : viewers) {
+      if (!kv.second.direct || kv.second.state != "connected") continue;
+      if (kv.second.path != "lan") return std::clamp(need, 4000.0, 40000.0);
+      lan = true;
+    }
+    return std::clamp(need, 4000.0, lan ? 100000.0 : 40000.0);
   }
 
-  // No bandwidth estimate as in WebRTC: lower the bitrate when a viewer loses packets, has to skip
-  // frames or its round trip grows (queues filling up), raise it slowly while all is well.
+  // The bitrate stays at the target as long as the viewers get it – no probing above, no sawtooth. Only
+  // a lasting trouble (a viewer's two reports in a row: skipped frames, a round trip grown by queues,
+  // heavy loss) brings it down, by 20% every 3 s at most and never below 40%; when all is well again it
+  // goes back up.
   void adaptBitrate() {
     std::vector<Viewer*> list;
     for (auto& kv : viewers) if (kv.second.direct && kv.second.state == "connected" && kv.second.report.isObject()) list.push_back(&kv.second);
     if (list.empty()) return;
-    double now = nowMs();
-    bool congested = false, calm = true;
-    double reached = INFINITY; // what got through to a viewer in trouble (kbit/s)
+    double now = nowMs(), full = target();
+    bool lasting = false, calm = true;
     for (Viewer* v : list) {
-      const Json& r = v->report;
-      bool trouble = r["loss"].num() > 2 || r["skips"].num() > 0 || (r["rtt"].isNumber() && r["rtt"].num() > v->minRtt + 40);
-      if (trouble) {
-        congested = true;
-        if (r["kbps"].num() > 0) reached = std::min(reached, r["kbps"].num());
-      }
-      if (r["loss"].num() >= 0.5) calm = false;
+      if (v->troubled >= 2) lasting = true;
+      if (v->troubled > 0 || v->report["loss"].num() >= 2) calm = false;
     }
-    if (congested && now - lastCut > 2000) {
-      double next = kbps * 0.7;
-      // the encoder made (nearly) what was asked and a viewer got much less: that is its line's speed –
-      // straight down there, not 30% at a time (every step was two more seconds of a growing delay)
-      if (encodedKbps > kbps * 0.6 && reached * 0.85 < next) next = reached * 0.85;
-      kbps = std::max(kMinKbps, next);
+    if (lasting && now - lastCut > 3000) {
+      kbps = std::max({kMinKbps, full * 0.4, kbps * 0.8});
       lastCut = now;
-    } else if (!congested && now - lastCut > 3000 && now - lastRaise > 1000 && calm) {
-      kbps = std::min(target(), kbps * 1.12 + 500);
+    } else if (calm && kbps < full && now - lastCut > 4000 && now - lastRaise > 2000) {
+      kbps = std::min(full, kbps * 1.15 + 500);
       lastRaise = now;
     }
-    kbps = std::min(kbps, target());
+    kbps = std::min(kbps, full);
     applyBitrate(false);
-  }
-
-  void countEncoded(size_t n) {
-    double t = nowMs();
-    if (!encodedAt) encodedAt = t;
-    encodedBytes += double(n);
-    if (t - encodedAt >= 1000) {
-      encodedKbps = encodedBytes * 8 / (t - encodedAt);
-      encodedBytes = 0;
-      encodedAt = t;
-    }
   }
 
   void applyBitrate(bool force) {
@@ -988,7 +984,6 @@ void Engine::sendVideo(const uint8_t* data, size_t n, bool key, double captureMs
   Impl* impl = impl_.get();
   impl->loop.post([impl, copy, key, captureMs, tsUs] {
     if (!impl->ep || impl->mode != "host") return;
-    impl->countEncoded(copy->size());
     MediaMeta m;
     m.stream = 0;
     m.key = key;
@@ -1012,12 +1007,19 @@ void Engine::sendAudio(int pair, int channels, const uint8_t* data, size_t n, do
   });
 }
 
-void Engine::setEncoderStats(double encodeMs, int width, int height) {
+void Engine::setEncoderStats(double encodeMs, int width, int height, int fps) {
   Impl* impl = impl_.get();
-  impl->loop.post([impl, encodeMs, width, height] {
+  impl->loop.post([impl, encodeMs, width, height, fps] {
     impl->encodeMs = encodeMs;
+    bool changed = width != impl->encW || height != impl->encH || (fps > 0 && fps != impl->encFps);
     impl->encW = width;
     impl->encH = height;
+    if (fps > 0) impl->encFps = fps;
+    // the picture's size known (or changed): its bitrate at once – unless a viewer had trouble lately
+    if (changed && impl->kbps > 0 && nowMs() - impl->lastCut > 10000) {
+      impl->kbps = impl->target();
+      impl->applyBitrate(false);
+    }
   });
 }
 

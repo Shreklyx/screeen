@@ -156,7 +156,9 @@ class Nvenc : public VideoEncoder {
     rc.rateControlMode = NV_ENC_PARAMS_RC_CBR;
     rc.averageBitRate = bps;
     rc.maxBitRate = bps;
-    rc.vbvBufferSize = uint32_t(2.0 * bps / fps_); // two frames: a keyframe does not wait long
+    // four frames: a keyframe or a big change (a new window, a scene cut) gets the bits to be sharp – and
+    // still goes in a moment (two frames left them blurry, pixelated for a while)
+    rc.vbvBufferSize = uint32_t(4.0 * bps / fps_);
     rc.vbvInitialDelay = rc.vbvBufferSize;
     rc.zeroReorderDelay = 1;
     rc.enableLookahead = 0;

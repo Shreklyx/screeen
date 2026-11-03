@@ -95,9 +95,9 @@ jobs:
       # each packet 20 ms (then also loses 1% of them; then is slower than the picture) with internet-sized
       # packets (MTU 1500): straight to the viewer (UDP), through the server's relay (UDP, two legs), in the
       # WebSocket (TCP, two legs, as to a browser) – how long a frame takes from the sharer to the viewer,
-      # beyond what the network itself takes. On a line slower than the picture the bitrate comes down to
-      # what the viewer gets, and its confirmations keep the queue short (frames are dropped instead);
-      # without them the delay grows. With 1% loss TCP slows down: BBR (the server's) keeps more speed.
+      # beyond what the network itself takes. On a line slower than the picture the viewer's confirmations
+      # keep the queue short (frames are dropped instead); without them the delay grows. With 1% loss TCP
+      # slows down: BBR (the server's) keeps more speed.
       - name: "Latency: every path"
         run: |
           PORT=8099 HOST_PASSWORD=ci DIRECT_PORT=3499 node server/server.js &
@@ -142,8 +142,41 @@ jobs:
               if (!(r.frames > 600) || !(r.latMedian < 20 * legs + 15)) problems.push(name + ": " + JSON.stringify(r));
             }
             const slow = got["WebSocket, 8 Mbit/s"] || {};
-            if (!(slow.latMedian < 250)) problems.push("a slow line made the WebSocket path late: " + JSON.stringify(slow));
+            if (!(slow.latMedian < 800) || !(slow.lastGap < 1500)) problems.push("a slow line made the WebSocket path late or stand still: " + JSON.stringify(slow));
             if (problems.length) { console.error(problems.join("\n")); process.exit(1); }
+          '
+      # A line that stops for 2 s and comes back: the picture has to come back too. (To a browser it stood
+      # still for good, the sound going on: the keyframe asked for while frames were dropped was dropped
+      # as well, and nothing asked for another.)
+      - name: "A stalled line: the picture comes back"
+        run: |
+          PORT=8089 HOST_PASSWORD=ci DIRECT_PORT=3489 node server/server.js &
+          sleep 2
+          sudo ip link set lo mtu 1500
+          stall() { # name, viewer flags
+            sudo tc qdisc replace dev lo root netem delay 20ms
+            build/ss-cli host --server http://127.0.0.1:8089 --password ci --h264 native/tests/data/test.h264 --seconds 22 --kbps 12000 > stall-host.log &
+            host=$!
+            for i in $(seq 1 80); do grep -q '^CODE' stall-host.log 2>/dev/null && break; sleep 0.25; done
+            code=$(grep '^CODE' stall-host.log | awk '{print $2}')
+            ( sleep 6; sudo tc qdisc change dev lo root netem delay 20ms loss 100%; sleep 2; sudo tc qdisc change dev lo root netem delay 20ms ) &
+            build/ss-cli view --server http://127.0.0.1:8089 --code "$code" --seconds 16 $2 > stall-view.log
+            wait $host
+            sudo tc qdisc del dev lo root
+            echo "$1|$(grep '^RESULT' stall-view.log | cut -c8-)" >> stalls.txt
+          }
+          stall "WebSocket (TCP)" "--tcp"
+          stall "direct (UDP)" ""
+          sudo ip link set lo mtu 65536
+          node -e '
+            let bad = false;
+            for (const [name, json] of require("fs").readFileSync("stalls.txt", "utf8").trim().split("\n").map((l) => l.split("|"))) {
+              const r = JSON.parse(json || "{}");
+              console.log(name.padEnd(18), "frames", r.frames, "· longest without a frame", r.maxGap, "ms · since the last one", r.lastGap, "ms");
+              // the line was gone 2 s (and TCP needs a moment more): after that the picture flows again
+              if (!(r.lastGap < 1000) || !(r.maxGap < 6000) || !(r.frames > 450)) bad = true;
+            }
+            if (bad) { console.error("the picture did not come back after the line did"); process.exit(1); }
           '
 
   # The native Windows app: MSVC build, then the real pipeline on this machine – the app shares

@@ -85,8 +85,9 @@ class MfEncoder : public VideoEncoder {
       // a GPU's encoder at its balanced setting (Intel: target usage 4, AMD: balanced), the
       // processor at a fast one (it is the fallback); 100 was the slowest, best-quality setting
       setUInt(codec.Get(), CODECAPI_AVEncCommonQualityVsSpeed, hardware_ ? 50 : 33);
-      // no frame bigger than two average ones (a keyframe too): a big one takes long to send – delay
-      setUInt(codec.Get(), CODECAPI_AVEncCommonBufferSize, ULONG(2.0 * bps / fps));
+      // no frame bigger than four average ones (a keyframe too): a big one takes long to send – delay;
+      // two left a keyframe or a big change blurry, pixelated for a while
+      setUInt(codec.Get(), CODECAPI_AVEncCommonBufferSize, ULONG(4.0 * bps / fps));
     }
     ComPtr<IMFMediaType> out;
     MFCreateMediaType(&out);
@@ -177,7 +178,7 @@ class MfEncoder : public VideoEncoder {
   void setBitrate(int bps) override {
     if (!codec_) return;
     setUInt(codec_.Get(), CODECAPI_AVEncCommonMeanBitRate, ULONG(bps));
-    setUInt(codec_.Get(), CODECAPI_AVEncCommonBufferSize, ULONG(2.0 * bps / fps_));
+    setUInt(codec_.Get(), CODECAPI_AVEncCommonBufferSize, ULONG(4.0 * bps / fps_));
   }
 
   std::string name() const override { return name_; }

@@ -17,8 +17,8 @@ const DEFAULT_SETTINGS = { res: 'auto', fps: 'auto', kbps: 'auto', mode: 'motion
 const SETTINGS_VERSION = 3; // older saved settings are dropped so everyone starts from the best defaults
 const NUMERIC_SETTINGS = new Set(['fps', 'kbps']);
 // "auto": a GPU encoder up to 4K 60 – the processor what it manages without falling behind
-const HW_TARGET = { res: '2160', fps: 60, kbps: 120000 };
-const SW_TARGET = { res: '1080', fps: 30, kbps: 20000 };
+const HW_TARGET = { res: '2160', fps: 60 };
+const SW_TARGET = { res: '1080', fps: 30 };
 const DIRECT_CODEC = 'avc1.640034'; // H.264 High 5.2 (up to 4K 60): every GPU decodes it
 const DIRECT_MIN_KBPS = 3000;
 // iPhone / iPad – iPadOS Safari presents itself as a Mac, the touch screen gives it away
@@ -620,9 +620,8 @@ function renderAutoProfile() {
   const t = autoTarget();
   const res = settings.res === 'auto' ? t.res : settings.res;
   const fps = settings.fps === 'auto' ? t.fps : settings.fps;
-  const kbps = settings.kbps === 'auto' ? t.kbps : settings.kbps;
   const why = direct.hw === false ? 'a processzor kódol' : direct.hw ? 'a videókártya kódol' : 'a videókártya kódol, ha tud';
-  $('#autoProfile').textContent = `Most: ${RES_LABEL[res] || res} · ${fps} FPS · max. ${fmtKbps(kbps)} – ${why}.`;
+  $('#autoProfile').textContent = `Most: ${RES_LABEL[res] || res} · ${fps} FPS · ${fmtKbps(directTargetKbps())} – ${why}.`;
 }
 
 function updateCaptureInfo() {
@@ -702,7 +701,7 @@ function updateSetting(key, value) {
     host.video.applyConstraints({ frameRate: { ideal: fps, max: fps } }).catch(() => {});
   }
   if (key === 'mode' && host.video) host.video.contentHint = CONTENT_HINT[value];
-  if (key === 'kbps' && direct.kbps) direct.kbps = Math.min(direct.kbps, directTargetKbps());
+  if (key === 'kbps' && direct.kbps) direct.kbps = directTargetKbps(); // (fixed: what was set)
   if (key === 'audio') updateDirectPipelines();
   updateCaptureInfo();
 }
@@ -968,7 +967,7 @@ function onHostDirectEvent(name, id, info) {
     Object.assign(v.direct, { state: info.state, path: info.path, rtt: info.rtt });
     if (info.state === 'connected') {
       clearTimeout(v.directTimer);
-      if (!direct.kbps) direct.kbps = info.path === 'lan' ? directTargetKbps() : Math.min(directTargetKbps(), 25000);
+      if (!direct.kbps) direct.kbps = directTargetKbps();
       DIRECT.bitrate(direct.kbps * 1000);
       updateDirectPipelines();
       direct.forceKey = true;
@@ -981,6 +980,10 @@ function onHostDirectEvent(name, id, info) {
   } else if (name === 'report') {
     v.direct.report = info;
     if (Number.isFinite(info.rtt)) v.direct.minRtt = Math.min(v.direct.minRtt, info.rtt);
+    // in trouble: frames it had to skip, its round trip grown by queues filling up, heavy loss (a little
+    // loss is what asking again is for)
+    const trouble = info.skips > 0 || info.loss > 8 || (Number.isFinite(info.rtt) && Number.isFinite(v.direct.minRtt) && info.rtt > v.direct.minRtt + 80);
+    v.direct.troubled = trouble ? (v.direct.troubled || 0) + 1 : 0;
     if (info.fps > 0) {
       v.directRetries = 0;
       v.directWhy = null;
@@ -990,27 +993,34 @@ function onHostDirectEvent(name, id, info) {
 }
 
 const directViewers = () => [...host.viewers.values()].filter((v) => v.direct?.state === 'connected');
-// the most beautiful picture the network allows: high (GPU) / what a processor manages
-const directTargetKbps = () => (settings.kbps === 'auto' ? autoTarget().kbps : settings.kbps);
-
-// No bandwidth estimate: lower the bitrate when a viewer loses packets, has to skip frames or its
-// round trip grows (queues filling up), raise it slowly while all is well.
-function adaptDirectBitrate() {
+// The bitrate the picture needs – fixed, the same quality all the time: ~0.12 bit a pixel a frame (sharp
+// text, clean motion), across the internet up to 40 Mbit/s, on the local network up to 100; or what was set.
+function directTargetKbps(config = direct.video?.config) {
+  if (settings.kbps !== 'auto') return settings.kbps;
+  const need = config ? (config.width * config.height * config.framerate * 0.12) / 1000 : 20000;
   const viewers = directViewers();
-  const reports = viewers.map((v) => v.direct.report).filter(Boolean);
-  if (!reports.length) return;
-  const target = directTargetKbps();
+  const lan = viewers.length > 0 && viewers.every((v) => v.direct.path === 'lan');
+  return Math.min(lan ? 100000 : 40000, Math.max(4000, need));
+}
+
+// The bitrate stays at the target as long as the viewers get it – no probing above, no sawtooth. Only a
+// lasting trouble (a viewer's two reports in a row: skipped frames, a round trip grown by queues, heavy
+// loss) brings it down, by 20% every 3 s at most and never below 40%; when all is well it goes back up.
+function adaptDirectBitrate() {
+  const viewers = directViewers().filter((v) => v.direct.report);
+  if (!viewers.length) return;
+  const full = directTargetKbps();
   const now = Date.now();
-  const congested = reports.some((r) => r.loss > 2 || r.skips > 0)
-    || viewers.some((v) => v.direct.report?.rtt != null && v.direct.report.rtt > v.direct.minRtt + 40);
-  if (congested && now - direct.lastCut > 2000) {
-    direct.kbps = Math.max(DIRECT_MIN_KBPS, direct.kbps * 0.7);
+  const lasting = viewers.some((v) => v.direct.troubled >= 2);
+  const calm = viewers.every((v) => !v.direct.troubled && !(v.direct.report.loss >= 2));
+  if (lasting && now - direct.lastCut > 3000) {
+    direct.kbps = Math.max(DIRECT_MIN_KBPS, full * 0.4, direct.kbps * 0.8);
     direct.lastCut = now;
-  } else if (!congested && now - direct.lastCut > 3000 && now - direct.lastRaise > 1000 && reports.every((r) => r.loss < 0.5)) {
-    direct.kbps = Math.min(target, direct.kbps * 1.12 + 500);
+  } else if (calm && direct.kbps < full && now - direct.lastCut > 4000 && now - direct.lastRaise > 2000) {
+    direct.kbps = Math.min(full, direct.kbps * 1.15 + 500);
     direct.lastRaise = now;
   }
-  direct.kbps = Math.min(direct.kbps, target);
+  direct.kbps = Math.min(direct.kbps, full);
   DIRECT.bitrate(direct.kbps * 1000);
 }
 
@@ -1097,7 +1107,7 @@ function readFrames(track, onFrame) {
 function startDirectVideo(track) {
   stopDirectVideo();
   if (!track || track.readyState !== 'live') return;
-  const pipe = { track, stop: null, encoder: null, config: null, sizeKey: '', captured: new Map(), encodeMs: null, inFlight: 0, limit: 1, lastOutput: performance.now(), scale: 1, slowSince: 0, fastSince: 0, stopped: false };
+  const pipe = { track, stop: null, encoder: null, config: null, sizeKey: '', captured: new Map(), encodeMs: null, inFlight: 0, limit: 2, lastOutput: performance.now(), scale: 1, fed: 0, skipped: 0, sizeAt: 0, calmSince: 0, stopped: false };
   direct.video = pipe;
   direct.forceKey = true;
   pipe.stop = readFrames(track, async (frame) => {
@@ -1136,12 +1146,12 @@ function directVideoConfig(pipe, frame) {
     scale = Math.max(1, w / tw, h / th);
   }
   scale *= pipe.scale; // the encoder could not keep up at the full size
+  const size = { width: evenPx(w / scale), height: evenPx(h / scale), framerate: settings.fps === 'auto' ? autoTarget().fps : settings.fps };
+  const kbps = directTargetKbps(size);
   return {
     codec: DIRECT_CODEC,
-    width: evenPx(w / scale),
-    height: evenPx(h / scale),
-    bitrate: Math.round((direct.kbps || directTargetKbps()) * 1000),
-    framerate: settings.fps === 'auto' ? autoTarget().fps : settings.fps,
+    ...size,
+    bitrate: Math.round(Math.min(direct.kbps || kbps, kbps) * 1000),
     latencyMode: 'realtime',
     bitrateMode: 'variable',
     avc: { format: 'annexb' },
@@ -1201,9 +1211,13 @@ async function encodeDirectFrame(pipe, frame) {
       pipe.encoder.configure(pipe.config);
     }
     if (pipe.stopped || !pipe.encoder) return;
-    // The encoder is still busy: a frame that waits is only delay – skip it. (An encoder
-    // that holds a frame or two back before its first output gets that much room.)
-    if (pipe.inFlight >= pipe.limit || pipe.encoder.encodeQueueSize > 0) {
+    pipe.fed++;
+    adaptDirectSize(pipe);
+    // The encoder is still busy: a frame that waits is only delay – skip it. (Two may be in it at once:
+    // a GPU encoder works on the next while the last comes out – with one, a Mac's left out every third
+    // at 60 FPS; one that holds more back before its first output gets that much room.)
+    if (pipe.inFlight >= pipe.limit || pipe.encoder.encodeQueueSize > 1) {
+      pipe.skipped++;
       if (performance.now() - pipe.lastOutput > 250 && pipe.limit < 4) pipe.limit++;
       return;
     }
@@ -1234,33 +1248,34 @@ function onDirectChunk(pipe, chunk) {
   if (c) {
     const ms = performance.now() - c.start;
     pipe.encodeMs = pipe.encodeMs == null ? ms : pipe.encodeMs * 0.9 + ms * 0.1;
-    adaptDirectSize(pipe);
   }
   DIRECT.send({ stream: 0, key: chunk.type === 'key', ts: chunk.timestamp, capture: c?.at ?? clockNow() }, data);
 }
 
-// Encoding slower than the frame interval adds delay: a smaller picture until it keeps up again.
+// The encoder cannot keep up – a quarter of the frames left out because it is still busy (a slow
+// processor, 4K on a weak GPU): a smaller picture until it can. Only with the size on automatic; and not
+// because of the time one frame takes (a Mac's GPU encoder takes 20–40 ms and keeps up all the same:
+// counting that made the picture small and pixelated for nothing).
 function adaptDirectSize(pipe) {
   const now = performance.now();
-  const interval = 1000 / (pipe.config?.framerate || 60);
-  if (pipe.encodeMs > interval * 0.9) {
-    pipe.fastSince = 0;
-    pipe.slowSince ||= now;
-    if (now - pipe.slowSince > 2000 && pipe.scale < 3) {
-      pipe.scale *= 1.5;
-      pipe.slowSince = 0;
-    }
-  } else if (pipe.encodeMs < interval * 0.35 && pipe.scale > 1) {
-    pipe.slowSince = 0;
-    pipe.fastSince ||= now;
-    if (now - pipe.fastSince > 10000) {
+  if (!pipe.sizeAt) pipe.sizeAt = now;
+  if (now - pipe.sizeAt < 3000) return;
+  const left = pipe.fed ? pipe.skipped / pipe.fed : 0;
+  if (left > 0.25 && settings.res === 'auto' && pipe.scale < 2.25) {
+    pipe.scale *= 1.5;
+    pipe.calmSince = 0;
+  } else if (left < 0.02 && pipe.scale > 1) {
+    pipe.calmSince ||= now;
+    if (now - pipe.calmSince > 10000) {
       pipe.scale = Math.max(1, pipe.scale / 1.5);
-      pipe.fastSince = 0;
+      pipe.calmSince = 0;
     }
   } else {
-    pipe.slowSince = 0;
-    pipe.fastSince = 0;
+    pipe.calmSince = 0;
   }
+  pipe.sizeAt = now;
+  pipe.fed = 0;
+  pipe.skipped = 0;
 }
 
 /* ---- the sharer's sound (Opus, 2.5 ms packets – its least delay) ---- */

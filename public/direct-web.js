@@ -25,9 +25,10 @@
   const MEDIA_HEADER = 32;
   const WHOLE = 4; // media flag: the whole frame in this one packet
   // how long frames may queue on their way to a viewer that confirms them (a keyframe longer: it is big,
-  // and what comes after it needs it) – beyond that they are dropped, not delayed
-  const QUEUE_MS = 120;
-  const KEY_QUEUE_MS = 400;
+  // and what comes after it needs it) – beyond that they are dropped, not delayed. Only a line clearly
+  // slower than the picture: every drop costs that viewer a keyframe.
+  const QUEUE_MS = 250;
+  const KEY_QUEUE_MS = 1000;
   const INFO = new TextEncoder().encode('screenshare-direct-v1');
   const subtle = globalThis.crypto?.subtle;
   const now = () => performance.timeOrigin + performance.now();
@@ -147,6 +148,7 @@
       // (the server, its proxy, the sockets) shows as frames confirmed late
       this.inFlight = []; // { id, at, key }
       this.acks = false;
+      this.keyAsked = -Infinity; // when a keyframe was last asked for this viewer (while frames are dropped)
       this.ackMin = [Infinity, Infinity]; // the least time a frame took to be confirmed, in two 5 s windows
       this.ackWindowAt = 0;
       // receiving video
@@ -492,14 +494,23 @@
         if (video) {
           // a viewer that confirms its frames: how long the oldest one still on its way has waited beyond
           // the path's own time – what queues between here and the viewer, where this socket does not see it
+          // (frames never confirmed for 5 s are forgotten)
+          while (peer.inFlight.length && t - peer.inFlight[0].at > 5000) peer.inFlight.shift();
           let late = false;
           if (peer.acks && peer.inFlight.length) {
             const base = Math.min(...peer.ackMin);
             const oldest = peer.inFlight[0];
             late = t - oldest.at - (Number.isFinite(base) ? base : 0) > (oldest.key ? KEY_QUEUE_MS : QUEUE_MS);
           }
-          if (queued > limit || late || (peer.dropping && !meta.key)) {
-            if (!peer.dropping) this.emit('keyframe', peer.id); // the next one goes when there is room
+          const full = queued > limit || late;
+          if (full || (peer.dropping && !meta.key)) {
+            // dropped: the viewer's picture goes on only from a keyframe – asked for as the dropping starts,
+            // and again once there is room (the one asked for may have come while there was none, and the
+            // viewer, getting nothing, asks for nothing: the picture would stand still, the sound going on)
+            if (!peer.dropping || (!full && t - peer.keyAsked > 300)) {
+              peer.keyAsked = t;
+              this.emit('keyframe', peer.id);
+            }
             peer.dropping = true;
             continue;
           }

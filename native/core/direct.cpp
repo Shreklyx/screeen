@@ -19,8 +19,9 @@ const uint8_t REG_ACK = 0x41;
 enum T : uint8_t { PROBE = 1, PROBE_ACK = 2, MEDIA = 3, NACK = 4, PLI = 5, PING = 6, PONG = 7, REPORT = 8, BYE = 9, FEC = 10, ACK = 11 };
 const uint8_t WHOLE = 4; // media flag: the whole frame in this one packet (the WebSocket path)
 // the WebSocket path: how long frames may queue on their way to a viewer that confirms them (a keyframe
-// longer: it is big, and what comes after it needs it) – beyond that they are dropped, not delayed
-const double kTcpQueueMs = 120, kKeyQueueMs = 400;
+// longer: it is big, and what comes after it needs it) – beyond that they are dropped, not delayed. Only
+// a line clearly slower than the picture: every drop costs that viewer a keyframe.
+const double kTcpQueueMs = 250, kKeyQueueMs = 1000;
 const size_t RING = 1 << 14; // video packets kept for retransmission
 const size_t MAX_CANDS = 8;
 const char* INFO = "screenshare-direct-v1";
@@ -558,6 +559,7 @@ struct DirectEndpoint::Peer {
   };
   std::deque<Sent> inFlight;
   bool acks = false;
+  double keyAsked = -1e9; // when a keyframe was last asked for this viewer (while frames are dropped)
   double ackMin[2] = {1e9, 1e9}; // the least time a frame took to be confirmed, in two 5 s windows: the path itself
   double ackWindowAt = 0;
   // receiving video (viewer)
@@ -828,9 +830,11 @@ void DirectEndpoint::openTcp(Peer& p) {
     onLoop([](Peer& q) {
       q.tcp.reset();
       q.tcpReady = false;
+      q.inFlight.clear(); // (what went in it is never confirmed)
     });
   };
   p.tcpReady = false;
+  p.inFlight.clear();
   p.tcp = wsFactory_(tcpUrl_, ev);
 }
 
@@ -1426,15 +1430,24 @@ void DirectEndpoint::sendWhole(Peer& p, const MediaMeta& meta, uint32_t frameId,
   double t = nowMs();
   if (video) {
     // a viewer that confirms its frames: how long the oldest one still on its way has waited beyond the
-    // path's own time – what queues between here and the viewer, where this socket does not see it
+    // path's own time – what queues between here and the viewer, where this socket does not see it.
+    // (Frames sent long ago that were never confirmed – a socket that closed meanwhile – are forgotten.)
+    while (!p.inFlight.empty() && t - p.inFlight.front().at > 5000) p.inFlight.pop_front();
     bool late = false;
     if (p.acks && !p.inFlight.empty()) {
       double base = std::min(p.ackMin[0], p.ackMin[1]);
       const Peer::Sent& oldest = p.inFlight.front();
       late = t - oldest.at - (base < 1e8 ? base : 0) > (oldest.key ? kKeyQueueMs : kTcpQueueMs);
     }
-    if (queued > limit || late || (p.dropping && !meta.key)) {
-      if (!p.dropping && ev_.keyframe) ev_.keyframe(p.id); // the next one goes when there is room
+    bool full = queued > limit || late;
+    if (full || (p.dropping && !meta.key)) {
+      // dropped: the viewer's picture goes on only from a keyframe – asked for as the dropping starts, and
+      // again once there is room (the one asked for may have come while there was none, and the viewer,
+      // getting nothing, asks for nothing: the picture would stand still for good, the sound going on)
+      if (ev_.keyframe && (!p.dropping || (!full && t - p.keyAsked > 300))) {
+        p.keyAsked = t;
+        ev_.keyframe(p.id);
+      }
       p.dropping = true;
       return;
     }

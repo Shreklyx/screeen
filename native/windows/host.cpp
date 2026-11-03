@@ -105,8 +105,9 @@ struct HostPipeline::Impl {
           lastBitrate = bitrate;
           enc->setBitrate(int(lastBitrate));
         }
-        // waiting for the next image; with one pending (and someone to send it to), only until its turn
-        unsigned timeout = pending && streaming ? unsigned(std::max(0.0, std::ceil(nextAt - slack - nowMs()))) : 50;
+        // waiting for the next image – while someone watches, only until the next frame's turn (a still
+        // screen gives no new image: the last one goes again then, below)
+        unsigned timeout = streaming && (pending || have) ? unsigned(std::max(0.0, std::ceil(nextAt - slack - nowMs()))) : 50;
         double t = 0;
         int r = cap.acquire(timeout, t);
         if (r < 0) {
@@ -118,9 +119,11 @@ struct HostPipeline::Impl {
           have = true;
           pending = true;
         }
-        // a keyframe asked for while the screen stands still: the last image again – still what the
-        // screen shows, so captured now (its old time would count the still seconds as delay)
-        if (have && !pending && wantKey && nowMs() - lastEncode >= interval) {
+        // the screen stands still: the last image again at its turn – a steady frame rate (the viewers'
+        // FPS does not fall to 0; a still picture costs a few hundred bytes a frame), a keyframe asked for
+        // goes at once. Still what the screen shows, so captured now (its old time would count the still
+        // seconds as delay).
+        if (have && !pending && streaming && (nowMs() >= nextAt - slack || (wantKey && nowMs() - lastEncode >= interval))) {
           pending = true;
           captureMs = nowMs();
         }
@@ -144,7 +147,7 @@ struct HostPipeline::Impl {
         if (lastEncode - statsAt >= 1000) {
           double ms = encSum / std::max(1, encoded);
           double rate = encoded * 1000.0 / (lastEncode - statsAt);
-          engine.setEncoderStats(ms, cap.width(), cap.height());
+          engine.setEncoderStats(ms, cap.width(), cap.height(), fps);
           setInfo([&](Info& i) {
             i.encodeMs = ms;
             i.fps = rate;
