@@ -1206,6 +1206,11 @@ async function encodeDirectFrame(pipe, frame) {
       await configureDirectEncoder(pipe, want);
       pipe.sizeKey = sizeKey;
       direct.forceKey = true;
+      // a new size: its own bitrate at once (unless a viewer had trouble lately)
+      if (pipe.config && direct.kbps && Date.now() - (direct.lastCut || 0) > 10000) {
+        direct.kbps = directTargetKbps(pipe.config);
+        DIRECT.bitrate(direct.kbps * 1000);
+      }
     } else if (Math.abs(want.bitrate - pipe.config.bitrate) > pipe.config.bitrate * 0.1) {
       pipe.config = { ...pipe.config, bitrate: want.bitrate };
       pipe.encoder.configure(pipe.config);

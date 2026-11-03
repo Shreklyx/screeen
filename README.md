@@ -10,9 +10,13 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   Opus-dekódoló (régebbi Safari / Firefox), az alkalmazások saját C/C++ kódja (BearSSL, libopus) fut az oldalon
   WebAssemblyként (`native/web`).
 - **Alapból a legjobb beállítás, a gép alapján (Automatikus):** ha a videókártya kódol, **4K · 60 FPS**, ha a
-  processzor, 1080p 30 – és ha a kódoló mégsem bírja a tempót, magától kisebb felbontásra vált. A bitrátát a nézők
-  jelentései szabályozzák (csomagvesztés, kihagyott kép, növekvő RTT → kevesebb; ha minden rendben, lassan több).
-  Kézzel minden felülírható (felbontás, FPS, bitráta, tartalomtípus).
+  processzor, 1080p 30 – és ha a kódoló tényleg nem bírja a tempót (a képek negyede kimarad), magától kisebb
+  felbontásra vált. **Állandó minőség és FPS:** a bitráta fix, amennyit a kép mérete és FPS-e kíván (1080p60 ~15,
+  1440p60 ~26, 4K60 40 Mbit/s interneten, helyi hálón akár 100) – nem próbálkozik fölötte, így nem hullámzik; csak
+  tartós gond (egy néző két egymás utáni jelentésében kihagyott kép, 80 ms-mal megnőtt RTT vagy 8% fölötti
+  csomagvesztés) viszi lejjebb, 3 másodpercenként 20%-kal, legfeljebb 40%-ig, és ha rendben van, visszajön. Álló
+  képernyőnél az alkalmazás az utolsó képet küldi újra, így az FPS nem esik 0-ra. Kézzel minden felülírható
+  (felbontás, FPS, bitráta, tartalomtípus).
 - **Hardveres kódolás a videókártyán** (H.264): az alkalmazásban NVIDIA NVENC, Intel / AMD (Media Foundation), Apple
   VideoToolbox; böngészőben a WebCodecs a videókártyán kódol, ha tud. A megosztó **egyszer** kódol minden nézőnek.
   A megosztó panelen látszik: *Hardveres kódolás (videókártya) · H.264 · 3840×2160 · 3 ms/kép*.
@@ -31,9 +35,9 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   megosztó nézőlistájában nézőnként látszik.
 - **Minden út mérve** (CI, 12 Mbit/s-os kép, 20 ms-os hálózat): közvetlenül (UDP) és a szerver reléjén át a kép a
   hálózat saját idején felül **~2 ms** alatt ér át, 1% csomagvesztésnél is. A böngészős nézők útján (WebSocket, a
-  szerveren át) a néző minden képet **visszaigazol**: ha a vonala lassabb a képnél, a megosztó a késve maradó képeket
-  eldobja (legfeljebb ~120 ms várakozás bárhol az úton – a szerver, a Caddy, a hálózati pufferek), és a bitráta
-  lejjebb megy – a késés nem nő.
+  szerveren át) a néző minden képet **visszaigazol**: ha a vonala egyértelműen lassabb a képnél, a megosztó a késve
+  maradó képeket eldobja (~250 ms várakozás fölött bárhol az úton – a szerver, a Caddy, a hálózati pufferek), majd
+  kulcsképpel folytatja – a késés nem nő, és a kép nem áll meg.
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).
 - **A szoba megmarad:** ha a megosztó újratölti az oldalt, bezárja a böngészőt vagy az alkalmazás ablakát, megszakad a
@@ -174,7 +178,8 @@ Fordítás: a GitHub Actions (`.github/workflows/ios.yml`) macOS gépen építi 
 
 ### Tippek, hogy ne akadjon
 
-- **Vezetékes net** a megosztó gépen, és elég feltöltési sávszélesség: 4K60-hoz kb. 20–30 Mbit/s nézőnként.
+- **Vezetékes net** a megosztó gépen, és elég feltöltési sávszélesség: 4K60-hoz kb. 40, 1080p60-hoz kb. 15 Mbit/s
+  nézőnként.
 - Chrome / Edge: legyen bekapcsolva a *Beállítások → Rendszer → Grafikus gyorsítás használata, ha rendelkezésre áll*,
   és legyen friss a videókártya illesztőprogramja – a **Kódolás** dobozban látszik, hogy a videókártya kódol-e.
   Szoftveres kódolásnál a késés a többszöröse is lehet.
@@ -256,8 +261,9 @@ lehető legrövidebb úton:
   egymásnak küld (helyi hálózaton a helyi címen); ha ez nem megy, a szerver továbbítja a (titkosított) csomagokat
   (3479/udp, vagy a TURN szerveren át); ha semmilyen UDP nem jut át (szigorú tűzfal), a szerver HTTPS-portján,
   WebSocketben mennek. Két alkalmazás között **nincs WebRTC**: ha a kapcsolat megszakad, újra felépül;
-- a bitrátát a néző jelentései szabályozzák (csomagvesztés, kihagyott kép, növekvő RTT → kevesebb; ha minden rendben,
-  lassan több); szoftveres kódolásnál, ha a kódoló nem bírja a tempót, kisebb felbontásra vált.
+- a bitráta fix (a kép méretéhez és FPS-éhez); csak a nézők tartós gondja (kihagyott képek, megnőtt RTT, nagy
+  csomagvesztés két jelentésen át) viszi lejjebb, lépcsőnként, és visszajön; szoftveres kódolásnál, ha a kódoló nem
+  bírja a tempót, kisebb felbontásra vált.
 
 A néző statisztikájában (**S**) a *Mód* sorban: *Közvetlen*, a *Késés (mért)* a valódi, végponttól végpontig mért
 késés (a megosztó gépen a rögzítéstől a néző vásznára rajzolásig, a két gép órájának eltérésével korrigálva).
@@ -265,8 +271,8 @@ késés (a megosztó gépen a rögzítéstől a néző vásznára rajzolásig, a
 protokoll és ugyanaz a végponttól végpontig titkosítás, de mivel böngészőből nem lehet UDP-t küldeni, a csomagok
 WebSocketben, a szerver HTTPS-portján (`wss://…/direct`) mennek, és a szerver adja tovább őket (a képet nem látja).
 Ezen az úton egy képkocka egy csomag (a TCP nem veszít el semmit, nincs újrakérés); ha a néző vonala nem bírja, a
-megosztó eldobja a képkockákat a következő kulcskockáig ahelyett, hogy sorba állítaná őket, és a bitráta lejjebb
-megy. A néző itt is puffer nélkül, minden képet azonnal kirajzol. Így megy alkalmazás → böngésző, böngésző →
+megosztó eldobja a képkockákat a következő kulcskockáig ahelyett, hogy sorba állítaná őket (és amint van hely, újra
+kér kulcskockát – a kép nem marad állva). A néző itt is puffer nélkül, minden képet azonnal kirajzol. Így megy alkalmazás → böngésző, böngésző →
 böngésző és böngésző → alkalmazás. A kulcscsere a böngésző WebCrypto X25519-e, ha van, különben az alkalmazások
 BearSSL-kódja WebAssemblyként; a hang a böngésző Opus-dekódolója (WebCodecs), ha van, különben a libopus
 WebAssemblyként (`public/ss-web.wasm`, forrás: `native/web`). A megosztó a képet és a hangot a
