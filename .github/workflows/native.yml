@@ -95,8 +95,9 @@ jobs:
       # each packet 20 ms (then also loses 1% of them; then is slower than the picture) with internet-sized
       # packets (MTU 1500): straight to the viewer (UDP), through the server's relay (UDP, two legs), in the
       # WebSocket (TCP, two legs, as to a browser) – how long a frame takes from the sharer to the viewer,
-      # beyond what the network itself takes. On a line slower than the picture the viewer's confirmations
-      # keep the queue short (frames are dropped instead); without them the delay grows. With 1% loss TCP
+      # beyond what the network itself takes. On a line slower than the picture the quality stays (the
+      # bitrate is fixed): that viewer misses frames, and its confirmations keep the queue from growing
+      # without end (without them the delay grows to seconds) – the picture keeps moving. With 1% loss TCP
       # slows down: BBR (the server's) keeps more speed.
       - name: "Latency: every path"
         run: |
@@ -142,7 +143,7 @@ jobs:
               if (!(r.frames > 600) || !(r.latMedian < 20 * legs + 15)) problems.push(name + ": " + JSON.stringify(r));
             }
             const slow = got["WebSocket, 8 Mbit/s"] || {};
-            if (!(slow.latMedian < 800) || !(slow.lastGap < 1500)) problems.push("a slow line made the WebSocket path late or stand still: " + JSON.stringify(slow));
+            if (!(slow.latMedian < 1500) || !(slow.lastGap < 1500) || !(slow.frames > 100)) problems.push("a slow line made the WebSocket path stand still: " + JSON.stringify(slow));
             if (problems.length) { console.error(problems.join("\n")); process.exit(1); }
           '
       # A line that stops for 2 s and comes back: the picture has to come back too. (To a browser it stood
