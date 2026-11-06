@@ -15,7 +15,6 @@ namespace ss {
 namespace {
 
 const char* kCodec = "avc1.640034"; // H.264 High 5.2 (up to 4K 60): every GPU decodes it
-const double kMinKbps = 3000;
 
 // why a viewer is not served, or why a connection is made again – the page's WHY_TEXT
 const std::map<std::string, std::string> kWhy = {
@@ -93,7 +92,6 @@ struct Engine::Impl {
     std::string path;
     double rtt = NAN, minRtt = INFINITY;
     Json report;
-    int troubled = 0; // its reports in a row that told of trouble (see onHostReport)
     int directTimer = 0, retryTimer = 0, retries = 0;
     std::string why;      // why it is being connected again / not served
     bool unsupported = false;
@@ -107,7 +105,7 @@ struct Engine::Impl {
   std::map<std::string, Viewer> viewers;
   int seq = 0;
   std::unique_ptr<DirectEndpoint> ep;
-  double kbps = 0, lastCut = 0, lastRaise = 0, targetKbps = 0, sentKbps = 0;
+  double kbps = 0, targetKbps = 0, sentKbps = 0;
   bool streaming = false;
   double lastKey = -1e9;
   int keyTimer = 0;
@@ -460,7 +458,6 @@ struct Engine::Impl {
     v.path.clear();
     v.rtt = NAN;
     v.minRtt = INFINITY;
-    v.troubled = 0;
     v.report = Json();
     send(Json::object().set("t", "direct").set("to", v.id));
     std::string id = v.id;
@@ -545,7 +542,7 @@ struct Engine::Impl {
     v.rtt = info["rtt"].num(NAN);
     if (state == "connected") {
       loop.cancel(v.directTimer);
-      if (!kbps) kbps = target();
+      kbps = target(); // (a line from the internet: the internet's bitrate – fixed from then on)
       applyBitrate(true);
       updateStreaming();
       encoderKeyframe();
@@ -568,10 +565,6 @@ struct Engine::Impl {
     Viewer& v = it->second;
     v.report = r;
     if (r["rtt"].isNumber()) v.minRtt = std::min(v.minRtt, r["rtt"].num());
-    // in trouble: frames it had to skip, its round trip grown by queues filling up, heavy loss (a little
-    // loss is what parity and asking again are for)
-    bool trouble = r["skips"].num() > 0 || r["loss"].num() > 8 || (r["rtt"].isNumber() && std::isfinite(v.minRtt) && r["rtt"].num() > v.minRtt + 80);
-    v.troubled = trouble ? v.troubled + 1 : 0;
     if (r["fps"].num() > 0) {
       v.retries = 0;
       v.why.clear();
@@ -579,43 +572,30 @@ struct Engine::Impl {
     adaptBitrate();
   }
 
-  // The bitrate the picture needs – fixed, the same quality all the time: ~0.12 bit a pixel a frame in
-  // H.264 (sharp text, clean motion), on the local network up to 100 Mbit/s, across the internet up to 40.
-  // (Asked for: setTargetKbps.)
+  // The bitrate the picture needs – fixed, never lowered: the same quality all the time, whatever a line
+  // does. 0.16 bit a pixel a frame in H.264 (sharp text, clean motion even in a film's dark scenes):
+  // 1080p60 20 Mbit/s, 1080p120 40, 1440p60 35, 4K60 80, 4K120 120 – across the internet up to 80 (120
+  // at 120 FPS), on the local network up to 200. A viewer whose line cannot carry it misses frames (only
+  // that one, see direct.cpp); nobody's picture gets worse. (Asked for: setTargetKbps.)
   double target() const {
     if (targetKbps > 0) return targetKbps;
-    double need = encW > 0 && encH > 0 ? double(encW) * encH * (encFps > 0 ? encFps : 60) * 0.12 / 1000 : 20000;
+    int fps = encFps > 0 ? encFps : 60;
+    double need = encW > 0 && encH > 0 ? double(encW) * encH * fps * 0.16 / 1000 : 20000;
+    double internet = fps > 90 ? 120000 : 80000;
     bool lan = false;
     for (auto& kv : viewers) {
       if (!kv.second.direct || kv.second.state != "connected") continue;
-      if (kv.second.path != "lan") return std::clamp(need, 4000.0, 40000.0);
+      if (kv.second.path != "lan") return std::clamp(need, 5000.0, internet);
       lan = true;
     }
-    return std::clamp(need, 4000.0, lan ? 100000.0 : 40000.0);
+    return std::clamp(need, 5000.0, lan ? 200000.0 : internet);
   }
 
-  // The bitrate stays at the target as long as the viewers get it – no probing above, no sawtooth. Only
-  // a lasting trouble (a viewer's two reports in a row: skipped frames, a round trip grown by queues,
-  // heavy loss) brings it down, by 20% every 3 s at most and never below 40%; when all is well again it
-  // goes back up.
+  /** The bitrate is the target – fixed: it follows the picture's size and which lines carry it, never a
+   *  viewer's trouble. */
   void adaptBitrate() {
-    std::vector<Viewer*> list;
-    for (auto& kv : viewers) if (kv.second.direct && kv.second.state == "connected" && kv.second.report.isObject()) list.push_back(&kv.second);
-    if (list.empty()) return;
-    double now = nowMs(), full = target();
-    bool lasting = false, calm = true;
-    for (Viewer* v : list) {
-      if (v->troubled >= 2) lasting = true;
-      if (v->troubled > 0 || v->report["loss"].num() >= 2) calm = false;
-    }
-    if (lasting && now - lastCut > 3000) {
-      kbps = std::max({kMinKbps, full * 0.4, kbps * 0.8});
-      lastCut = now;
-    } else if (calm && kbps < full && now - lastCut > 4000 && now - lastRaise > 2000) {
-      kbps = std::min(full, kbps * 1.15 + 500);
-      lastRaise = now;
-    }
-    kbps = std::min(kbps, full);
+    if (kbps <= 0) return;
+    kbps = target();
     applyBitrate(false);
   }
 
@@ -973,7 +953,7 @@ void Engine::setTargetKbps(double kbps) {
   impl->loop.post([impl, kbps] {
     impl->targetKbps = kbps;
     if (impl->kbps) {
-      impl->kbps = std::min(impl->kbps, impl->target());
+      impl->kbps = impl->target();
       impl->applyBitrate(true);
     }
   });
@@ -1015,8 +995,8 @@ void Engine::setEncoderStats(double encodeMs, int width, int height, int fps) {
     impl->encW = width;
     impl->encH = height;
     if (fps > 0) impl->encFps = fps;
-    // the picture's size known (or changed): its bitrate at once – unless a viewer had trouble lately
-    if (changed && impl->kbps > 0 && nowMs() - impl->lastCut > 10000) {
+    // the picture's size known (or changed): its bitrate at once
+    if (changed && impl->kbps > 0) {
       impl->kbps = impl->target();
       impl->applyBitrate(false);
     }

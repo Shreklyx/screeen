@@ -193,7 +193,7 @@ Fordítás: a GitHub Actions (`.github/workflows/ios.yml`) macOS gépen építi 
 ## Asztali alkalmazás (Windows, Mac)
 
 Letöltés: a weboldal főoldalán, vagy <https://github.com/Shreklyx/screeen/releases/tag/desktop-latest>
-(**ScreenShare-Setup.exe** Windowsra – 64 bites, **ScreenShare-mac.dmg** Macre – Apple Silicon és Intel, macOS 12.3+).
+(**ScreenShare-Setup.exe** Windowsra – 64 bites, **ScreenShare-mac.dmg** Macre – csak Apple Silicon: M1 és újabb, macOS 12.3+).
 
 **Natív alkalmazás, Electron és Chromium nélkül** (`native/`): Windowson egyetlen ~1,5 MB-os program (Win32,
 Direct3D 11, Media Foundation, WASAPI), Macen egy ~2 MB-os alkalmazás (AppKit, ScreenCaptureKit, VideoToolbox, Core
@@ -301,7 +301,7 @@ nézőlistában pedig, ki kapja térhangban. A néző statisztikájában (**S**)
 
 
 A `native/` mappában van. A GitHub Actions (`.github/workflows/native.yml`) minden változásnál lefordítja (Windows:
-MSVC, Mac: arm64 + x86_64 egy alkalmazásba fűzve), és a CI gépeken valódi megosztással és nézéssel teszteli (az
+MSVC, Mac: csak Apple Silicon – arm64, M1-re hangolva), és a CI gépeken valódi megosztással és nézéssel teszteli (az
 alkalmazás megoszt egy natív nézőnek, és néz egy natív megosztót), majd feltölti a `desktop-latest` kiadásba. Kézzel:
 
 ```bash
@@ -309,7 +309,7 @@ cmake -S native -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build   # W
 build/sscore_test                                                            # a mag tesztjei
 ```
 
-Macen egy architektúra: `-DCMAKE_OSX_ARCHITECTURES=arm64` (vagy `x86_64`) `-DCMAKE_OSX_DEPLOYMENT_TARGET=12.3`.
+Macen: `-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_CXX_FLAGS=-mcpu=apple-m1 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3` (csak Apple Silicon).
 A `build/ss-cli` parancssoros megosztó / néző (teszteléshez: `ss-cli host --server … --password … --h264 fájl`,
 `ss-cli view --server … --code …`). A korábbi Electron alkalmazás (`desktop/`) már nem készül.
 

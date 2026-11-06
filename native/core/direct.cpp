@@ -1513,7 +1513,7 @@ void DirectEndpoint::enqueue(Peer& p, std::shared_ptr<const Bytes> payload, bool
 
 void DirectEndpoint::drain() {
   double t = nowMs();
-  bool pending = false;
+  double wait = -1; // until the first viewer waiting for its turn has one (ms)
   for (auto& kv : peers_) {
     Peer& p = *kv.second;
     // on the local network a frame goes out at (up to) gigabit speed: a 4K frame in ~2 ms
@@ -1530,12 +1530,16 @@ void DirectEndpoint::drain() {
       p.sentBytes += b->size();
       send(p, type, b->data(), b->size());
     }
-    if (!p.out.empty()) pending = true;
+    if (!p.out.empty()) {
+      double w = -p.tokens / rate;
+      wait = wait < 0 ? w : std::min(wait, w);
+    }
   }
-  if (pending && !draining_) {
+  // the rest when its turn comes – a timer, not the loop spinning until then (a core at full load)
+  if (wait >= 0 && !draining_) {
     draining_ = true;
     std::weak_ptr<bool> alive = alive_;
-    loop_.post([this, alive] {
+    loop_.setTimer(std::max(0.2, wait), [this, alive] {
       if (alive.expired() || !*alive.lock()) return;
       draining_ = false;
       drain();

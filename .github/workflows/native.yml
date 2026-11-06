@@ -361,7 +361,7 @@ jobs:
             from-app.h264
           if-no-files-found: error
 
-  # The native Mac app: built for Apple silicon and Intel (joined with lipo, signed ad hoc), then on
+  # The native Mac app: built for Apple silicon only (M1 and later, tuned for it; signed ad hoc), then on
   # this machine it watches (decodes with VideoToolbox) a native sharer, and shares its screen to a
   # native viewer when the runner lets it record the screen. Published as ScreenShare-Native-Mac.zip.
   mac:
@@ -382,19 +382,16 @@ jobs:
             sips -z $((s * 2)) $((s * 2)) desktop/build/icon.png --out icon.iconset/icon_${s}x${s}@2x.png >/dev/null
           done
           iconutil -c icns icon.iconset -o native/mac/app.icns
-      - name: Build (arm64 and x86_64, one app)
+      - name: Build (Apple silicon)
         run: |
           set -e
-          for arch in arm64 x86_64; do
-            cmake -S native -B build-$arch -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=$arch \
-              -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 -DSS_VERSION=2.0.${{ github.run_number }} -DSS_BUILD=${{ github.run_number }}
-            cmake --build build-$arch -j4
-          done
+          cmake -S native -B build-arm64 -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_C_FLAGS=-mcpu=apple-m1 -DCMAKE_CXX_FLAGS=-mcpu=apple-m1 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3 -DSS_VERSION=2.0.${{ github.run_number }} -DSS_BUILD=${{ github.run_number }}
+          cmake --build build-arm64 -j4
           mkdir -p dist
           cp -R "build-arm64/mac/Screen Share.app" dist/
-          exe="Contents/MacOS/Screen Share"
-          lipo -create "build-arm64/mac/Screen Share.app/$exe" "build-x86_64/mac/Screen Share.app/$exe" -output "dist/Screen Share.app/$exe"
-          lipo -info "dist/Screen Share.app/$exe"
+          lipo -info "dist/Screen Share.app/Contents/MacOS/Screen Share"
           codesign --force --deep --sign - "dist/Screen Share.app"
           codesign --verify --verbose "dist/Screen Share.app"
       - name: Core tests
@@ -692,7 +689,7 @@ jobs:
             gh release delete-asset desktop-latest "$old" -y 2>/dev/null || true
           done
           cat > notes.md <<NOTES
-          Windows (64 bites): **ScreenShare-Setup.exe** · Mac (Apple Silicon és Intel, macOS 12.3+): **ScreenShare-mac.dmg** · iPhone / iPad: **ScreenShare-iOS.ipa**
+          Windows (64 bites): **ScreenShare-Setup.exe** · Mac (csak Apple Silicon – M1 és újabb, macOS 12.3+): **ScreenShare-mac.dmg** · iPhone / iPad: **ScreenShare-iOS.ipa**
 
           Natív alkalmazás – Electron és Chromium nélkül (Windowson ~1 MB, Macen ~2 MB):
           - Windows: DXGI képernyőkép, NVENC / Intel / AMD hardveres kódolás (vagy a Windows szoftveres kódolója), a gép teljes hangja (5.1 / 7.1 is), Direct3D 11 megjelenítés.

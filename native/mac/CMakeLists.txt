@@ -1,5 +1,5 @@
 # Screen Share for macOS (native): "Screen Share.app" – AppKit, ScreenCaptureKit, VideoToolbox, Core Audio.
-# One architecture per build (CMAKE_OSX_ARCHITECTURES); CI joins the arm64 and x86_64 builds with lipo.
+# Apple silicon only (CMAKE_OSX_ARCHITECTURES=arm64, tuned with -mcpu=apple-m1: M1 and later).
 set(SS_VERSION "2.0.0" CACHE STRING "version shown and compared for updates")
 set(SS_BUILD "0" CACHE STRING "build number (CI run), shown in the About panel")
 
