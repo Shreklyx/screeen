@@ -16,6 +16,10 @@ services:
       DIRECT_PORT: "3479"
       # csak a Caddy éri el, így a X-Forwarded-For fejléc megbízható
       TRUST_PROXY: "1"
+      # az állandó szobák és a szobák tokenjeit aláíró kulcs: a szerver újraindulása után is megvannak
+      DATA_DIR: /data
+    volumes:
+      - app_data:/data
     expose:
       - "8080"
     ports:
@@ -97,3 +101,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  app_data:

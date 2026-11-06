@@ -71,7 +71,12 @@ class Engine {
   void keepRoom();
   /** Sharer: the picture is paused (true) or goes on (false); viewers see "szünetel". */
   void setLive(bool live);
-  void stopHosting();
+  /** Sharer: ends the share. A permanent room stays (its sharer is away) unless forget: then it is gone. */
+  void stopHosting(bool forget = false);
+  /** Sharer: the room's options – permanent (the server keeps it, also after it starts again, and it does
+   *  not close while the sharer is away) and an entry password viewers have to give ("" = none). Before
+   *  host(), or while sharing (the server gets them again). */
+  void setRoomOptions(bool permanent, const std::string& access);
   /** Sharer: the encoder's target, to start with and as an upper limit (kbit/s; 0 = automatic). */
   void setTargetKbps(double kbps);
   /** Sharer: an encoded H.264 frame (Annex B) – any thread. */
@@ -89,8 +94,11 @@ class Engine {
   /** Both: a chat message to everyone in the room. */
   void sendChat(const std::string& text);
 
-  /** Viewer: joins a room by its code. */
+  /** Viewer: joins a room by its code (or "code.key" from a link: the key never goes to the server). */
   void join(const std::string& code);
+  /** Viewer: the room's entry password (before join, or after a "join-error" with code "access": then it
+   *  joins again with it). */
+  void setAccess(const std::string& access);
   void leave();
   /** Viewer: the decoder lost track – a keyframe, please. */
   void requestKeyframe();

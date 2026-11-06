@@ -77,6 +77,9 @@ export function loadConfig(env = process.env) {
     trustProxy: /^(1|true|yes)$/i.test(env.TRUST_PROXY || ''),
     // direct mode (app ↔ app): UDP port for address discovery and relaying; 0 = off
     directPort: Number(env.DIRECT_PORT) || 0,
+    // where the permanent rooms are kept (and the key that signs rooms' tokens, if ROOM_SECRET is not set)
+    dataDir: env.DATA_DIR || '',
+    roomSecret: env.ROOM_SECRET || '',
   };
 }
 
@@ -84,6 +87,52 @@ export function loadConfig(env = process.env) {
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest();
 const passwordMatches = (given, expected) => crypto.timingSafeEqual(sha256(given), sha256(expected));
+
+/* A room's token is signed: HMAC(the server's key, its code). A server that started again has no rooms –
+ * the sharer's app comes back with its code and token, and the room is there again with the same code
+ * (nothing kept but the key). The key: ROOM_SECRET; else made once and kept in DATA_DIR; else from the TURN
+ * secret or the host password (they stay the same across restarts); else new at each start. */
+function roomSigningKey(config) {
+  if (config.roomSecret) return crypto.createHmac('sha256', config.roomSecret).update('screenshare rooms').digest();
+  if (config.dataDir) {
+    const file = path.join(config.dataDir, 'room-secret');
+    try {
+      const key = fs.readFileSync(file);
+      if (key.length >= 32) return key;
+    } catch {
+      // made below
+    }
+    try {
+      const key = crypto.randomBytes(32);
+      fs.mkdirSync(config.dataDir, { recursive: true });
+      fs.writeFileSync(file, key, { mode: 0o600 });
+      return key;
+    } catch (err) {
+      console.warn(`[screenshare] ${file} nem írható (${err.message}) – a szobák nem élik túl az újraindulást.`);
+    }
+  }
+  const base = config.turnSecret || config.hostPassword;
+  if (base) return crypto.createHmac('sha256', base).update('screenshare rooms').digest();
+  return crypto.randomBytes(32);
+}
+
+// A room's entry password: kept only as a slow salted hash (scrypt).
+function hashAccess(password) {
+  const salt = crypto.randomBytes(16);
+  return { salt: salt.toString('base64'), hash: crypto.scryptSync(password, salt, 32).toString('base64') };
+}
+
+function accessMatches(password, access) {
+  if (typeof password !== 'string' || !password || password.length > 128) return false;
+  try {
+    const want = Buffer.from(access.hash, 'base64');
+    return crypto.timingSafeEqual(crypto.scryptSync(password, Buffer.from(access.salt, 'base64'), 32), want);
+  } catch {
+    return false;
+  }
+}
+
+const validAccess = (a) => Boolean(a && typeof a.salt === 'string' && typeof a.hash === 'string');
 
 function randomCode(n = 6) {
   const bytes = crypto.randomBytes(n);
@@ -254,6 +303,68 @@ function handleStatic(req, res) {
 export function createApp(config = loadConfig()) {
   const rooms = new Map();
   let closing = false;
+  const signKey = roomSigningKey(config);
+  const tokenFor = (code) => crypto.createHmac('sha256', signKey).update(`room|${code}`).digest('base64url');
+  const newRoom = (code) => ({
+    code,
+    token: tokenFor(code),
+    host: null,
+    viewers: new Map(),
+    live: false,
+    awayTimer: null,
+    chat: [], // the last messages: {id, from: 'host' or a viewer's id, name, text, at}
+    chatSeq: 0,
+    viewerSeq: 0, // for the names of those who give none: Néző 1, Néző 2, …
+    permanent: false, // kept on disk: it is there after a restart too, it does not close when its sharer is away
+    access: null, // the entry password's hash (see hashAccess): viewers come in only with it
+  });
+
+  // the permanent rooms: kept in DATA_DIR/rooms.json (their codes and entry passwords' hashes)
+  const storeFile = config.dataDir ? path.join(config.dataDir, 'rooms.json') : '';
+  const saveRooms = () => {
+    if (!storeFile) return;
+    const list = [...rooms.values()].filter((r) => r.permanent).map((r) => ({ code: r.code, access: r.access }));
+    try {
+      fs.mkdirSync(config.dataDir, { recursive: true });
+      fs.writeFileSync(`${storeFile}.tmp`, JSON.stringify({ rooms: list }), { mode: 0o600 });
+      fs.renameSync(`${storeFile}.tmp`, storeFile);
+    } catch (err) {
+      console.warn(`[screenshare] a szobák mentése nem sikerült: ${err.message}`);
+    }
+  };
+  if (storeFile) {
+    try {
+      for (const r of JSON.parse(fs.readFileSync(storeFile, 'utf8')).rooms || []) {
+        if (!CODE_RE.test(String(r.code)) || rooms.has(r.code)) continue;
+        const room = newRoom(r.code);
+        room.permanent = true;
+        room.access = validAccess(r.access) ? r.access : null;
+        rooms.set(room.code, room);
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.warn(`[screenshare] ${storeFile}: ${err.message}`);
+    }
+  }
+
+  /** The sharer's choices for its room: permanent (kept, also after a restart) and an entry password ("": none). */
+  const applyRoomOptions = (room, msg) => {
+    let changed = false;
+    if (typeof msg.permanent === 'boolean' && msg.permanent !== room.permanent) {
+      room.permanent = msg.permanent;
+      changed = true;
+    }
+    if (typeof msg.access === 'string') {
+      const pw = msg.access.slice(0, 128);
+      if (!pw && room.access) {
+        room.access = null;
+        changed = true;
+      } else if (pw && !(room.access && accessMatches(pw, room.access))) {
+        room.access = hashAccess(pw);
+        changed = true;
+      }
+    }
+    if (changed) saveRooms();
+  };
   // direct mode sessions; the UDP port only when DIRECT_PORT is set (the TCP fallback always works)
   const relay = createRelay({ port: config.directPort, host: config.host });
   const relayReady = config.directPort ? relay.listen().catch((err) => {
@@ -311,6 +422,7 @@ export function createApp(config = loadConfig()) {
   function closeRoom(room, reason = 'closed') {
     clearTimeout(room.awayTimer);
     rooms.delete(room.code);
+    if (room.permanent) saveRooms();
     relay.removeWhere((s) => s.room === room.code);
     for (const v of room.viewers.values()) {
       v.room = null;
@@ -335,7 +447,7 @@ export function createApp(config = loadConfig()) {
     } else if (conn.role === 'host' && room.host === conn) {
       room.host = null;
       for (const v of room.viewers.values()) send(v, { t: 'host-away' });
-      if (!closing) room.awayTimer = setTimeout(() => closeRoom(room, 'timeout'), LIMITS.hostGraceMs);
+      if (!closing && !room.permanent) room.awayTimer = setTimeout(() => closeRoom(room, 'timeout'), LIMITS.hostGraceMs);
     }
     conn.room = null;
     conn.role = null;
@@ -356,6 +468,8 @@ export function createApp(config = loadConfig()) {
       t: 'hosted',
       code: room.code,
       token: room.token,
+      permanent: room.permanent,
+      access: Boolean(room.access),
       iceServers: iceServers(config),
       live: room.live,
       viewers: [...room.viewers.values()].map((v) => ({ id: v.id, caps: v.caps, name: v.name })),
@@ -371,10 +485,19 @@ export function createApp(config = loadConfig()) {
     host(conn, msg) {
       const resume = msg.resume;
       if (resume && typeof resume === 'object') {
-        const room = rooms.get(String(resume.code || ''));
-        if (room && typeof resume.token === 'string' && passwordMatches(resume.token, room.token)) {
+        const code = String(resume.code || '').toLowerCase();
+        let room = rooms.get(code);
+        // its own token – for a room this server does not have (it started again since), the one signed
+        // for that code: the room is there again with its code
+        const token = typeof resume.token === 'string' ? resume.token : '';
+        if (token && passwordMatches(token, room ? room.token : tokenFor(code)) && (room || (CODE_RE.test(code) && rooms.size < LIMITS.rooms))) {
+          if (!room) {
+            room = newRoom(code);
+            rooms.set(code, room);
+          }
           if (conn.room && conn.room !== room) leave(conn);
           conn.name = cleanText(msg.name, LIMITS.chatName) || room.host?.name || 'Megosztó';
+          applyRoomOptions(room, msg);
           attachHost(conn, room);
           return;
         }
@@ -392,18 +515,9 @@ export function createApp(config = loadConfig()) {
       conn.name = cleanText(msg.name, LIMITS.chatName) || 'Megosztó';
       let code;
       do code = randomCode(); while (rooms.has(code));
-      const room = {
-        code,
-        token: crypto.randomBytes(24).toString('base64url'),
-        host: null,
-        viewers: new Map(),
-        live: false,
-        awayTimer: null,
-        chat: [], // the last messages: {id, from: 'host' or a viewer's id, name, text, at}
-        chatSeq: 0,
-        viewerSeq: 0, // for the names of those who give none: Néző 1, Néző 2, …
-      };
+      const room = newRoom(code);
       rooms.set(code, room);
+      applyRoomOptions(room, msg);
       attachHost(conn, room);
     },
 
@@ -415,6 +529,14 @@ export function createApp(config = loadConfig()) {
       const code = String(msg.code || '').toLowerCase().slice(0, 6);
       const room = CODE_RE.test(code) ? rooms.get(code) : null;
       if (!room) return send(conn, { t: 'error', code: 'notfound' });
+      if (room.access) {
+        // its entry password (wrong ones count as the sharers' wrong passwords do)
+        if (authLimiter.limited(conn.ip)) return send(conn, { t: 'error', code: 'rate' });
+        if (!accessMatches(msg.access, room.access)) {
+          if (typeof msg.access === 'string' && msg.access) authLimiter.hit(conn.ip);
+          return send(conn, { t: 'error', code: 'access' });
+        }
+      }
       if (room.viewers.size >= LIMITS.viewersPerRoom) return send(conn, { t: 'error', code: 'full' });
       if (conn.room) leave(conn);
       conn.role = 'viewer';
@@ -455,9 +577,12 @@ export function createApp(config = loadConfig()) {
       for (const v of room.viewers.values()) send(v, { t: 'state', live: room.live });
     },
 
-    close(conn) {
+    close(conn, msg) {
       const room = conn.room;
-      if (room && conn.role === 'host' && room.host === conn) closeRoom(room);
+      if (!room || conn.role !== 'host' || room.host !== conn) return;
+      // a permanent room stays (its sharer is away, as when it left) – unless it is given up
+      if (room.permanent && msg.forget !== true) return leave(conn);
+      closeRoom(room);
     },
 
     leave(conn) {

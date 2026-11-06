@@ -61,6 +61,46 @@ jobs:
             if (!(code.frames > 50)) throw new Error("with only the code there was no picture: " + JSON.stringify(code));
             console.log("e2e ok", wrong.frames, code.frames);
           '
+      # The server starts again in the middle of a share: the room keeps its code (its token is signed –
+      # the sharer's app takes it back on its own), the viewer goes on. And a permanent room with an entry
+      # password: kept on the server's disk, no picture without the password, with it the picture comes.
+      - name: "Rooms: the server starts again; a permanent room with a password"
+        run: |
+          data=$(mktemp -d)
+          PORT=8093 HOST_PASSWORD=ci DIRECT_PORT=3493 DATA_DIR=$data node server/server.js > rs-srv1.log 2>&1 &
+          srv=$!
+          sleep 2
+          build/ss-cli host --server http://127.0.0.1:8093 --password ci --h264 native/tests/data/test.h264 --seconds 26 > rs-host.log &
+          host=$!
+          for i in $(seq 1 50); do grep -q '^ROOM' rs-host.log && break; sleep 0.2; done
+          room=$(grep '^ROOM' rs-host.log | awk '{print $2}')
+          build/ss-cli view --server http://127.0.0.1:8093 --code "$room" --seconds 22 > rs-view.log &
+          viewer=$!
+          sleep 6
+          kill $srv; wait $srv 2>/dev/null || true
+          sleep 2
+          PORT=8093 HOST_PASSWORD=ci DIRECT_PORT=3493 DATA_DIR=$data node server/server.js > rs-srv2.log 2>&1 &
+          srv=$!
+          wait $viewer
+          wait $host
+          build/ss-cli host --server http://127.0.0.1:8093 --password ci --h264 native/tests/data/test.h264 --seconds 12 --permanent --access mozi > perm-host.log &
+          for i in $(seq 1 50); do grep -q '^ROOM' perm-host.log && break; sleep 0.2; done
+          proom=$(grep '^ROOM' perm-host.log | awk '{print $2}')
+          build/ss-cli view --server http://127.0.0.1:8093 --code "$proom" --seconds 3 > perm-none.log
+          build/ss-cli view --server http://127.0.0.1:8093 --code "$proom" --access mozi --seconds 3 > perm-ok.log
+          kill $srv
+          node -e '
+            const fs = require("fs");
+            const result = (f) => JSON.parse(fs.readFileSync(f, "utf8").split("\n").filter((l) => l.startsWith("RESULT ")).pop().slice(7));
+            const hosted = fs.readFileSync("rs-host.log", "utf8").split("\n").filter((l) => l.includes("\"type\":\"hosted\""));
+            if (hosted.length < 2 || hosted.some((l) => l.includes("\"changed\":true"))) throw new Error("the room did not keep its code: " + hosted.join(" | "));
+            const view = result("rs-view.log");
+            if (!(view.frames > 600) || !(view.lastGap < 1000)) throw new Error("the viewer did not go on: " + JSON.stringify(view));
+            if (result("perm-none.log").frames !== 0) throw new Error("a viewer without the password got the picture");
+            if (!(result("perm-ok.log").frames > 50)) throw new Error("with the password there was no picture: " + JSON.stringify(result("perm-ok.log")));
+            if (fs.readFileSync(process.argv[1] + "/rooms.json", "utf8").includes("mozi\"")) throw new Error("the password itself was kept");
+            console.log("rooms ok", view.frames, hosted.length);
+          ' "$data"
       # A room kept: its sharer's app goes away without closing it (a crash, an update, a restart) and
       # takes it back with its token – the same code, no password; the viewer in it gets the picture again
       - name: "A room kept: the sharer goes away and comes back"

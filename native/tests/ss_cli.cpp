@@ -5,7 +5,8 @@
 //   ss-cli view --server http://127.0.0.1:8090 --code abc123 [--seconds 10] [--out received.h264]
 //   the room's chat, both: [--name NAME] [--chat TEXT (once in the room)] [--chat-reply TEXT ({name}: who wrote)]
 //   host: [--resume CODE:TOKEN (take that room back)] [--keep (leave the room open at the end, as an app quitting)]
-//         [--kbps N (frames padded to that bitrate)] [--relay] [--tcp]; view: [--tcp] [--no-acks (frames not confirmed)]
+//         [--kbps N (frames padded to that bitrate)] [--relay] [--tcp] [--permanent] [--access PASSWORD (to enter)]
+//   view: [--tcp] [--no-acks (frames not confirmed)] [--access PASSWORD (the room's entry password)]
 //   ss-cli ws-bench --url ws://127.0.0.1:8095 [--count 240]   (round trips through an echo server; SS_NAGLE=1:
 //                                                             with Nagle's algorithm on, as a control)
 //   ss-cli ws-echo --port 8195 [--slow-acks]                   (that echo server, acknowledging late on Windows)
@@ -136,6 +137,7 @@ static int host(int argc, char** argv) {
   if (kbpsMax > 0) engine.setTargetKbps(kbpsMax);
   std::string resume = arg(argc, argv, "--resume");
   size_t colon = resume.find(':');
+  if (flag(argc, argv, "--permanent") || !arg(argc, argv, "--access").empty()) engine.setRoomOptions(flag(argc, argv, "--permanent"), arg(argc, argv, "--access"));
   engine.host(arg(argc, argv, "--password"), colon == std::string::npos ? "" : resume.substr(0, colon), colon == std::string::npos ? "" : resume.substr(colon + 1));
   double start = nowMs(), next = start;
   size_t n = 0;
@@ -210,6 +212,7 @@ static int view(int argc, char** argv) {
   enginePtr = &engine;
   chat.engine = &engine;
   engine.setName(arg(argc, argv, "--name"));
+  if (!arg(argc, argv, "--access").empty()) engine.setAccess(arg(argc, argv, "--access"));
   engine.join(arg(argc, argv, "--code"));
   double start = nowMs();
   while (nowMs() - start < seconds * 1000) std::this_thread::sleep_for(std::chrono::milliseconds(50));

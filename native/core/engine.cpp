@@ -186,6 +186,8 @@ struct Engine::Impl {
   int seq = 0;
   std::unique_ptr<DirectEndpoint> ep;
   double kbps = 0, targetKbps = 0, sentKbps = 0;
+  bool roomOptions = false, permanent = false; // (set: sent with "host")
+  std::string access;                          // the room's entry password (sharer: to set; viewer: to give)
   Bytes roomKey; // the room's own key (see roomkey): the sharer's – or the viewer's, from the link
   bool streaming = false;
   double lastKey = -1e9;
@@ -196,6 +198,7 @@ struct Engine::Impl {
 
   /* ---- viewer */
   std::string viewCode, viewSession;
+  bool everJoined = false; // (a "notfound" after it: the server started again)
   bool viewClosed = false, joinPending = false;
   int joinTimer = 0, retryJoin = 0;
   struct View {
@@ -436,6 +439,7 @@ struct Engine::Impl {
     m.set("t", "host").set("password", password);
     if (!myName.empty()) m.set("name", myName);
     if (!code.empty() && !token.empty()) m.set("resume", Json::object().set("code", code).set("token", token));
+    if (roomOptions) m.set("permanent", permanent).set("access", access);
     send(m);
   }
 
@@ -482,6 +486,7 @@ struct Engine::Impl {
     Json e = Json::object();
     std::string key = roomkey::base32(roomKey);
     e.set("type", "hosted").set("code", code).set("link", site + "#" + code + "." + key).set("changed", changed).set("token", token + "." + key);
+    e.set("permanent", res["permanent"].b(false)).set("access", res["access"].b(false));
     emit(e);
     status("Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.", "ok");
     send(Json::object().set("t", "state").set("live", live));
@@ -793,6 +798,7 @@ struct Engine::Impl {
       clearHost();
     }
     mode = "viewer";
+    everJoined = false;
     // "code.key" from the link: the code goes to the server, the key never
     viewCode = c.substr(0, c.find('.'));
     roomKey = roomkey::fromRoom(c);
@@ -811,6 +817,7 @@ struct Engine::Impl {
     caps.set("direct", true);
     Json m = Json::object();
     m.set("t", "join").set("code", viewCode).set("caps", caps);
+    if (!access.empty()) m.set("access", access);
     if (!myName.empty()) m.set("name", myName);
     send(m);
   }
@@ -818,6 +825,7 @@ struct Engine::Impl {
   void onViewerMessage(const std::string& t, const Json& msg) {
     if (t == "joined") {
       joinPending = false;
+      everJoined = true;
       iceServers = msg["iceServers"];
       viewLive = msg["live"].b(false);
       Json e = Json::object();
@@ -834,9 +842,18 @@ struct Engine::Impl {
       Json je = Json::object();
       je.set("type", "join-error").set("code", c); // (an app going back into a room it had: notfound – gone)
       emit(je);
-      std::string text = c == "notfound" ? "Nincs ilyen szoba (lejárt vagy elírtad a kódot)." : c == "full" ? "A szoba megtelt." : c == "rate" ? "Túl sok próbálkozás, várj egy kicsit." : "Nem sikerült csatlakozni.";
-      viewState(text + " Újrapróbálom…");
-      retryJoin = loop.setTimer(c == "rate" ? 30000 : 5000, [this] { if (mode == "viewer" && wsOpen) sendJoin(); });
+      if (c == "access") { // (the app asks for it: setAccess joins again)
+        viewState(access.empty() ? "Ebbe a szobába jelszóval lehet belépni." : "Hibás jelszó.");
+        return;
+      }
+      // a room that was there and is not now: its server started again – the sharer brings it back
+      std::string text = c == "notfound" && everJoined ? "A szoba épp újraindul (a szerver újraindult) – várakozás a megosztóra…"
+                         : c == "notfound"              ? "Nincs ilyen szoba (lejárt vagy elírtad a kódot)."
+                         : c == "full"                  ? "A szoba megtelt."
+                         : c == "rate"                  ? "Túl sok próbálkozás, várj egy kicsit."
+                                                        : "Nem sikerült csatlakozni.";
+      viewState(text + (c == "notfound" && everJoined ? "" : " Újrapróbálom…"));
+      retryJoin = loop.setTimer(c == "rate" ? 30000 : c == "notfound" && everJoined ? 3000 : 5000, [this] { if (mode == "viewer" && wsOpen) sendJoin(); });
     } else if (t == "signal" && msg["from"].str() == "host") {
       onHostSignal(msg["data"]);
     } else if (t == "direct") {
@@ -1055,14 +1072,36 @@ void Engine::setLive(bool live) {
   });
 }
 
-void Engine::stopHosting() {
+void Engine::stopHosting(bool forget) {
   Impl* impl = impl_.get();
-  impl->loop.post([impl] {
+  impl->loop.post([impl, forget] {
     if (impl->mode != "host") return;
-    impl->send(Json::object().set("t", "close"));
+    impl->send(Json::object().set("t", "close").set("forget", forget));
     impl->clearHost();
     impl->mode.clear();
     impl->closeSignal();
+  });
+}
+
+void Engine::setRoomOptions(bool permanent, const std::string& access) {
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, permanent, access] {
+    impl->roomOptions = true;
+    impl->permanent = permanent;
+    impl->access = access;
+    // while sharing: the server gets them now (the room keeps its code)
+    if (impl->mode == "host" && !impl->hostPending && impl->wsOpen && !impl->code.empty()) impl->sendHost();
+  });
+}
+
+void Engine::setAccess(const std::string& access) {
+  Impl* impl = impl_.get();
+  impl->loop.post([impl, access] {
+    impl->access = access;
+    if (impl->mode == "viewer" && impl->wsOpen && !impl->joinPending) {
+      impl->loop.cancel(impl->retryJoin);
+      impl->sendJoin();
+    }
   });
 }
 

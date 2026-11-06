@@ -2,6 +2,9 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import WebSocket from 'ws';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createApp, turnCredentials } from '../server/server.js';
 
 let app;
@@ -16,8 +19,8 @@ before(async () => {
 after(() => app.close());
 
 /** Opens a signaling socket and collects messages. */
-async function client(headers = {}) {
-  const ws = new WebSocket(`ws://${base}/ws`, { headers: { Origin: `http://${base}`, ...headers } });
+async function client(headers = {}, at = base) {
+  const ws = new WebSocket(`ws://${at}/ws`, { headers: { Origin: `http://${at}`, ...headers } });
   const inbox = [];
   const waiters = [];
   ws.on('message', (raw) => {
@@ -459,4 +462,85 @@ chatTest('chat: those who come later get the last 50 messages; the sharer too, c
   for (const v of r.viewers) v.close();
   h2.send({ t: 'close' });
   h2.close();
+});
+
+/* ---- rooms that last: across a restart, permanent ones with an entry password */
+
+async function startServer(dataDir) {
+  const a = createApp({ port: 0, hostPassword: 'titok123', turnSecret: 's3cret', turnHost: 'example.test', turnPort: 3478, trustProxy: false, dataDir });
+  await new Promise((r) => a.server.listen(0, '127.0.0.1', r));
+  return { app: a, at: `127.0.0.1:${a.server.address().port}` };
+}
+
+test('a room keeps its code when the server starts again: the sharer takes it back with its token', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-rooms-'));
+  let s = await startServer(dir);
+  const h = await client({}, s.at);
+  h.send({ t: 'host', password: 'titok123' });
+  const hosted = await h.next(is('hosted'));
+  assert.equal(hosted.permanent, false);
+  h.close();
+  await s.app.close();
+
+  s = await startServer(dir); // (a new server: no rooms in it)
+  const v = await client({}, s.at);
+  v.send({ t: 'join', code: hosted.code });
+  assert.deepEqual(await v.next(is('error')), { t: 'error', code: 'notfound' }, 'until its sharer comes back');
+  const h2 = await client({}, s.at);
+  h2.send({ t: 'host', resume: { code: hosted.code, token: 'wrong' } });
+  assert.deepEqual(await h2.next(is('error')), { t: 'error', code: 'auth' }, 'not with another token');
+  h2.send({ t: 'host', resume: { code: hosted.code, token: hosted.token } });
+  const back = await h2.next(is('hosted'));
+  assert.equal(back.code, hosted.code);
+  v.send({ t: 'join', code: hosted.code });
+  await v.next(is('joined'));
+  h2.close();
+  v.close();
+  await s.app.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a permanent room with an entry password: kept on disk, there after a restart, its password asked', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ss-rooms-'));
+  let s = await startServer(dir);
+  const h = await client({}, s.at);
+  h.send({ t: 'host', password: 'titok123', permanent: true, access: 'mozi-este' });
+  const hosted = await h.next(is('hosted'));
+  assert.equal(hosted.permanent, true);
+  assert.equal(hosted.access, true);
+  assert.ok(!fs.readFileSync(path.join(dir, 'rooms.json'), 'utf8').includes('mozi-este'), 'only its hash is kept');
+  const v = await client({}, s.at);
+  v.send({ t: 'join', code: hosted.code });
+  assert.deepEqual(await v.next(is('error')), { t: 'error', code: 'access' });
+  v.send({ t: 'join', code: hosted.code, access: 'rossz' });
+  assert.deepEqual(await v.next(is('error')), { t: 'error', code: 'access' });
+  v.send({ t: 'join', code: hosted.code, access: 'mozi-este' });
+  await v.next(is('joined'));
+  h.send({ t: 'close' }); // (the sharer stops: the room stays, its sharer is away)
+  await v.next(is('host-away'));
+  v.close();
+  h.close();
+  await s.app.close();
+
+  s = await startServer(dir); // the server starts again: the room is there before its sharer is
+  const v2 = await client({}, s.at);
+  v2.send({ t: 'join', code: hosted.code, access: 'mozi-este' });
+  const joined = await v2.next(is('joined'));
+  assert.equal(joined.hostPresent, false);
+  const h2 = await client({}, s.at);
+  h2.send({ t: 'host', resume: { code: hosted.code, token: hosted.token }, permanent: true, access: 'mozi-este' });
+  assert.equal((await h2.next(is('hosted'))).code, hosted.code);
+  await v2.next(is('host-back'));
+  h2.send({ t: 'close', forget: true }); // given up: gone, also after a restart
+  await v2.next(is('closed'));
+  v2.close();
+  h2.close();
+  await s.app.close();
+  s = await startServer(dir);
+  const v3 = await client({}, s.at);
+  v3.send({ t: 'join', code: hosted.code, access: 'mozi-este' });
+  assert.deepEqual(await v3.next(is('error')), { t: 'error', code: 'notfound' });
+  v3.close();
+  await s.app.close();
+  fs.rmSync(dir, { recursive: true, force: true });
 });
