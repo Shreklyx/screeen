@@ -52,6 +52,7 @@ const WHY_TEXT = {
   timeout: 'a kapcsolat nem jött létre időben',
   unavailable: 'az átvitel nem indult el',
   failed: 'a kapcsolat megszakadt',
+  insecure: 'a kapcsolat nem igazolta a szoba kulcsát – valaki közbeállhatott',
 };
 
 /* ---------------------------- helpers ---------------------------- */
@@ -79,8 +80,12 @@ function parseCode(input) {
   let s = String(input || '').trim();
   const hash = s.indexOf('#');
   if (hash >= 0) s = s.slice(hash + 1);
+  const dot = s.indexOf('.');
+  if (dot >= 0) s = s.slice(0, dot); // (what follows is the room's key)
   return s.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
+
+const { base32, unbase32, parseRoomKey, e2eProof, e2eProofOk } = window.RoomKey; // (room-key.js)
 
 const randomId = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
 
@@ -238,6 +243,7 @@ const host = {
   password: '',
   code: null,
   token: null,
+  key: null, // the room's own key (see base32 above): in the link, never sent to the server
   iceServers: [],
   serverDirect: false,
   video: null,
@@ -364,6 +370,8 @@ async function openRoom(password) {
   // code and link again – after a reload, a closed tab, the browser started again
   const saved = store.get('ss-host-room', null);
   const resume = saved && Date.now() - (saved.at || 0) < ROOM_KEEP_MS ? { code: saved.code, token: saved.token } : null;
+  host.key = (resume && unbase32(saved.key || '')) || null;
+  if (host.key?.length !== 16) host.key = crypto.getRandomValues(new Uint8Array(16));
   const res = await signal.request({ t: 'host', password, resume: resume || undefined, name: chatName() }, ['hosted']);
   applyHosted(res);
   return Boolean(resume && res.code === resume.code);
@@ -385,7 +393,7 @@ const ROOM_KEEP_MS = 10 * 60 * 1000; // as long as the server waits for a sharer
 
 /** The room, for coming back to it: kept on this computer while sharing (the time says how fresh). */
 function keepRoom() {
-  if (host.code && host.token) store.set('ss-host-room', { code: host.code, token: host.token, at: Date.now() });
+  if (host.code && host.token) store.set('ss-host-room', { code: host.code, token: host.token, key: base32(host.key), at: Date.now() });
 }
 
 function applyHosted(res) {
@@ -395,7 +403,7 @@ function applyHosted(res) {
   host.serverDirect = res.direct === true;
   keepRoom();
   $('#roomCode').textContent = res.code;
-  $('#roomLink').value = `${SITE_URL}#${res.code}`;
+  $('#roomLink').value = `${SITE_URL}#${res.code}.${base32(host.key)}`;
   $('#btnCopy').disabled = false;
   setSignalStatus(host.serverDirect ? 'Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.' : `A nézők nem kapnak képet: ${WHY_TEXT.server}`, host.serverDirect ? 'ok' : 'warn');
   host.signal.send({ t: 'state', live: isLive() });
@@ -526,7 +534,7 @@ function dropViewer(id) {
   renderViewers();
 }
 
-function onViewerSignal(id, data) {
+async function onViewerSignal(id, data) {
   const v = host.viewers.get(id);
   if (!v || !data || typeof data !== 'object') return;
   if (data.type === 'recall') {
@@ -535,7 +543,21 @@ function onViewerSignal(id, data) {
   }
   if (data.session !== v.session) return;
   if (data.type === 'direct-answer' && v.direct?.state === 'connecting') {
-    DIRECT.connect(v.id, { pub: data.pub, cands: data.cands, tcp: data.tcp === true });
+    // a viewer with the link proves it holds the room's key – then the key is in the keys too; a wrong proof
+    // is someone in between. (Without one: a viewer that typed only the code – unchecked.)
+    const d = v.direct;
+    let psk;
+    if (typeof data.proof === 'string') {
+      const ok = await e2eProofOk(host.key, 'viewer', v.session, data.pub, data.proof);
+      if (v.direct !== d || d.state !== 'connecting') return;
+      if (!ok) {
+        directFailed(v, 'insecure');
+        return;
+      }
+      psk = host.key;
+    }
+    d.verified = Boolean(psk);
+    DIRECT.connect(v.id, { pub: data.pub, cands: data.cands, tcp: data.tcp === true, psk });
   } else if (data.type === 'direct-fail') {
     directFailed(v, typeof data.why === 'string' && WHY_TEXT[data.why] ? data.why : 'failed');
   } else if (data.type === 'stats') {
@@ -950,7 +972,9 @@ async function onDirectSession(msg) {
     return;
   }
   d.state = 'connecting';
-  host.signal.send({ t: 'signal', to: v.id, data: { type: 'direct-offer', session: v.session, udp: msg.session, pub: res.pub, cands: res.cands, tcp: res.tcp === true, codec: DIRECT_CODEC } });
+  const proof = await e2eProof(host.key, 'host', v.session, res.pub); // (it holds the room's key)
+  if (v.direct !== d) return;
+  host.signal.send({ t: 'signal', to: v.id, data: { type: 'direct-offer', session: v.session, udp: msg.session, pub: res.pub, cands: res.cands, tcp: res.tcp === true, codec: DIRECT_CODEC, proof } });
 }
 
 function onHostDirectEvent(name, id, info) {
@@ -1416,6 +1440,7 @@ const viewer = {
   idleTimer: null,
   hostStats: null, // the sender's encoder info (hardware, encode time)
   direct: null, // the connection to the sharer, see "DIRECT MODE: the viewer"
+  key: null, // the room's key from the link (see base32): the sharer has to prove it holds it
   tick: 0,
   unread: 0, // chat messages that came while the panel was closed
 };
@@ -1436,11 +1461,13 @@ function surroundSpeakers() {
   }
 }
 
-async function startViewing(code) {
+async function startViewing(code, key = null) {
   showView('view-viewer');
   $('#viewerRoom').textContent = code;
-  if (location.hash.slice(1) !== code) history.replaceState(null, '', `#${code}`);
+  const room = key ? `${code}.${base32(key)}` : code; // (the key stays in the address: a reload keeps it)
+  if (location.hash.slice(1) !== room) history.replaceState(null, '', `#${room}`);
   viewer.code = code;
+  viewer.key = key;
   setOverlay('Csatlakozás a szobához…');
   await directReady;
   if (!canDirect.ok) {
@@ -1746,9 +1773,26 @@ async function onDirectOffer(data) {
     return;
   }
   if (typeof data.codec === 'string') d.codec = data.codec;
+  // the link's key: the sharer has to prove it holds it, else it is not the sharer (someone in between – the
+  // server or whoever took its place); then it is in the keys, and this side proves it too
+  let psk;
+  let proof;
+  if (viewer.key) {
+    const ok = await e2eProofOk(viewer.key, 'host', data.session, data.pub, data.proof);
+    if (viewer.direct !== d) return;
+    if (!ok) {
+      closeDirectView();
+      sendToHost({ type: 'direct-fail', why: 'insecure' });
+      setOverlay('A kapcsolat nem igazolta a szoba kulcsát – valaki közbeállhatott, ezért nem nézem. (Régi a megosztó appja? Frissítse.)', { spinner: false, actions: [{ label: 'Vissza a főoldalra', onClick: goHome }] });
+      return;
+    }
+    psk = viewer.key;
+    proof = await e2eProof(psk, 'viewer', data.session, res.pub);
+    if (viewer.direct !== d) return;
+  }
   d.state = 'connecting';
-  DIRECT.connect('host', { pub: data.pub, cands: data.cands, tcp: data.tcp === true });
-  sendToHost({ type: 'direct-answer', pub: res.pub, cands: res.cands, tcp: res.tcp === true });
+  DIRECT.connect('host', { pub: data.pub, cands: data.cands, tcp: data.tcp === true, psk });
+  sendToHost({ type: 'direct-answer', pub: res.pub, cands: res.cands, tcp: res.tcp === true, ...(proof ? { proof } : {}) });
   if (!hasPicture()) setOverlay('Kapcsolódás a megosztóhoz…');
 }
 
@@ -2217,13 +2261,13 @@ function init() {
     e.preventDefault();
     const code = parseCode($('#joinCode').value);
     if (code.length < 4) { toast('Érvénytelen szobakód.', 'warn'); return; }
-    startViewing(code);
+    startViewing(code, parseRoomKey($('#joinCode').value));
   });
 
   window.addEventListener('hashchange', () => { if (!host.active) location.reload(); });
 
   const code = parseCode(location.hash);
-  if (code) startViewing(code);
+  if (code) startViewing(code, parseRoomKey(location.hash));
   else showView('view-home');
 }
 

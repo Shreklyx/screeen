@@ -34,12 +34,33 @@ jobs:
             flag=""; [ "$path" = tcp ] && flag="--tcp"
             build/ss-cli host --server http://127.0.0.1:8090 --password ci --h264 native/tests/data/test.h264 --seconds 12 $flag > host.log &
             host=$!
-            for i in $(seq 1 50); do grep -q '^CODE' host.log && break; sleep 0.2; done
-            code=$(grep '^CODE' host.log | awk '{print $2}')
+            for i in $(seq 1 50); do grep -q '^ROOM' host.log && break; sleep 0.2; done
+            # the room as the link has it (code.key: the sharer proves the key, it goes into the keys)
+            code=$(grep '^ROOM' host.log | awk '{print $2}')
             build/ss-cli view --server http://127.0.0.1:8090 --code "$code" --seconds 5 $flag | tee view.log | grep RESULT
             node -e "const r=JSON.parse(require('fs').readFileSync('view.log','utf8').split('\n').find(l=>l.startsWith('RESULT ')).slice(7)); if(!(r.frames>100&&r.firstKey)) {console.error('too few frames', r); process.exit(1)}"
             wait $host # (not the server: that one runs on)
           done
+      # End to end: a viewer with the link takes only a sharer that proves the room's key – one whose key does
+      # not match (someone in between, who does not have it) gets no picture; with only the code it works.
+      - name: "End to end: the room's key is checked"
+        run: |
+          PORT=8097 HOST_PASSWORD=ci DIRECT_PORT=3497 node server/server.js &
+          sleep 2
+          build/ss-cli host --server http://127.0.0.1:8097 --password ci --h264 native/tests/data/test.h264 --seconds 14 > e2e-host.log &
+          for i in $(seq 1 50); do grep -q '^ROOM' e2e-host.log && break; sleep 0.2; done
+          code=$(grep '^CODE' e2e-host.log | awk '{print $2}')
+          build/ss-cli view --server http://127.0.0.1:8097 --code "$code.aaaaaaaaaaaaaaaaaaaaaaaaaa" --seconds 4 > e2e-wrong.log
+          build/ss-cli view --server http://127.0.0.1:8097 --code "$code" --seconds 4 > e2e-code.log
+          node -e '
+            const fs = require("fs");
+            const result = (f) => JSON.parse(fs.readFileSync(f, "utf8").split("\n").find((l) => l.startsWith("RESULT ")).slice(7));
+            const wrong = result("e2e-wrong.log"), code = result("e2e-code.log");
+            if (wrong.frames !== 0) throw new Error("a sharer that did not prove the key was watched: " + JSON.stringify(wrong));
+            if (!fs.readFileSync("e2e-wrong.log", "utf8").includes("kulcs")) throw new Error("the viewer did not say why");
+            if (!(code.frames > 50)) throw new Error("with only the code there was no picture: " + JSON.stringify(code));
+            console.log("e2e ok", wrong.frames, code.frames);
+          '
       # A room kept: its sharer's app goes away without closing it (a crash, an update, a restart) and
       # takes it back with its token – the same code, no password; the viewer in it gets the picture again
       - name: "A room kept: the sharer goes away and comes back"

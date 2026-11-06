@@ -116,6 +116,8 @@ static int host(int argc, char** argv) {
     if (e["type"].str() == "hosted") {
       line("CODE " + e["code"].str());
       line("TOKEN " + e["token"].str());
+      const std::string& link = e["link"].str();
+      line("ROOM " + link.substr(link.find('#') + 1)); // (code.key: what a viewer with the link joins)
     }
     if (!chat.on(e) && e["type"].str() != "viewers") line("EVENT " + e.dump());
   };

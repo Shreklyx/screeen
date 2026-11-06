@@ -10,6 +10,7 @@
 #include "clock.h"
 #include "crypto.h"
 #include "direct.h"
+#include "engine.h"
 #include "json.h"
 #include "net.h"
 
@@ -115,6 +116,22 @@ static void packetTests() {
   Bytes body;
   CHECK(direct_detail::unseal(recv, 1, packet.data(), packet.size(), body) && std::string(body.begin(), body.end()) == "frame", "packet opens with the right key");
   CHECK(!direct_detail::unseal(recv, 2, packet.data(), packet.size(), body) && !direct_detail::unseal(wrong, 1, packet.data(), packet.size(), body), "not with the wrong direction or key");
+  // the room's own key mixed in: the same on both sides, other keys than without it (or with another)
+  Bytes psk(16, 7), other(16, 8);
+  direct_detail::Keys ph, pv, po;
+  CHECK(direct_detail::deriveKeys(h, vp, 42, ph, psk) && direct_detail::deriveKeys(v, hp, 42, pv, psk) && ph.toViewer == pv.toViewer && ph.toHost == pv.toHost, "with the room's key: both sides the same keys");
+  CHECK(direct_detail::deriveKeys(v, hp, 42, po, other) && po.toViewer != ph.toViewer && ph.toViewer != kh.toViewer, "another room key (or none): other keys");
+}
+
+static void roomKeyTests() {
+  // the same values as the website's (test/room-key.test.js) – computed apart, with Python's hmac
+  Bytes key;
+  for (int i = 0; i < 16; i++) key.push_back(uint8_t(i));
+  CHECK(roomkey::base32(key) == "aaaqeayeaudaocajbifqydiob4" && roomkey::unbase32("aaaqeayeaudaocajbifqydiob4") == key, "the key in a link: base32 both ways");
+  CHECK(roomkey::fromRoom("abc123.aaaqeayeaudaocajbifqydiob4") == key && roomkey::fromRoom("abc123").empty() && roomkey::fromRoom("abc123.aaaq").empty() && roomkey::fromRoom("abc123.AAAQEAYEAUDAOCAJBIFQYDIOB4").empty(), "the key from code.key");
+  const char* pub = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU=";
+  CHECK(roomkey::proof(key, "host", "0011223344556677", pub) == "UK0D35ordS81pSx+UUzQHQ==", "the sharer's proof");
+  CHECK(roomkey::proof(key, "viewer", "0011223344556677", pub) == "svWv4TCw/ObLMyKUqLi+xg==", "the viewer's proof");
 }
 
 /** Two endpoints in one loop exchange frames over loopback. `lossy`: the third packet of every frame
@@ -218,6 +235,7 @@ int main() {
   cryptoVectors();
   jsonTests();
   packetTests();
+  roomKeyTests();
   endpointTest(false);
   endpointTest(true);
   std::printf(failures ? "%d FAILED\n" : "ALL PASS\n", failures);

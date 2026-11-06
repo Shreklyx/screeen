@@ -1643,16 +1643,27 @@ void startSharing(const std::string& resumeCode = "", const std::string& resumeT
   g.engine->host(narrow(pw.c_str()), resumeCode, resumeToken);
 }
 
+/** The room in what was typed or pasted: its code – and from a link its own key ("abc123.<26 letters>"),
+ *  which stays with it (the engine sends only the code to the server; the key proves the sharer). */
 std::string parseCode(std::wstring s) {
   size_t hash = s.find(L'#');
   if (hash != std::wstring::npos) s = s.substr(hash + 1);
-  std::string out;
+  std::string code, key;
+  bool inKey = false;
   for (wchar_t c : s) {
-    if (c >= L'A' && c <= L'Z') out += char(c - L'A' + 'a');
-    else if ((c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9')) out += char(c);
+    if (c == L'.' && !inKey) {
+      inKey = true;
+      continue;
+    }
+    wchar_t l = c >= L'A' && c <= L'Z' ? wchar_t(c - L'A' + L'a') : c;
+    if (!inKey && ((l >= L'a' && l <= L'z') || (l >= L'0' && l <= L'9'))) code += char(l);
+    else if (inKey && ((l >= L'a' && l <= L'z') || (l >= L'2' && l <= L'7'))) key += char(l);
   }
-  return out;
+  return key.size() == 26 ? code + "." + key : code;
 }
+
+/** The code alone, as shown (without the key). */
+std::string codeOnly(const std::string& room) { return room.substr(0, room.find('.')); }
 
 void startWatching(const std::string& code) {
   if (code.size() < 4) {
@@ -1682,7 +1693,7 @@ void startWatching(const std::string& code) {
   player->needKeyframe = [engine] { engine->requestKeyframe(); };
   g.picture = false;
   g.overlayText = L"Csatlakozás a szobához…";
-  g.roomCode = toW(code);
+  g.roomCode = toW(codeOnly(code));
   g.viewInfo.clear();
   setTitle(L"Szoba " + g.roomCode);
   resetChat();
@@ -1820,7 +1831,7 @@ void onEngineEvent(const Json& e) {
     rememberRoom(e["code"].str(), false, "");
     g.restoring = false;
   } else if (type == "join-error" && g.restoring && e["code"].str() == "notfound") {
-    std::wstring code = toW(g.savedCode);
+    std::wstring code = toW(codeOnly(g.savedCode));
     stopToHome(L"A szoba (" + code + L"), amit néztél, közben bezárult.");
     setTab(1); // (the note is on the Nézés tab)
   } else if (type == "closed" && g.screen == Screen::Viewing) {

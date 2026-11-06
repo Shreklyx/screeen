@@ -30,6 +30,7 @@
   const QUEUE_MS = 250;
   const KEY_QUEUE_MS = 1000;
   const INFO = new TextEncoder().encode('screenshare-direct-v1');
+  const INFO2 = new TextEncoder().encode('screenshare-direct-v2'); // (the room's own key mixed in)
   const subtle = globalThis.crypto?.subtle;
   const now = () => performance.timeOrigin + performance.now();
 
@@ -255,15 +256,23 @@
     }
 
     /** The other side's answer: the keys, then probes until it answers. */
-    async connectPeer(id, { pub }) {
+    async connectPeer(id, { pub, psk }) {
       const peer = this.peers.get(id);
       if (!peer) return;
       try {
         const shared = await peer.kx.shared(unb64(pub));
-        const hkdf = await subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+        // the room's own key (when both sides proved they hold it) goes into the keys too
+        const withKey = psk?.length === 16;
+        const ikm = withKey ? new Uint8Array(48) : shared;
+        if (withKey) {
+          ikm.set(shared);
+          ikm.set(psk, 32);
+        }
+        const hkdf = await subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+        if (withKey) ikm.fill(0);
         const salt = new Uint8Array(4);
         new DataView(salt.buffer).setUint32(0, peer.session);
-        const okm = new Uint8Array(await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt, info: INFO }, hkdf, 256));
+        const okm = new Uint8Array(await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt, info: withKey ? INFO2 : INFO }, hkdf, 256));
         const aes = (raw) => subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
         const [toViewer, toHost] = await Promise.all([aes(okm.subarray(0, 16)), aes(okm.subarray(16, 32))]);
         if (this.peers.get(id) !== peer) return;

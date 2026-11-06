@@ -106,4 +106,14 @@ class Engine {
   std::unique_ptr<Impl> impl_;
 };
 
+/** The room's own key (in the link after the code, never sent to the server – see engine.cpp). */
+namespace roomkey {
+std::string base32(const Bytes& b);
+Bytes unbase32(const std::string& s);
+/** The key from "code.key" (none: empty). */
+Bytes fromRoom(const std::string& room);
+/** What proves that one side ("host" or "viewer") holds the key: over its public key and the session. */
+std::string proof(const Bytes& key, const char* role, const std::string& session, const std::string& pub);
+}  // namespace roomkey
+
 }  // namespace ss

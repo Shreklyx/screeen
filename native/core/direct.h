@@ -106,7 +106,9 @@ class DirectEndpoint {
   /** Starts a connection; done(true, what the other side needs) – or done(false, {}). */
   void addPeer(const std::string& id, const PeerInfo& info, std::function<void(bool, Offer)> done);
   /** The other side's answer: derive the keys and find a path. */
-  void connectPeer(const std::string& id, const Offer& other);
+  /** The other side's offer: the keys (with the room's own key mixed in when both sides proved they hold
+   *  it – psk, 16 bytes, else empty), then probes until it answers. */
+  void connectPeer(const std::string& id, const Offer& other, const Bytes& psk = Bytes());
   void removePeer(const std::string& id);
   /** Viewer: ask the sharer for a keyframe (the decoder could not go on). */
   void keyframe(const std::string& id);
@@ -204,7 +206,7 @@ struct Keys {
   std::array<uint8_t, 16> toViewer{};
   std::array<uint8_t, 16> toHost{};
 };
-bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out);
+bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk = Bytes());
 Bytes seal(AesGcm& key, uint8_t dir, uint8_t type, uint32_t session, uint64_t counter, const uint8_t* payload, size_t n);
 bool unseal(AesGcm& key, uint8_t dir, const uint8_t* packet, size_t n, Bytes& body);
 Bytes registration(int role, uint32_t session, const Bytes& secret);

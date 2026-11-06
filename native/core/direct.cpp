@@ -25,6 +25,7 @@ const double kTcpQueueMs = 250, kKeyQueueMs = 1000;
 const size_t RING = 1 << 14; // video packets kept for retransmission
 const size_t MAX_CANDS = 8;
 const char* INFO = "screenshare-direct-v1";
+const char* INFO2 = "screenshare-direct-v2"; // (the room's own key mixed in)
 const double NaN = std::nan("");
 
 /** Parity for a frame's packets, a group of g at a time: each the XOR of the group's data (padded to
@@ -95,13 +96,23 @@ int rankOf(const std::string& kind) {
 
 namespace direct_detail {
 
-bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out) {
+// The keys from the key agreement – and, when both ends proved they hold the room's link, its own key
+// too (v2): a key the server never sees, so a server that put its own public key in between would not
+// have the keys even then.
+bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk) {
   if (peerPub.size() != 32) return false;
-  uint8_t shared[32];
-  if (!mine.shared(peerPub.data(), shared)) return false;
+  uint8_t ikm[48];
+  if (!mine.shared(peerPub.data(), ikm)) return false;
+  size_t ikmLen = 32;
+  if (psk.size() == 16) {
+    std::memcpy(ikm + 32, psk.data(), 16);
+    ikmLen = 48;
+  }
+  const char* info = ikmLen == 48 ? INFO2 : INFO;
   uint8_t salt[4];
   putU32(salt, session);
-  Bytes okm = hkdfSha256(salt, 4, shared, 32, reinterpret_cast<const uint8_t*>(INFO), std::strlen(INFO), 32);
+  Bytes okm = hkdfSha256(salt, 4, ikm, ikmLen, reinterpret_cast<const uint8_t*>(info), std::strlen(info), 32);
+  std::memset(ikm, 0, sizeof ikm);
   std::memcpy(out.toViewer.data(), okm.data(), 16);
   std::memcpy(out.toHost.data(), okm.data() + 16, 16);
   return true;
@@ -756,12 +767,12 @@ void DirectEndpoint::addPeer(const std::string& id, const PeerInfo& info, std::f
   else step();
 }
 
-void DirectEndpoint::connectPeer(const std::string& id, const Offer& other) {
+void DirectEndpoint::connectPeer(const std::string& id, const Offer& other, const Bytes& psk) {
   auto it = peers_.find(id);
   if (it == peers_.end()) return;
   Peer& p = *it->second;
   Keys keys;
-  if (!deriveKeys(p.kp, base64Decode(other.pub), p.session, keys)) {
+  if (!deriveKeys(p.kp, base64Decode(other.pub), p.session, keys, psk)) {
     setState(p, "failed");
     return;
   }

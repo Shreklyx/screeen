@@ -1715,15 +1715,28 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   _engine->host(U(pw), resumeCode, resumeToken);
 }
 
+/** The room in what was typed or pasted: its code – and from a link its own key ("abc123.<26 letters>"),
+ *  which stays with it (the engine sends only the code to the server; the key proves the sharer). */
 static std::string parseCode(NSString* text) {
   std::string s = U(text);
   size_t hash = s.find('#');
   if (hash != std::string::npos) s = s.substr(hash + 1);
-  std::string out;
-  for (char c : s)
-    if (isalnum(static_cast<unsigned char>(c))) out += char(tolower(c));
-  return out;
+  std::string code, key;
+  bool inKey = false;
+  for (char ch : s) {
+    if (ch == '.' && !inKey) {
+      inKey = true;
+      continue;
+    }
+    char c = char(tolower(static_cast<unsigned char>(ch)));
+    if (!inKey && isalnum(static_cast<unsigned char>(c))) code += c;
+    else if (inKey && ((c >= 'a' && c <= 'z') || (c >= '2' && c <= '7'))) key += c;
+  }
+  return key.size() == 26 ? code + "." + key : code;
 }
+
+/** The code alone, as shown (without the key). */
+static std::string codeOnly(const std::string& room) { return room.substr(0, room.find('.')); }
 
 - (void)join {
   [self watch:parseCode(_code.stringValue)];
@@ -1759,7 +1772,7 @@ static std::string parseCode(NSString* text) {
   _overlayText.stringValue = @"Csatlakozás a szobához…";
   _overlay.alphaValue = 1;
   [_overlaySpinner startAnimation:nil];
-  _viewTitle.stringValue = S("Szoba: " + code);
+  _viewTitle.stringValue = S("Szoba: " + codeOnly(code));
   _window.title = S("Szoba " + code); // (the Window menu, Mission Control: which room this window shows)
   _viewInfo.stringValue = @"";
   setDotColor(_viewDot, NSColor.systemOrangeColor);
@@ -1990,7 +2003,7 @@ static std::string parseCode(NSString* text) {
     [self rememberRoom:e["code"].str() host:false token:""];
     _restoring = false;
   } else if (type == "join-error" && _restoring && e["code"].str() == "notfound") {
-    std::string code = _savedCode;
+    std::string code = codeOnly(_savedCode);
     [self stopToHome];
     _tabs.selectedSegment = 1; // (the note is on the Nézés tab)
     [self applyTab];

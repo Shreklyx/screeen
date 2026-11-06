@@ -409,7 +409,9 @@ export function createApp(config = loadConfig()) {
     join(conn, msg) {
       if (joinLimiter.limited(conn.ip)) return send(conn, { t: 'error', code: 'rate' });
       joinLimiter.hit(conn.ip);
-      const code = String(msg.code || '').toLowerCase();
+      // (an older app sends a new link's code and key run together: the code is its first 6 letters – the
+      // key itself is not looked at, nor kept)
+      const code = String(msg.code || '').toLowerCase().slice(0, 6);
       const room = CODE_RE.test(code) ? rooms.get(code) : null;
       if (!room) return send(conn, { t: 'error', code: 'notfound' });
       if (room.viewers.size >= LIMITS.viewersPerRoom) return send(conn, { t: 'error', code: 'full' });

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <chrono>
 #include <regex>
@@ -26,7 +27,85 @@ const std::map<std::string, std::string> kWhy = {
     {"timeout", "a közvetlen kapcsolat nem jött létre időben"},
     {"unavailable", "a közvetlen átvitel nem indult el"},
     {"failed", "a közvetlen kapcsolat megszakadt"},
+    {"insecure", "a kapcsolat nem igazolta a szoba kulcsát – valaki közbeállhatott"},
 };
+
+}  // namespace
+
+/* The room's own key – end to end for real. 16 random bytes the sharer makes, in the link after the code
+ * ("#abc123.<26 letters>"): the part of a link after # never goes to a server, and the apps never send it.
+ * Each side proves to the other that it holds it (an HMAC over its own public key and the session) and it
+ * is mixed into the keys: the server that carries the key agreement cannot put its own public key in
+ * between – it does not have the room's key. A viewer that has it accepts only a sharer that proves it. */
+namespace roomkey {
+
+namespace {
+const char* const kB32 = "abcdefghijklmnopqrstuvwxyz234567";
+}  // namespace
+
+std::string base32(const Bytes& b) {
+  std::string out;
+  uint32_t acc = 0;
+  int bits = 0;
+  for (uint8_t x : b) {
+    acc = acc << 8 | x;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += kB32[acc >> bits & 31];
+    }
+    acc &= (1u << bits) - 1;
+  }
+  if (bits) out += kB32[acc << (5 - bits) & 31];
+  return out;
+}
+
+Bytes unbase32(const std::string& s) {
+  Bytes out;
+  uint32_t acc = 0;
+  int bits = 0;
+  for (char c : s) {
+    const char* p = c ? std::strchr(kB32, c) : nullptr;
+    if (!p) return Bytes();
+    acc = acc << 5 | uint32_t(p - kB32);
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(uint8_t(acc >> bits));
+      acc &= (1u << bits) - 1;
+    }
+  }
+  return out;
+}
+
+/** The room's key from "code.key" (none: empty). */
+Bytes fromRoom(const std::string& room) {
+  size_t dot = room.find('.');
+  if (dot == std::string::npos) return Bytes();
+  Bytes key = unbase32(room.substr(dot + 1));
+  return key.size() == 16 ? key : Bytes();
+}
+
+std::string proof(const Bytes& key, const char* role, const std::string& session, const std::string& pub) {
+  std::string msg = std::string("ss-e2e-v2|") + role + "|" + session + "|" + pub;
+  uint8_t mac[32];
+  hmacSha256(key.data(), key.size(), reinterpret_cast<const uint8_t*>(msg.data()), msg.size(), mac);
+  return base64Encode(mac, 16);
+}
+
+}  // namespace roomkey
+
+namespace {
+
+bool e2eProofOk(const Bytes& key, const char* role, const std::string& session, const std::string& pub, const Json& proof) {
+  if (key.size() != 16 || !proof.isString()) return false;
+  std::string want = roomkey::proof(key, role, session, pub);
+  const std::string& got = proof.str();
+  if (got.size() != want.size()) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < want.size(); i++) diff |= uint8_t(want[i] ^ got[i]);
+  return diff == 0;
+}
 
 std::string whyText(const std::string& why) {
   auto it = kWhy.find(why);
@@ -97,6 +176,7 @@ struct Engine::Impl {
     bool unsupported = false;
     Json remote;          // what the viewer measured
     std::string name;     // its chat name
+    bool verified = false; // it proved it holds the room's key (came with the link)
   };
   std::string password, code, token;
   Json iceServers;
@@ -106,6 +186,7 @@ struct Engine::Impl {
   int seq = 0;
   std::unique_ptr<DirectEndpoint> ep;
   double kbps = 0, targetKbps = 0, sentKbps = 0;
+  Bytes roomKey; // the room's own key (see roomkey): the sharer's – or the viewer's, from the link
   bool streaming = false;
   double lastKey = -1e9;
   int keyTimer = 0;
@@ -328,9 +409,17 @@ struct Engine::Impl {
     if (mode == "viewer") stopView();
     mode = "host";
     password = pw;
+    roomKey.clear();
     if (!resumeCode.empty() && !resumeToken.empty()) { // (the server gives it back with the token, no password needed)
       code = resumeCode;
-      token = resumeToken;
+      // the token as the app keeps it: the server's, then the room's own key ("<token>.<key>")
+      size_t dot = resumeToken.find('.');
+      token = resumeToken.substr(0, dot);
+      roomKey = roomkey::fromRoom(resumeToken);
+    }
+    if (roomKey.size() != 16) { // a new room (or one kept by an older version: its old links work on, unchecked)
+      roomKey.resize(16);
+      randomBytes(roomKey.data(), 16);
     }
     hostPending = true;
     ensureEndpoint(DirectEndpoint::Role::Host);
@@ -391,7 +480,8 @@ struct Engine::Impl {
     iceServers = res["iceServers"];
     serverDirect = res["direct"].b(false);
     Json e = Json::object();
-    e.set("type", "hosted").set("code", code).set("link", site + "#" + code).set("changed", changed).set("token", token);
+    std::string key = roomkey::base32(roomKey);
+    e.set("type", "hosted").set("code", code).set("link", site + "#" + code + "." + key).set("changed", changed).set("token", token + "." + key);
     emit(e);
     status("Kapcsolódva. A nézők a linkkel vagy a kóddal csatlakozhatnak.", "ok");
     send(Json::object().set("t", "state").set("live", live));
@@ -507,6 +597,7 @@ struct Engine::Impl {
       vi->second.state = "connecting";
       Json data = offer.toJson();
       data.set("type", "direct-offer").set("session", session).set("udp", double(udp)).set("codec", kCodec);
+      data.set("proof", roomkey::proof(roomKey, "host", session, offer.pub)); // (it holds the room's key)
       send(Json::object().set("t", "signal").set("to", id).set("data", data));
       emitViewers();
     });
@@ -523,7 +614,15 @@ struct Engine::Impl {
     }
     if (data["session"].str() != v.session) return;
     if (type == "direct-answer" && v.direct && v.state == "connecting") {
-      ep->connectPeer(v.id, Offer::fromJson(data));
+      // a viewer with the link proves it holds the room's key – then the key is in the keys too; a wrong
+      // proof is someone in between. (Without one: a viewer that typed only the code – unchecked.)
+      Bytes psk;
+      if (data["proof"].isString()) {
+        if (!e2eProofOk(roomKey, "viewer", v.session, data["pub"].str(), data["proof"])) return directFailed(v, "insecure");
+        psk = roomKey;
+      }
+      v.verified = !psk.empty();
+      ep->connectPeer(v.id, Offer::fromJson(data), psk);
     } else if (type == "direct-fail") {
       std::string why = data["why"].str("failed");
       directFailed(v, kWhy.count(why) ? why : "failed");
@@ -652,6 +751,7 @@ struct Engine::Impl {
       o.set("id", v.id).set("n", v.n).set("name", v.name);
       std::string state = v.unsupported ? "unsupported" : !v.direct ? "retrying" : v.state;
       o.set("state", state).set("path", v.path);
+      if (v.state == "connected") o.set("verified", v.verified); // (came with the link: the room's key checked)
       const Json& r = v.report;
       if (r.isObject() && v.state == "connected") o.set("fps", r["fps"]).set("kbps", r["kbps"]).set("loss", r["loss"]);
       if (!std::isnan(v.rtt)) o.set("rtt", r["rtt"].isNumber() ? r["rtt"] : Json(v.rtt));
@@ -693,7 +793,9 @@ struct Engine::Impl {
       clearHost();
     }
     mode = "viewer";
-    viewCode = c;
+    // "code.key" from the link: the code goes to the server, the key never
+    viewCode = c.substr(0, c.find('.'));
+    roomKey = roomkey::fromRoom(c);
     viewClosed = false;
     ensureEndpoint(DirectEndpoint::Role::Viewer);
     viewState("Csatlakozás a szobához…");
@@ -719,7 +821,8 @@ struct Engine::Impl {
       iceServers = msg["iceServers"];
       viewLive = msg["live"].b(false);
       Json e = Json::object();
-      e.set("type", "joined").set("code", msg["code"].str(viewCode));
+      // (the room as the app keeps it: with its key)
+      e.set("type", "joined").set("code", msg["code"].str(viewCode) + (roomKey.size() == 16 ? "." + roomkey::base32(roomKey) : ""));
       emit(e);
       chatJoined(msg["id"].str(), msg);
       if (!msg["hostPresent"].b(false)) viewState("A megosztó épp nincs bent. Várakozás…");
@@ -825,10 +928,25 @@ struct Engine::Impl {
       sendToHost(fail);
       return;
     }
+    // the link's key: the sharer has to prove it holds it, else it is not the sharer (someone in between –
+    // the server or whoever took its place); then it is in the keys, and this side proves it too
+    Bytes psk;
+    if (roomKey.size() == 16) {
+      if (!e2eProofOk(roomKey, "host", viewSession, data["pub"].str(), data["proof"])) {
+        closeView();
+        Json fail = Json::object();
+        fail.set("type", "direct-fail").set("why", "insecure");
+        sendToHost(fail);
+        viewState("A kapcsolat nem igazolta a szoba kulcsát – valaki közbeállhatott, ezért nem nézem. (Régi a megosztó appja? Frissítse.)");
+        return;
+      }
+      psk = roomKey;
+    }
     view->state = "connecting";
-    ep->connectPeer("host", Offer::fromJson(data));
+    ep->connectPeer("host", Offer::fromJson(data), psk);
     Json answer = view->mine.toJson();
     answer.set("type", "direct-answer");
+    if (!psk.empty()) answer.set("proof", roomkey::proof(roomKey, "viewer", viewSession, view->mine.pub));
     sendToHost(answer);
     if (!view->picture) viewState("Közvetlen kapcsolat…");
   }
