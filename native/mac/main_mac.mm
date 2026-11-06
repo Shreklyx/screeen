@@ -130,14 +130,14 @@ static NSString* runSecurity(NSArray<NSString*>* args, NSString* input, int* sta
 }
 
 /** false (and why in `why`) when it could not be saved. */
-static bool savePassword(NSString* pw, NSString** why = nullptr) {
+static bool savePassword(NSString* pw, NSString** why = nullptr, NSString* account = @"share") {
   NSData* utf8 = [pw dataUsingEncoding:NSUTF8StringEncoding];
   NSMutableString* hex = [NSMutableString stringWithCapacity:utf8.length * 2];
   for (NSUInteger i = 0; i < utf8.length; i++) [hex appendFormat:@"%02x", ((const uint8_t*)utf8.bytes)[i]];
   // on its standard input (`-i`), not on the command line, where other programs could see it. (No -T:
   // the item's access stays the tool's own – setting it on an existing item is what asks.)
-  NSString* cmd = pw.length ? [NSString stringWithFormat:@"add-generic-password -U -s %@ -a share -w %@\n", kKeychainService, hex]
-                            : [NSString stringWithFormat:@"delete-generic-password -s %@ -a share\n", kKeychainService];
+  NSString* cmd = pw.length ? [NSString stringWithFormat:@"add-generic-password -U -s %@ -a %@ -w %@\n", kKeychainService, account, hex]
+                            : [NSString stringWithFormat:@"delete-generic-password -s %@ -a %@\n", kKeychainService, account];
   int status = 0;
   NSString* errors = @"";
   runSecurity(@[ @"-i" ], cmd, &status, &errors);
@@ -147,9 +147,10 @@ static bool savePassword(NSString* pw, NSString** why = nullptr) {
   return ok;
 }
 
-static NSString* loadPassword() {
+/** The sharing password ("share") – or the room's entry password ("room-access"). */
+static NSString* loadPassword(NSString* account = @"share") {
   int status = 0;
-  NSString* hex = [runSecurity(@[ @"find-generic-password", @"-s", kKeychainService, @"-a", @"share", @"-w" ], nil, &status)
+  NSString* hex = [runSecurity(@[ @"find-generic-password", @"-s", kKeychainService, @"-a", account, @"-w" ], nil, &status)
       stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
   if (status != 0 || hex.length % 2) return @"";
   NSMutableData* utf8 = [NSMutableData dataWithLength:hex.length / 2];
@@ -864,6 +865,10 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   NSSecureTextField* _password;
   NSTextField* _code;
   NSSwitch *_remember, *_audio;
+  NSSwitch* _permanent;                         // a permanent room: always the same code
+  NSSecureTextField *_roomAccess, *_joinAccess; // the room's entry password: to set (sharing) / to give (watching)
+  NSString* _savedAccess;                       // (as the keychain has it: saved only when it changes)
+  std::string _watchRoom;                       // the room being watched, as given (code.key)
   NSPopUpButton *_displayPopup, *_qualityPopup;
   NSTextField *_qualityHint, *_shareError, *_joinError;
   NSButton *_shareButton, *_joinButton, *_updateButton;
@@ -1166,17 +1171,28 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   SSGroup* picture = [SSGroup new];
   [picture setRows:@[ formRow(@"Képernyő", nil, _displayPopup), formRow(@"Minőség", nil, _qualityPopup), formRow(@"A gép hangja", @"macOS 13-tól", _audio) ]];
   _qualityHint = label(@"", 11, NSFontWeightRegular, NSColor.secondaryLabelColor, kHomeWidth - 24);
+  // the room: permanent (always the same code) and an entry password for viewers
+  _permanent = makeSwitch([ud boolForKey:@"permanentRoom"]);
+  _roomAccess = [NSSecureTextField new];
+  _roomAccess.placeholderString = @"nem kötelező";
+  _roomAccess.bezelStyle = NSTextFieldRoundedBezel;
+  _savedAccess = loadPassword(@"room-access");
+  _roomAccess.stringValue = _savedAccess;
+  sizeTo(_roomAccess, 210, 0);
+  SSGroup* roomOptions = [SSGroup new];
+  [roomOptions setRows:@[ formRow(@"Állandó szoba", @"mindig ugyanaz a kód – a szerver újraindulása után is", _permanent), formRow(@"Belépési jelszó", nil, _roomAccess) ]];
   _shareButton = button(@"Megosztás indítása", nil, self, @selector(share));
   _shareButton.controlSize = NSControlSizeLarge;
   [_shareButton.widthAnchor constraintGreaterThanOrEqualToConstant:230].active = YES;
   _shareError = label(@"", 12, NSFontWeightRegular, NSColor.systemRedColor, kHomeWidth);
   _shareError.alignment = NSTextAlignmentCenter;
   _shareError.hidden = YES;
-  _sharePane = vstack(@[ access, picture, _qualityHint, _shareButton, _shareError ], 14);
+  _sharePane = vstack(@[ access, picture, _qualityHint, roomOptions, _shareButton, _shareError ], 14);
   [_sharePane setCustomSpacing:6 afterView:picture];
-  [_sharePane setCustomSpacing:22 afterView:_qualityHint];
+  [_sharePane setCustomSpacing:22 afterView:roomOptions];
   stretch(access, _sharePane);
   stretch(picture, _sharePane);
+  stretch(roomOptions, _sharePane);
   stretch(_qualityHint, _sharePane, 12);
 
   // watching
@@ -1185,8 +1201,13 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   _code.bezelStyle = NSTextFieldRoundedBezel;
   _code.delegate = self;
   sizeTo(_code, 220, 0);
+  _joinAccess = [NSSecureTextField new];
+  _joinAccess.placeholderString = @"ha a szobának van";
+  _joinAccess.bezelStyle = NSTextFieldRoundedBezel;
+  _joinAccess.delegate = self;
+  sizeTo(_joinAccess, 220, 0);
   SSGroup* room = [SSGroup new];
-  [room setRows:@[ formRow(@"Szobakód vagy link", nil, _code) ]];
+  [room setRows:@[ formRow(@"Szobakód vagy link", nil, _code), formRow(@"Jelszó", nil, _joinAccess) ]];
   NSTextField* hint = label(@"A megosztótól kapott 6 jelű kód, vagy a teljes link (pl. mozizas.hu/#abc123).", 11, NSFontWeightRegular,
                             NSColor.secondaryLabelColor, kHomeWidth - 24);
   _joinButton = button(@"Csatlakozás", nil, self, @selector(join));
@@ -1263,7 +1284,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
 }
 
 - (void)controlTextDidChange:(NSNotification*)n {
-  if (n.object == _code && !_joinError.hidden) [self setError:_joinError text:@""];
+  if ((n.object == _code || n.object == _joinAccess) && !_joinError.hidden) [self setError:_joinError text:@""];
 }
 
 /* ---- sharing */
@@ -1670,6 +1691,21 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   [ud setInteger:quality forKey:@"quality2"];
   [ud setBool:_audio.state == NSControlStateValueOn forKey:@"audio"];
   [ud setBool:_remember.state == NSControlStateValueOn forKey:@"rememberPassword"];
+  bool permanent = _permanent.state == NSControlStateValueOn;
+  [ud setBool:permanent forKey:@"permanentRoom"];
+  NSString* access = _roomAccess.stringValue ?: @"";
+  if (![access isEqualToString:_savedAccess ?: @""]) {
+    savePassword(access, nullptr, @"room-access");
+    _savedAccess = access;
+  }
+  // the permanent room this Mac made: taken back (unticked: once more, and it becomes a normal room)
+  std::string resumeAt = resumeCode, resumeWith = resumeToken;
+  NSDictionary* kept = [ud dictionaryForKey:@"permanentRoomCode"];
+  if (resumeAt.empty() && [kept[@"code"] isKindOfClass:NSString.class] && [kept[@"token"] isKindOfClass:NSString.class]) {
+    resumeAt = U(kept[@"code"]);
+    resumeWith = U(kept[@"token"]);
+  }
+  if (!permanent) [ud removeObjectForKey:@"permanentRoomCode"];
   // into the keychain once the server took it (a mistyped one is not remembered), only when it changes
   // (going back into a room: the token let us in, the password field says nothing)
   _passwordToSave = resume ? nil : _remember.state == NSControlStateValueOn ? pw : @"";
@@ -1712,7 +1748,8 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   _window.title = @"Megosztás";
   [self show:_host];
   [self startChat];
-  _engine->host(U(pw), resumeCode, resumeToken);
+  _engine->setRoomOptions(permanent, U(access));
+  _engine->host(U(pw), resumeAt, resumeWith);
 }
 
 /** The room in what was typed or pasted: its code – and from a link its own key ("abc123.<26 letters>"),
@@ -1773,11 +1810,13 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
   _overlay.alphaValue = 1;
   [_overlaySpinner startAnimation:nil];
   _viewTitle.stringValue = S("Szoba: " + codeOnly(code));
-  _window.title = S("Szoba " + code); // (the Window menu, Mission Control: which room this window shows)
+  _window.title = S("Szoba " + codeOnly(code)); // (the Window menu, Mission Control: which room this window shows)
   _viewInfo.stringValue = @"";
   setDotColor(_viewDot, NSColor.systemOrangeColor);
   [self show:_viewer];
   [self startChat];
+  _watchRoom = code;
+  if (_joinAccess.stringValue.length) engine->setAccess(U(_joinAccess.stringValue));
   engine->join(code);
 }
 
@@ -1979,6 +2018,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
     _window.title = [@"Megosztás · " stringByAppendingString:S(e["code"].str())];
     _copyButton.enabled = YES;
     [self rememberRoom:e["code"].str() host:true token:e["token"].str()];
+    if (e["permanent"].b()) [NSUserDefaults.standardUserDefaults setObject:@{@"code" : S(e["code"].str()), @"token" : S(e["token"].str())} forKey:@"permanentRoomCode"];
     _restoring = false;
     if (e["changed"].b())
       [self ask:@"Új link készült" text:@"A korábbi szoba lejárt, ezért új kód és link készült – küldd el újra a nézőknek." ok:@"Rendben" cancel:nil danger:NO action:nil];
@@ -2002,6 +2042,17 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
   } else if (type == "joined") {
     [self rememberRoom:e["code"].str() host:false token:""];
     _restoring = false;
+  } else if (type == "join-error" && e["code"].str() == "access") {
+    // the room has an entry password: back to the Nézés tab, the room in its field, the password asked
+    std::string room = _watchRoom;
+    bool wrong = _joinAccess.stringValue.length > 0;
+    [self stopToHome];
+    _tabs.selectedSegment = 1;
+    [self applyTab];
+    _code.stringValue = S(room);
+    _joinAccess.stringValue = @"";
+    [self setError:_joinError text:wrong ? @"Hibás jelszó – próbáld újra." : @"Ebbe a szobába jelszóval lehet belépni – írd be a jelszót."];
+    [_window makeFirstResponder:_joinAccess];
   } else if (type == "join-error" && _restoring && e["code"].str() == "notfound") {
     std::string code = codeOnly(_savedCode);
     [self stopToHome];

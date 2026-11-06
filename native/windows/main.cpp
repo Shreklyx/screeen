@@ -103,9 +103,9 @@ enum class Screen { Home, Hosting, Viewing };
 // what can be clicked (and the text boxes)
 enum Id {
   ID_NONE = 0,
-  ID_PASSWORD = 100, ID_CODE, ID_CHAT, ID_NAME,
+  ID_PASSWORD = 100, ID_CODE, ID_CHAT, ID_NAME, ID_ACCESS, ID_JOIN_ACCESS,
   B_SHARE = 200, B_JOIN, B_REMEMBER, B_AUDIO, B_UPDATE, B_ABOUT, B_COPY, B_PAUSE, B_STOP, B_FULL, B_LEAVE, B_VOLUME, B_MUTE,
-  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL, B_TAB0, B_TAB1, B_MONITOR, B_QUALITY, B_NEW, B_CHAT, B_CHAT_SEND, B_CHAT_CLOSE,
+  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL, B_TAB0, B_TAB1, B_MONITOR, B_QUALITY, B_NEW, B_CHAT, B_CHAT_SEND, B_CHAT_CLOSE, B_PERMANENT,
 };
 const UINT kMenuMonitor0 = 1000, kMenuQuality0 = 2000; // the pop-up menus' items
 
@@ -154,6 +154,8 @@ struct App {
   int tab = 0; // home: 0 sharing, 1 watching
 
   HWND pass = nullptr, code = nullptr, video = nullptr;
+  HWND access = nullptr, joinAccess = nullptr; // the room's entry password: to set (sharing) / to give (watching)
+  std::string watchRoom;                       // the room being watched, as given (code.key)
   std::map<int, Rect> fieldRects;   // where the text boxes go (DIPs, in the scrolled content)
   std::map<int, Rect> controlRects; // where the pop-ups are (their menus open under them)
   std::map<int, RECT> placed;       // where the text boxes are (pixels)
@@ -175,6 +177,7 @@ struct App {
   std::vector<Monitor> monitors;
   int monitor = 0, quality = 0;
   bool remember = false, audio = true;
+  bool permanent = false; // a permanent room: always the same code (the server keeps it, also after it starts again)
 
   std::unique_ptr<Engine> engine;
   std::unique_ptr<HostPipeline> host;
@@ -363,6 +366,31 @@ void savePassword(const std::wstring& pw) {
   }
 }
 
+/** A secret in the registry, encrypted for this Windows user (DPAPI): the sharing password, the room's
+ *  entry password. */
+void saveSecret(const wchar_t* name, const std::wstring& pw) {
+  if (pw.empty()) {
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kKey, name);
+    return;
+  }
+  DATA_BLOB in{DWORD(pw.size() * sizeof(wchar_t)), reinterpret_cast<BYTE*>(const_cast<wchar_t*>(pw.data()))}, out{};
+  if (CryptProtectData(&in, L"Screen Share", nullptr, nullptr, nullptr, 0, &out)) {
+    RegSetKeyValueW(HKEY_CURRENT_USER, kKey, name, REG_BINARY, out.pbData, out.cbData);
+    LocalFree(out.pbData);
+  }
+}
+
+std::wstring loadSecret(const wchar_t* name) {
+  BYTE buf[4096];
+  DWORD size = sizeof buf;
+  if (RegGetValueW(HKEY_CURRENT_USER, kKey, name, RRF_RT_REG_BINARY, nullptr, buf, &size) != ERROR_SUCCESS) return L"";
+  DATA_BLOB in{size, buf}, out{};
+  if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out)) return L"";
+  std::wstring pw(reinterpret_cast<wchar_t*>(out.pbData), out.cbData / sizeof(wchar_t));
+  LocalFree(out.pbData);
+  return pw;
+}
+
 std::wstring loadPassword() {
   BYTE buf[4096];
   DWORD size = sizeof buf;
@@ -496,6 +524,8 @@ HWND editFor(int id) {
   switch (id) {
     case ID_PASSWORD: return g.pass;
     case ID_CODE: return g.code;
+    case ID_ACCESS: return g.access;
+    case ID_JOIN_ACCESS: return g.joinAccess;
     case ID_CHAT: return g.chatEdit;
     case ID_NAME: return g.nameEdit;
     default: return nullptr;
@@ -515,7 +545,7 @@ void field(int id, const Rect& r) {
   HWND h = editFor(id);
   if (g.transitioning && h) {
     std::wstring t = getText(h);
-    if (id == ID_PASSWORD) t = std::wstring(t.size(), L'\x25CF');
+    if (id == ID_PASSWORD || id == ID_ACCESS || id == ID_JOIN_ACCESS) t = std::wstring(t.size(), L'\x25CF');
     c.text(t, {r.x + 8, r.y, r.w - 16, r.h}, 13, Regular, cText);
   }
 }
@@ -623,7 +653,14 @@ float sharePane(float x0, float y, float cw) {
   popup(B_QUALITY, {x0 + cw - 12 - qw, y + 49, qw, 22}, kQualities[g.quality].name);
   rowTitle({x0, y + 80, cw, 46}, L"A gép hangja", L"5.1 / 7.1 térhang is");
   toggleSwitch(B_AUDIO, {x0, y + 80, cw, 46}, g.audio);
-  y += 126 + 6;
+  y += 126 + 14;
+  // the room: permanent (always the same code) and an entry password for viewers
+  group({x0, y, cw, 86}, {y + 46});
+  rowTitle({x0, y, cw, 46}, L"Állandó szoba", L"mindig ugyanaz a kód – a szerver újraindulása után is");
+  toggleSwitch(B_PERMANENT, {x0, y, cw, 46}, g.permanent);
+  rowTitle({x0, y + 46, cw, 40}, L"Belépési jelszó");
+  field(ID_ACCESS, {x0 + cw - 12 - 210, y + 54, 210, 24});
+  y += 86 + 6;
   y += note(kQualities[g.quality].hint, x0 + 12, y, cw - 24, 11, cMuted) + 22;
   button(B_SHARE, {std::floor(x0 + cw / 2 - 115), y, 230, 28}, L"Megosztás indítása", Style::Primary);
   y += 28;
@@ -631,10 +668,12 @@ float sharePane(float x0, float y, float cw) {
 }
 
 float watchPane(float x0, float y, float cw) {
-  group({x0, y, cw, 40});
+  group({x0, y, cw, 80}, {y + 40});
   rowTitle({x0, y, cw, 40}, L"Szobakód vagy link");
   field(ID_CODE, {x0 + cw - 12 - 220, y + 8, 220, 24});
-  y += 40 + 6;
+  rowTitle({x0, y + 40, cw, 40}, L"Jelszó");
+  field(ID_JOIN_ACCESS, {x0 + cw - 12 - 220, y + 48, 220, 24});
+  y += 80 + 6;
   y += note(L"A megosztótól kapott 6 jelű kód, vagy a teljes link (pl. mozizas.hu/#abc123).", x0 + 12, y, cw - 24, 11, cMuted) + 22;
   button(B_JOIN, {std::floor(x0 + cw / 2 - 115), y, 230, 28}, L"Csatlakozás", Style::Primary);
   y += 28;
@@ -1216,7 +1255,9 @@ void placeChild(int id, HWND h, bool visible) {
 void updateChildren() {
   bool home = g.screen == Screen::Home && !g.transitioning;
   placeChild(ID_PASSWORD, g.pass, home && g.tab == 0);
+  placeChild(ID_ACCESS, g.access, home && g.tab == 0);
   placeChild(ID_CODE, g.code, home && g.tab == 1);
+  placeChild(ID_JOIN_ACCESS, g.joinAccess, home && g.tab == 1);
   bool chat = !g.transitioning && !g.modal.open && (g.screen == Screen::Hosting || (g.screen == Screen::Viewing && g.chatOpen));
   placeChild(ID_CHAT, g.chatEdit, chat);
   placeChild(ID_NAME, g.nameEdit, chat);
@@ -1606,6 +1647,18 @@ void startSharing(const std::string& resumeCode = "", const std::string& resumeT
   saveDword(L"Audio", g.audio);
   saveDword(L"Remember", g.remember);
   savePassword(g.remember ? pw : L"");
+  saveDword(L"Permanent", g.permanent);
+  std::wstring access = getText(g.access);
+  saveSecret(L"RoomAccess", access);
+  // the permanent room this computer made: taken back (unticked: once more, and it becomes a normal room)
+  std::string permanentRoom = narrow(loadString(L"PermanentRoom").c_str());
+  std::string resumeAt = resumeCode, resumeWith = resumeToken;
+  size_t semi = permanentRoom.find(';');
+  if (resumeAt.empty() && semi != std::string::npos) {
+    resumeAt = permanentRoom.substr(0, semi);
+    resumeWith = permanentRoom.substr(semi + 1);
+  }
+  if (!g.permanent) saveString(L"PermanentRoom", L"");
   g.shareErr.clear();
   endSession();
   int session = ++g.session;
@@ -1640,7 +1693,8 @@ void startSharing(const std::string& resumeCode = "", const std::string& resumeT
   resetChat();
   show(Screen::Hosting);
   g.engine->setName(narrow(loadString(L"ChatName").c_str()));
-  g.engine->host(narrow(pw.c_str()), resumeCode, resumeToken);
+  g.engine->setRoomOptions(g.permanent, narrow(access.c_str()));
+  g.engine->host(narrow(pw.c_str()), resumeAt, resumeWith);
 }
 
 /** The room in what was typed or pasted: its code – and from a link its own key ("abc123.<26 letters>"),
@@ -1694,11 +1748,14 @@ void startWatching(const std::string& code) {
   g.picture = false;
   g.overlayText = L"Csatlakozás a szobához…";
   g.roomCode = toW(codeOnly(code));
+  g.watchRoom = code;
   g.viewInfo.clear();
   setTitle(L"Szoba " + g.roomCode);
   resetChat();
   show(Screen::Viewing);
   engine->setName(narrow(loadString(L"ChatName").c_str()));
+  std::wstring access = getText(g.joinAccess);
+  if (!access.empty()) engine->setAccess(narrow(access.c_str()));
   engine->join(code);
 }
 
@@ -1766,6 +1823,7 @@ void onEngineEvent(const Json& e) {
     g.roomLink = e["link"].str();
     setTitle(L"Megosztás · " + g.roomCode);
     rememberRoom(e["code"].str(), true, e["token"].str());
+    if (e["permanent"].b()) saveString(L"PermanentRoom", toW(e["code"].str() + ";" + e["token"].str()));
     g.restoring = false;
     if (e["changed"].b()) ask(L"Új link készült", L"A korábbi szoba lejárt, ezért új kód és link készült – küldd el újra a nézőknek.", L"Rendben", L"", false, nullptr);
   } else if (type == "host-error") {
@@ -1830,6 +1888,15 @@ void onEngineEvent(const Json& e) {
   } else if (type == "joined") {
     rememberRoom(e["code"].str(), false, "");
     g.restoring = false;
+  } else if (type == "join-error" && e["code"].str() == "access") {
+    // the room has an entry password: back to the Nézés tab, the room in its field, the password asked
+    std::wstring room = toW(g.watchRoom);
+    bool wrong = !getText(g.joinAccess).empty();
+    stopToHome(wrong ? L"Hibás jelszó – próbáld újra." : L"Ebbe a szobába jelszóval lehet belépni – írd be a jelszót.");
+    setTab(1);
+    SetWindowTextW(g.code, room.c_str());
+    SetWindowTextW(g.joinAccess, L"");
+    SetFocus(g.joinAccess);
   } else if (type == "join-error" && g.restoring && e["code"].str() == "notfound") {
     std::wstring code = toW(codeOnly(g.savedCode));
     stopToHome(L"A szoba (" + code + L"), amit néztél, közben bezárult.");
@@ -2164,6 +2231,7 @@ void onClick(int id) {
     case B_JOIN: startWatching(parseCode(getText(g.code))); break;
     case B_REMEMBER: g.remember = !g.remember; break;
     case B_AUDIO: g.audio = !g.audio; break;
+    case B_PERMANENT: g.permanent = !g.permanent; break;
     case B_ABOUT: showAbout(); break;
     case B_COPY: copyLink(); break;
     case B_PAUSE:
@@ -2206,8 +2274,8 @@ LRESULT CALLBACK videoProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 /** The text boxes: Enter starts what the box is for; the focus ring follows them. */
 LRESULT CALLBACK editProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR) {
   if (msg == WM_KEYDOWN && wp == VK_RETURN) {
-    if (int(id) == ID_PASSWORD) startSharing();
-    else if (int(id) == ID_CODE) startWatching(parseCode(getText(g.code)));
+    if (int(id) == ID_PASSWORD || int(id) == ID_ACCESS) startSharing();
+    else if (int(id) == ID_CODE || int(id) == ID_JOIN_ACCESS) startWatching(parseCode(getText(g.code)));
     else if (int(id) == ID_CHAT) sendChat();
     else if (int(id) == ID_NAME) SetFocus(g.chatEdit); // (keeps the name: it loses the focus)
     return 0;
@@ -2242,7 +2310,7 @@ void makeEditFont() {
   HFONT old = g.editFont;
   g.editFont = CreateFontW(-px(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
                            L"Segoe UI");
-  for (HWND h : {g.pass, g.code, g.chatEdit, g.nameEdit})
+  for (HWND h : {g.pass, g.code, g.access, g.joinAccess, g.chatEdit, g.nameEdit})
     if (h) SendMessageW(h, WM_SETFONT, WPARAM(g.editFont), TRUE);
   if (old) DeleteObject(old);
   g.placed.clear();
@@ -2254,6 +2322,8 @@ void createControls() {
   std::wstring pw = loadPassword();
   g.pass = makeEdit(ID_PASSWORD, ES_PASSWORD, pw, L"megosztási jelszó");
   g.code = makeEdit(ID_CODE, 0, L"", L"abc123 vagy link");
+  g.access = makeEdit(ID_ACCESS, ES_PASSWORD, loadSecret(L"RoomAccess"), L"nem kötelező");
+  g.joinAccess = makeEdit(ID_JOIN_ACCESS, ES_PASSWORD, L"", L"ha a szobának van");
   g.chatEdit = makeEdit(ID_CHAT, 0, L"", L"Üzenet…");
   SendMessageW(g.chatEdit, EM_LIMITTEXT, 500, 0);
   g.nameEdit = makeEdit(ID_NAME, 0, loadString(L"ChatName"), L"a neved a chatben");
@@ -2262,6 +2332,7 @@ void createControls() {
   g.video = CreateWindowExW(0, L"SSVideo", L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, g.wnd, nullptr, g.inst, nullptr);
   g.remember = loadDword(L"Remember", 1) != 0; // (on unless turned off, as on the Mac)
   g.audio = loadDword(L"Audio", 1) != 0;
+  g.permanent = loadDword(L"Permanent", 0) != 0;
   DWORD old = std::min<DWORD>(loadDword(L"Quality", 0), DWORD(std::size(kOldQuality) - 1));
   g.quality = int(std::min<DWORD>(loadDword(L"Quality2", DWORD(kOldQuality[old])), DWORD(std::size(kQualities) - 1)));
   g.monitors = listMonitors();
