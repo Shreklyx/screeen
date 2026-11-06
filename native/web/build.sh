@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds public/ss-web.wasm (see ss_web.cpp): BearSSL's X25519 and libopus' decoder for browsers.
+# Builds public/ss-web.wasm (see ss_web.cpp): our lossless sound (FLAC), BearSSL's X25519 and libopus'
+# decoder for browsers.
 #
 #   native/web/build.sh [out.wasm]          SS_WEB_TEST=1: with an Opus encoder too (for the tests)
 #
@@ -37,7 +38,9 @@ for s in $srcs; do
   $cc $flags -c "$s" -o "$tmp/$n.o"
   objs="$objs $tmp/$n.o"
 done
-$cc $flags -std=c++17 -fno-exceptions -fno-rtti -c "$here/ss_web.cpp" -o "$tmp/ss_web.o"
+$cc $flags -I$root/native/common -std=c++17 -fno-exceptions -fno-rtti -c "$here/ss_web.cpp" -o "$tmp/ss_web.o"
+# the lossless sound: the apps' own FLAC code
+$cc $flags -std=c++17 -fno-exceptions -fno-rtti -c "$root/native/common/lossless.cpp" -o "$tmp/lossless.o"
 $cc --target=wasm32-wasi -mexec-model=reactor -nostdlib++ -Wl,--gc-sections -Wl,--strip-all -Wl,-z,stack-size=1048576 \
-  -o "$out" "$tmp/ss_web.o" $objs
+  -o "$out" "$tmp/ss_web.o" "$tmp/lossless.o" $objs
 echo "$out: $(wc -c <"$out") bytes"

@@ -1,4 +1,4 @@
-// The viewers' sound, shared by the native apps: Opus packets are decoded and written into a ring by
+// The viewers' sound, shared by the native apps: lossless (FLAC) or Opus packets are decoded and written into a ring by
 // their timestamps (each channel pair arrives separately) and played with a small buffer that grows
 // only when the network makes it run dry (5–100 ms) and slowly shrinks again; what it holds beyond
 // that is played past, so no delay stays – the same as the browsers' worklet (public/direct-audio.js).
@@ -16,6 +16,9 @@ namespace ss {
 
 class AudioRing {
  public:
+  /** In a packet's sub (pair | channels << 4): the pair's sound is lossless (FLAC, see lossless.h), with
+   *  the frame before it again. */
+  static const int kLossless = 8;
   AudioRing();
   ~AudioRing();
   /** One Opus packet: sub = pair | channels << 4 (as sent), ts in µs – any thread. */

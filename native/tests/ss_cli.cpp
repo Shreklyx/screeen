@@ -6,6 +6,7 @@
 //   the room's chat, both: [--name NAME] [--chat TEXT (once in the room)] [--chat-reply TEXT ({name}: who wrote)]
 //   host: [--resume CODE:TOKEN (take that room back)] [--keep (leave the room open at the end, as an app quitting)]
 //         [--kbps N (frames padded to that bitrate)] [--relay] [--tcp] [--permanent] [--access PASSWORD (to enter)]
+//         [--tone (a 440/660 Hz stereo tone as the sound: lossless, FLAC)]
 //   view: [--tcp] [--no-acks (frames not confirmed)] [--access PASSWORD (the room's entry password)]
 //   ss-cli ws-bench --url ws://127.0.0.1:8095 [--count 240]   (round trips through an echo server; SS_NAGLE=1:
 //                                                             with Nagle's algorithm on, as a control)
@@ -29,6 +30,7 @@
 
 #include "clock.h"
 #include "engine.h"
+#include "flac_sender.h"
 #include "ws_bench.h"
 
 using namespace ss;
@@ -139,6 +141,28 @@ static int host(int argc, char** argv) {
   size_t colon = resume.find(':');
   if (flag(argc, argv, "--permanent") || !arg(argc, argv, "--access").empty()) engine.setRoomOptions(flag(argc, argv, "--permanent"), arg(argc, argv, "--access"));
   engine.host(arg(argc, argv, "--password"), colon == std::string::npos ? "" : resume.substr(0, colon), colon == std::string::npos ? "" : resume.substr(colon + 1));
+  // the sound: a tone, lossless (FLAC, 2.5 ms packets with the one before again – as the apps send)
+  std::atomic<bool> toneOn{flag(argc, argv, "--tone")};
+  std::thread tone;
+  if (toneOn) {
+    tone = std::thread([&] {
+      FlacSender flac(2);
+      double at = nowMs(), ts = at * 1000;
+      long long sample = 0;
+      std::vector<float> pcm(240);
+      while (toneOn) {
+        at += 2.5;
+        double wait = at - nowMs();
+        if (wait > 0) std::this_thread::sleep_for(std::chrono::microseconds(long(wait * 1000)));
+        for (int i = 0; i < 120; i++, sample++) {
+          pcm[size_t(i) * 2] = float(std::round(0.5 * std::sin(sample * 2 * M_PI * 440 / 48000) * 8388608) / 8388608);
+          pcm[size_t(i) * 2 + 1] = float(std::round(0.3 * std::sin(sample * 2 * M_PI * 660 / 48000) * 8388608) / 8388608);
+        }
+        if (streaming) flac.send(pcm.data(), 120, [&](int pair, const uint8_t* d, size_t n) { engine.sendAudio(pair, 2, d, n, ts); });
+        ts += 2500;
+      }
+    });
+  }
   double start = nowMs(), next = start;
   size_t n = 0;
   double lastViewers = 0;
@@ -164,6 +188,8 @@ static int host(int argc, char** argv) {
       engine.setEncoderStats(1.0, 1280, 720, fps);
     }
   }
+  toneOn = false;
+  if (tone.joinable()) tone.join();
   line("SENT " + std::to_string(n) + " keyframe-requests " + std::to_string(keyframes.load()));
   if (flag(argc, argv, "--keep")) engine.keepRoom();
   chat.engine = nullptr;
@@ -174,7 +200,7 @@ static int view(int argc, char** argv) {
   double seconds = std::stod(arg(argc, argv, "--seconds", "10"));
   std::string out = arg(argc, argv, "--out");
   std::mutex mu;
-  uint64_t frames = 0, keys = 0, bytes = 0, audio = 0;
+  uint64_t frames = 0, keys = 0, bytes = 0, audio = 0, lossless = 0, losslessBad = 0;
   bool firstKey = false, sawFrame = false;
   double lastFrameAt = 0, maxGap = 0; // (a picture that stood still: the longest time without a frame)
   std::vector<double> lat;
@@ -192,6 +218,14 @@ static int view(int argc, char** argv) {
     std::lock_guard<std::mutex> l(mu);
     if (m.stream == 1) {
       audio++;
+      // lossless (FLAC): this frame (after its length) decodes, whole, with its checksums
+      if (m.sub & FlacSender::kLosslessPair) {
+        size_t len = n >= 2 ? size_t(d[0] | d[1] << 8) : 0;
+        float pcm[lossless::kMaxFrames * 2];
+        int ch = 0;
+        if (n >= 2 + len && len && lossless::decode(d + 2, len, pcm, lossless::kMaxFrames, &ch) == 120 && ch == 2) lossless++;
+        else losslessBad++;
+      }
       return;
     }
     if (!sawFrame) {
@@ -220,6 +254,7 @@ static int view(int argc, char** argv) {
   std::sort(lat.begin(), lat.end());
   Json r = Json::object();
   r.set("frames", double(frames)).set("keyframes", double(keys)).set("bytes", double(bytes)).set("audio", double(audio)).set("firstKey", firstKey);
+  r.set("lossless", double(lossless)).set("losslessBad", double(losslessBad));
   r.set("latMedian", lat.empty() ? Json() : Json(std::round(lat[lat.size() / 2] * 10) / 10));
   r.set("latP90", lat.empty() ? Json() : Json(std::round(lat[lat.size() * 9 / 10] * 10) / 10));
   r.set("maxGap", std::round(maxGap)).set("lastGap", lastFrameAt ? Json(std::round(nowMs() - lastFrameAt)) : Json());

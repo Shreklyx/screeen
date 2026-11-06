@@ -7,7 +7,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #include <mach/mach_time.h>
 
-#include <opus.h>
+#include "flac_sender.h"
 
 #include <algorithm>
 #include <atomic>
@@ -155,7 +155,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
   // sound
   std::vector<float> pending, raw;
   double pendingTs = -1;
-  OpusEncoder* opus = nullptr;
+  std::unique_ptr<FlacSender> flac; // the sound: lossless (FLAC, our own encoder)
   mutable std::mutex mu;
   Info info;
 
@@ -166,7 +166,6 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
       CFRelease(encoder);
     }
     if (lastImage) CVPixelBufferRelease(lastImage);
-    if (opus) opus_encoder_destroy(opus);
   }
 
   void setInfo(const std::function<void(Info&)>& fn) {
@@ -270,9 +269,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     if (![stream addStreamOutput:output type:SCStreamOutputTypeScreen sampleHandlerQueue:videoQueue error:&err]) return fail("capture-failed");
     if (audio) {
       if (@available(macOS 13.0, *)) [stream addStreamOutput:output type:SCStreamOutputTypeAudio sampleHandlerQueue:audioQueue error:nil];
-      int e = 0;
-      opus = opus_encoder_create(48000, 2, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &e);
-      if (opus) opus_encoder_ctl(opus, OPUS_SET_BITRATE(256000));
+      flac.reset(new FlacSender(2));
     }
     setInfo([&](Info& i) {
       i.width = w;
@@ -371,7 +368,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
   }
 
   void onAudio(CMSampleBufferRef sample) override {
-    if (!opus || !running) return;
+    if (!flac || !running) return;
     setInfo([](Info& i) { i.audioBuffers++; });
     // float PCM straight from the block: one channel after the other (non-interleaved, as
     // ScreenCaptureKit gives it) or interleaved – the format description says which
@@ -403,16 +400,11 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
         pending.push_back(planar ? raw[ch * frames + i] : raw[i * size_t(channels) + ch]);
       }
     }
-    uint8_t out[1500];
     while (pending.size() >= 240) {
-      // 2.5 ms packets: the least delay Opus has
-      int n = opus_encode_float(opus, pending.data(), 120, out, sizeof out);
-      if (n > 0) {
-        engine.sendAudio(0, 2, out, size_t(n), pendingTs);
-        setInfo([](Info& i) { i.audioPackets++; });
-      } else {
-        setInfo([&](Info& i) { i.audioNote = std::string("opus: ") + opus_strerror(n); });
-      }
+      // 2.5 ms packets, lossless
+      double ts = pendingTs;
+      flac->send(pending.data(), 120, [&](int pair, const uint8_t* d, size_t n) { engine.sendAudio(pair, 2, d, n, ts); });
+      setInfo([](Info& i) { i.audioPackets++; });
       pending.erase(pending.begin(), pending.begin() + 240);
       pendingTs += 2500;
     }
@@ -450,8 +442,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
       }
       self->inFlight = 0;
       dispatch_sync(self->audioQueue, ^{ // (the sound's encoder is used there)
-        if (self->opus) opus_encoder_destroy(self->opus);
-        self->opus = nullptr;
+        self->flac.reset();
         self->pending.clear();
         self->pendingTs = -1;
       });

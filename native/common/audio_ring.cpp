@@ -2,6 +2,8 @@
 
 #include <opus.h>
 
+#include "lossless.h"
+
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -52,10 +54,28 @@ void AudioRing::restart(long long at) {
 void AudioRing::push(int sub, const uint8_t* data, size_t n, double tsUs) {
   int ch = std::max(1, std::min(8, sub >> 4));
   int pair = sub & 15;
+  bool flac = (pair & kLossless) != 0;
+  pair &= 7;
   if (pair * 2 >= ch) return;
   std::lock_guard<std::mutex> l(mu_);
   if (ch != channels_) configure(ch);
   int pc = std::min(2, ch - pair * 2);
+  if (flac) {
+    // lossless (FLAC): [this frame's length][this frame][the one before it, again] – a lost packet's sound
+    // comes with the next one (its time is one frame earlier; the older one first, as it was played)
+    if (n < 2) return;
+    size_t len = size_t(data[0] | data[1] << 8);
+    if (len > n - 2) return;
+    float pcm[lossless::kMaxFrames * 2];
+    int got = 0;
+    if (n - 2 - len > 0) {
+      int frames = lossless::decode(data + 2 + len, n - 2 - len, pcm, lossless::kMaxFrames, &got);
+      if (frames > 0 && got == pc) place(pair, pc, pcm, frames, tsUs - frames * 1e6 / kRate);
+    }
+    int frames = lossless::decode(data + 2, len, pcm, lossless::kMaxFrames, &got);
+    if (frames > 0 && got == pc) place(pair, pc, pcm, frames, tsUs);
+    return;
+  }
   OpusDecoder*& dec = decoders_[size_t(pair)];
   if (!dec) {
     int err = 0;

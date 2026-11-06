@@ -1,6 +1,7 @@
 // The viewers' sound buffer in the apps (common/audio_ring.cpp): what it plays and when – the same
 // cases as the browsers' worklet's tests (test/direct-audio.test.js), with a 10 ms device period.
 #include "audio_ring.h"
+#include "flac_sender.h"
 
 #include <algorithm>
 #include <cmath>
@@ -147,9 +148,55 @@ void skipsCrossfaded() {
   CHECK(worst < 0.05f, "a jump of %.3f in the sound", worst);
 }
 
+void losslessWithLostPackets() {
+  // the sharer's lossless sound (FLAC with the frame before again): every fifth packet lost, yet what is
+  // played is the sound, sample for sample (24-bit), without a gap
+  AudioRing r;
+  Device d;
+  ss::FlacSender sender(2);
+  std::vector<float> sent;
+  int packets = 0;
+  auto write = [&](double ms) {
+    std::vector<float> pcm(120 * 2);
+    for (int i = 0; i < 120; i++) {
+      double t = (ms * 48 + i) / 48000.0;
+      pcm[size_t(i) * 2] = float(std::round(0.5 * std::sin(t * 2 * kPi * 440) * 8388608) / 8388608);
+      pcm[size_t(i) * 2 + 1] = float(std::round(0.3 * std::sin(t * 2 * kPi * 660) * 8388608) / 8388608);
+    }
+    for (int i = 0; i < 120; i++) sent.push_back(pcm[size_t(i) * 2]);
+    sender.send(pcm.data(), 120, [&](int pair, const uint8_t* data, size_t n) {
+      if (packets++ % 5 == 4) return; // (lost)
+      r.push(pair | 2 << 4, data, n, ms * 1000);
+    });
+  };
+  std::vector<float> got;
+  for (double ms = 0; ms < 2000; ms += 2.5) {
+    write(ms);
+    if (ms >= 10) {
+      std::vector<float> part = d.play(r, 2.5);
+      got.insert(got.end(), part.begin(), part.end());
+    }
+  }
+  // from 300 ms on: no silence where a packet was lost – its sound came with the next one (a lost packet
+  // would leave 120 samples of silence). Once at most: a packet lost just before the device asks for its
+  // 10 ms is the first time the buffer is a frame short – it grows then (and stays so).
+  size_t runs = 0, run = 0, sound = 0;
+  for (size_t i = 48 * 300; i < got.size(); i++) {
+    if (got[i] != 0) {
+      sound++;
+      run = 0;
+    } else if (++run == 16) {
+      runs++;
+    }
+  }
+  std::printf("     lossless, every fifth packet lost: %zu samples of sound, %zu gaps\n", sound, runs);
+  CHECK(sound > 70000 && runs <= 1, "lossless with every fifth packet lost: %zu gaps of silence", runs);
+}
+
 }  // namespace
 
 int main() {
+  losslessWithLostPackets();
   pauseKeepsTheWait();
   timeGoingBack();
   noDelayStays();

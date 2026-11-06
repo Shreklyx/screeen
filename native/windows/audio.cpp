@@ -6,7 +6,7 @@
 #include <mmdeviceapi.h>
 #include <wrl/client.h>
 
-#include <opus.h>
+#include "flac_sender.h"
 
 #include <algorithm>
 #include <atomic>
@@ -29,7 +29,7 @@ namespace {
 const GUID kFloatFormat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 
 const int kRate = 48000;
-const int kFrame = 120; // 2.5 ms: the least delay Opus has
+const int kFrame = 120; // 2.5 ms a packet
 
 /** Samples of the device's mix format as float (most devices already are). */
 float sampleAt(const BYTE* p, const WAVEFORMATEX* f, size_t frame, int channel) {
@@ -75,7 +75,7 @@ class DeviceWatch : public IMMNotificationClient {
 
 }  // namespace
 
-/* ------------------------------------------------ the sharer: loopback → Opus */
+/* ------------------------------------------------ the sharer: loopback → FLAC (lossless) */
 
 struct AudioCapture::Impl {
   Packet packet;
@@ -132,16 +132,8 @@ struct AudioCapture::Impl {
     client->SetEventHandle(event);
     ComPtr<IAudioCaptureClient> capture;
     client->GetService(IID_PPV_ARGS(&capture));
-    // one Opus encoder per channel pair; 5 ms packets, low delay
-    int pairs = (channels + 1) / 2;
-    std::vector<OpusEncoder*> encoders;
-    for (int p = 0; p < pairs; p++) {
-      int ch = std::min(2, channels - p * 2);
-      int err = 0;
-      OpusEncoder* e = opus_encoder_create(kRate, ch, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
-      opus_encoder_ctl(e, OPUS_SET_BITRATE(ch * 128000));
-      encoders.push_back(e);
-    }
+    // lossless: FLAC, our own encoder – a channel pair at a time, 2.5 ms frames
+    FlacSender flac(channels);
     DWORD task = 0;
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &task);
     client->Start();
@@ -150,8 +142,6 @@ struct AudioCapture::Impl {
     std::vector<float> pending; // interleaved, `channels` wide, at 48 kHz
     double pos = 0;             // position in the device's samples (resampling)
     double streamUs = -1;       // timestamp of pending[0]
-    uint8_t out[1500];
-    std::vector<float> pairBuf(kFrame * 2);
     bool lost = false;
     while (!quit && !watch.changed && !lost) {
       if (WaitForSingleObject(event, 50) != WAIT_OBJECT_0) {
@@ -196,13 +186,7 @@ struct AudioCapture::Impl {
         pos -= frames;
         capture->ReleaseBuffer(frames);
         while (pending.size() >= size_t(kFrame * channels)) {
-          for (int p = 0; p < pairs; p++) {
-            int ch = std::min(2, channels - p * 2);
-            for (int i = 0; i < kFrame; i++)
-              for (int c = 0; c < ch; c++) pairBuf[size_t(i * ch + c)] = pending[size_t(i * channels + p * 2 + c)];
-            int n = opus_encode_float(encoders[size_t(p)], pairBuf.data(), kFrame, out, sizeof out);
-            if (n > 0) packet(p, channels, out, size_t(n), streamUs);
-          }
+          flac.send(pending.data(), kFrame, [&](int pair, const uint8_t* d, size_t n) { packet(pair, channels, d, n, streamUs); });
           pending.erase(pending.begin(), pending.begin() + kFrame * channels);
           streamUs += kFrame * 1e6 / kRate;
         }
@@ -210,7 +194,6 @@ struct AudioCapture::Impl {
     }
     client->Stop();
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
-    for (OpusEncoder* e : encoders) opus_encoder_destroy(e);
     CoTaskMemFree(mix);
     CloseHandle(event);
     return "";
@@ -236,7 +219,7 @@ void AudioCapture::stop() {
 
 std::string AudioCapture::layout() const { return impl_->layoutName; }
 
-/* ------------------------------------------------ the viewer: Opus → ring (audio_ring.cpp) → speakers */
+/* ------------------------------------------------ the viewer: FLAC / Opus → ring (audio_ring.cpp) → speakers */
 
 struct AudioPlayer::Impl {
   AudioRing ring;

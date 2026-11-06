@@ -25,20 +25,34 @@ jobs:
           cmake -S native -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j4
       - name: Core tests
-        run: build/sscore_test
+        run: |
+          build/sscore_test
+          build/lossless_test
+      # Lossless sound: what our FLAC encoder makes, ffmpeg's FLAC decoder plays back bit for bit
+      - name: "Lossless sound: standard FLAC"
+        run: |
+          sudo apt-get install -y -q ffmpeg > /dev/null
+          c++ -O2 -std=c++17 -Inative/common native/tests/flac_file.cpp native/common/lossless.cpp -o flac_file
+          for ch in 1 2 6 8; do
+            ./flac_file $ch ours.flac ours.raw
+            ffmpeg -v error -i ours.flac -f s32le -acodec pcm_s32le ff.raw -y
+            cmp ff.raw ours.raw
+            echo "$ch channels: ffmpeg decodes ours bit for bit"
+          done
       - name: Native sharer → native viewer through the server
         run: |
           PORT=8090 HOST_PASSWORD=ci DIRECT_PORT=3479 node server/server.js &
           sleep 2
           for path in udp tcp; do
             flag=""; [ "$path" = tcp ] && flag="--tcp"
-            build/ss-cli host --server http://127.0.0.1:8090 --password ci --h264 native/tests/data/test.h264 --seconds 12 $flag > host.log &
+            build/ss-cli host --server http://127.0.0.1:8090 --password ci --h264 native/tests/data/test.h264 --seconds 12 --tone $flag > host.log &
             host=$!
             for i in $(seq 1 50); do grep -q '^ROOM' host.log && break; sleep 0.2; done
             # the room as the link has it (code.key: the sharer proves the key, it goes into the keys)
             code=$(grep '^ROOM' host.log | awk '{print $2}')
             build/ss-cli view --server http://127.0.0.1:8090 --code "$code" --seconds 5 $flag | tee view.log | grep RESULT
-            node -e "const r=JSON.parse(require('fs').readFileSync('view.log','utf8').split('\n').find(l=>l.startsWith('RESULT ')).slice(7)); if(!(r.frames>100&&r.firstKey)) {console.error('too few frames', r); process.exit(1)}"
+            # (and the sound, lossless: every FLAC frame whole – 400 a second)
+            node -e "const r=JSON.parse(require('fs').readFileSync('view.log','utf8').split('\n').find(l=>l.startsWith('RESULT ')).slice(7)); if(!(r.frames>100&&r.firstKey)) {console.error('too few frames', r); process.exit(1)} if(!(r.lossless>1000)||r.losslessBad) {console.error('the lossless sound did not come whole', r); process.exit(1)}"
             wait $host # (not the server: that one runs on)
           done
       # End to end: a viewer with the link takes only a sharer that proves the room's key – one whose key does

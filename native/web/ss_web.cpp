@@ -1,5 +1,6 @@
-// Screen Share for the website – WebAssembly from the apps' own C/C++ code, for what a browser may
-// lack: the X25519 key exchange of the direct mode (BearSSL, as in native/core) and an Opus decoder
+// Screen Share for the website – WebAssembly from the apps' own C/C++ code: the lossless sound (FLAC, our
+// own encoder and decoder – native/common/lossless.cpp, the same as the apps'), and for what a browser
+// may lack: the X25519 key exchange of the direct mode (BearSSL, as in native/core) and an Opus decoder
 // (libopus, as in the apps). public/ss-web.js loads it; build: native/web/build.sh.
 // (C headers: there is no C++ library for wasm32-wasi here, and none is needed)
 #include <stdint.h>
@@ -10,6 +11,8 @@ extern "C" {
 #include "bearssl.h"
 #include "opus.h"
 }
+
+#include "lossless.h"
 
 #define EXPORT(name) extern "C" __attribute__((export_name(#name)))
 
@@ -45,6 +48,16 @@ EXPORT(ss_opus_decode) int ss_opus_decode(OpusDecoder* d, const uint8_t* data, i
 }
 
 EXPORT(ss_opus_destroy) void ss_opus_destroy(OpusDecoder* d) { opus_decoder_destroy(d); }
+
+/** A FLAC frame (ours) → interleaved float samples: the frames (its channels into *channels), 0 when bad. */
+EXPORT(ss_flac_decode) int ss_flac_decode(const uint8_t* data, int len, float* pcm, int maxFrames, int* channels) {
+  return len > 0 ? ss::lossless::decode(data, size_t(len), pcm, maxFrames, channels) : 0;
+}
+
+/** Interleaved float samples (48 kHz) → one FLAC frame: its bytes, 0 when it does not fit. */
+EXPORT(ss_flac_encode) int ss_flac_encode(const float* pcm, int channels, int frames, uint8_t* out, int max, uint32_t number) {
+  return int(ss::lossless::encode(pcm, channels, frames, out, max > 0 ? size_t(max) : 0, number));
+}
 
 #ifdef SS_WEB_TEST
 // tests only (test/ss-web.test.js): an encoder to make packets with

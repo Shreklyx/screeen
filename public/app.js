@@ -20,6 +20,9 @@ const NUMERIC_SETTINGS = new Set(['fps', 'kbps']);
 const HW_TARGET = { res: '2160', fps: 60 };
 const SW_TARGET = { res: '1080', fps: 30 };
 const DIRECT_CODEC = 'avc1.640034'; // H.264 High 5.2 (up to 4K 60): every GPU decodes it
+// in an audio packet's sub (pair | channels << 4): the pair's sound is lossless – FLAC, our own encoder
+// (native/common/lossless.cpp, here as WebAssembly): [this frame's length][this frame][the one before]
+const LOSSLESS = 8;
 // iPhone / iPad – iPadOS Safari presents itself as a Mac, the touch screen gives it away
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
 const IS_MAC = !IS_IOS && /Macintosh/.test(navigator.userAgent);
@@ -1360,8 +1363,10 @@ async function readAudio(track, onData) {
 function startDirectAudio(track) {
   stopDirectAudio();
   if (!track || track.readyState !== 'live') return;
-  const pipe = { track, stop: null, encoders: [], channels: 0, rate: 0, stopped: false };
+  const pipe = { track, stop: null, encoders: [], channels: 0, rate: 0, stopped: false, wasm: null, flac: null };
   direct.audio = pipe;
+  // the lossless sound: our FLAC encoder (WebAssembly) – Opus until it is there, or when not 48 kHz
+  globalThis.ScreenShareWasm?.load().then((w) => { pipe.wasm = w; }, () => {});
   readAudio(track, (data) => {
     try {
       if (!pipe.stopped) encodeDirectAudio(pipe, data);
@@ -1389,6 +1394,10 @@ function stopDirectAudio() {
 
 function encodeDirectAudio(pipe, data) {
   const channels = Math.min(8, data.numberOfChannels);
+  if (pipe.wasm && data.sampleRate === 48000) {
+    encodeLossless(pipe, data, channels);
+    return;
+  }
   const pairs = Math.ceil(channels / 2);
   if (channels !== pipe.channels || data.sampleRate !== pipe.rate) {
     for (const e of pipe.encoders) {
@@ -1415,6 +1424,52 @@ function encodeDirectAudio(pipe, data) {
     if (pipe.encoders[pair].state === 'configured') pipe.encoders[pair].encode(part);
     part.close();
   }
+}
+
+/** Lossless: 2.5 ms FLAC frames a channel pair at a time, each with the pair's frame before it again while
+ *  both fit in one packet (as the apps send – native/common/flac_sender.h). */
+function encodeLossless(pipe, data, channels) {
+  const FRAMES = 120;
+  const MAX_PAYLOAD = 1100;
+  let f = pipe.flac;
+  if (!f || f.channels !== channels) {
+    f = pipe.flac = { channels, pending: new Float32Array(0), ts: 0, last: [], number: 0 };
+  }
+  const frames = data.numberOfFrames;
+  const inter = new Float32Array(frames * channels);
+  const plane = new Float32Array(frames);
+  for (let c = 0; c < channels; c++) {
+    data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+    for (let i = 0; i < frames; i++) inter[i * channels + c] = plane[i];
+  }
+  if (!f.pending.length) f.ts = data.timestamp;
+  const all = new Float32Array(f.pending.length + inter.length);
+  all.set(f.pending);
+  all.set(inter, f.pending.length);
+  let at = 0;
+  const pairs = Math.ceil(channels / 2);
+  for (; all.length - at >= FRAMES * channels; at += FRAMES * channels) {
+    for (let pair = 0; pair < pairs; pair++) {
+      const ch = Math.min(2, channels - pair * 2);
+      const pcm = new Float32Array(FRAMES * ch);
+      for (let i = 0; i < FRAMES; i++)
+        for (let c = 0; c < ch; c++) pcm[i * ch + c] = all[at + i * channels + pair * 2 + c];
+      const frame = pipe.wasm.flac.encode(pcm, ch, FRAMES, f.number);
+      if (!frame) continue;
+      const prev = f.last[pair];
+      const withPrev = prev && 2 + frame.length + prev.length <= MAX_PAYLOAD;
+      const out = new Uint8Array(2 + frame.length + (withPrev ? prev.length : 0));
+      out[0] = frame.length & 255;
+      out[1] = frame.length >> 8;
+      out.set(frame, 2);
+      if (withPrev) out.set(prev, 2 + frame.length);
+      f.last[pair] = frame;
+      DIRECT.send({ stream: 1, sub: pair | LOSSLESS | (channels << 4), ts: f.ts, capture: clockNow() }, out);
+    }
+    f.number++;
+    f.ts += (FRAMES * 1e6) / 48000;
+  }
+  f.pending = all.slice(at);
 }
 
 function sendDirectAudio(pipe, pair, channels, chunk) {
@@ -1998,7 +2053,8 @@ async function openDirectAudio(d, channels) {
     ctx.close().catch(() => {});
     return null;
   }
-  const wasm = canDirect.audio === 'wasm' ? await globalThis.ScreenShareWasm.load().catch(() => null) : null;
+  // our WebAssembly: the lossless sound (FLAC) – and Opus where the browser has no decoder
+  const wasm = await globalThis.ScreenShareWasm?.load().catch(() => null) ?? null;
   if (viewer.direct !== d || (canDirect.audio === 'wasm' && !wasm)) {
     ctx.close().catch(() => {});
     return null;
@@ -2031,6 +2087,27 @@ function closeDirectAudio(d) {
 function syncDirectVolume() {
   const a = viewer.direct?.audio;
   if (a) a.gain.gain.value = viewer.muted ? 0 : viewer.volume;
+}
+
+/** A lossless packet: the frame before it again first (a lost packet's sound, at its own time), then this
+ *  one – planes to the player (it places them by their time: what it has already is the same). */
+function playLossless(a, pair, meta, data) {
+  if (!a.wasm || data.length < 2) return;
+  const len = data[0] | (data[1] << 8);
+  if (len > data.length - 2) return;
+  const play = (frame, ts) => {
+    const out = a.wasm.flac.decode(frame);
+    if (!out) return;
+    const frames = out.pcm.length / out.channels;
+    const planes = Array.from({ length: out.channels }, (_, c) => {
+      const plane = new Float32Array(frames);
+      for (let i = 0; i < frames; i++) plane[i] = out.pcm[i * out.channels + c];
+      return plane;
+    });
+    a.node.port.postMessage({ pair, ts: ts(frames), frames, planes }, planes.map((p) => p.buffer));
+  };
+  if (data.length > 2 + len) play(data.subarray(2 + len), (frames) => meta.ts - (frames * 1e6) / 48000);
+  play(data.subarray(2, 2 + len), () => meta.ts);
 }
 
 /** A decoder for one channel pair: { decode(meta, data), close() } – planes to the player. */
@@ -2079,7 +2156,8 @@ function pairDecoder(a, pair, channels) {
 async function playDirectAudio(d, meta, data) {
   if (!canDirect.audio) return; // this browser has no way to play it
   const channels = Math.max(1, Math.min(8, meta.sub >> 4));
-  const pair = meta.sub & 15;
+  const lossless = (meta.sub & LOSSLESS) !== 0;
+  const pair = meta.sub & 7;
   if (pair * 2 >= channels) return;
   let a = d.audio;
   if (!a || a.channels !== channels) {
@@ -2091,6 +2169,10 @@ async function playDirectAudio(d, meta, data) {
       d.audioOpening = false;
     }
     if (!a) return;
+  }
+  if (lossless) {
+    playLossless(a, pair, meta, data);
+    return;
   }
   let dec = a.decoders[pair];
   if (!dec || dec.state === 'closed') {
