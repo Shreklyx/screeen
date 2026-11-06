@@ -392,6 +392,9 @@ input[type="password"] {
 .overlay-box p { margin: 14px 0 0; font-size: 16px; color: #e6e6ee; }
 .overlay-actions { display: flex; gap: 10px; justify-content: center; margin-top: 18px; flex-wrap: wrap; }
 .overlay-actions:empty { display: none; }
+/* the room's entry password, asked in the overlay */
+.access-form { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; width: 100%; }
+.access-form input[type="password"] { flex: 1 1 220px; min-width: 0; font-size: 16px; }
 .spinner {
   width: 38px;
   height: 38px;

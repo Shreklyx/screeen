@@ -47,6 +47,8 @@
           <form id="shareForm" class="share-form">
             <input id="hostPassword" type="password" autocomplete="current-password" placeholder="Megosztási jelszó" aria-label="Megosztási jelszó" required>
             <label class="check"><input id="rememberPassword" type="checkbox" checked> Jelszó megjegyzése ezen a gépen</label>
+            <label class="check"><input id="permanentRoom" type="checkbox"> Állandó szoba – mindig ugyanaz a kód, a szerver újraindulása után is</label>
+            <input id="roomAccess" type="password" autocomplete="new-password" placeholder="Belépési jelszó a nézőknek (nem kötelező)" aria-label="Belépési jelszó a nézőknek">
             <button id="btnShare" class="btn btn-primary btn-lg" type="submit">Képernyő megosztása</button>
             <p id="shareError" class="hint error" role="alert" hidden></p>
           </form>

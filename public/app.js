@@ -36,6 +36,7 @@ const ERROR_TEXT = {
   rate: 'Túl sok próbálkozás. Várj egy kicsit, és próbáld újra.',
   full: 'A szerver vagy a szoba megtelt. Próbáld újra később.',
   notfound: 'Ez a szoba nem létezik, vagy már bezárult.',
+  access: 'Ebbe a szobába jelszóval lehet belépni.',
   offline: 'Nem sikerült elérni a szervert.',
   timeout: 'A szerver nem válaszolt időben.',
 };
@@ -243,7 +244,9 @@ const host = {
   password: '',
   code: null,
   token: null,
-  key: null, // the room's own key (see base32 above): in the link, never sent to the server
+  key: null, // the room's own key (see room-key.js): in the link, never sent to the server
+  permanent: false, // the server keeps the room (its code) for good, also after it starts again
+  access: '', // the room's entry password for viewers ('' none)
   iceServers: [],
   serverDirect: false,
   video: null,
@@ -368,11 +371,20 @@ async function openRoom(password) {
   await signal.whenOpen(8000);
   // the last room, if it can still be there (the server keeps one 10 minutes for its sharer): the same
   // code and link again – after a reload, a closed tab, the browser started again
-  const saved = store.get('ss-host-room', null);
-  const resume = saved && Date.now() - (saved.at || 0) < ROOM_KEEP_MS ? { code: saved.code, token: saved.token } : null;
+  // a permanent room: always the same one (its code, token and key kept on this computer for good)
+  // (unticked: the permanent room is taken back once more and becomes a normal one – it closes as they do)
+  const permanent = $('#permanentRoom').checked;
+  const access = $('#roomAccess').value;
+  const kept = store.get('ss-permanent-room', null);
+  const recent = store.get('ss-host-room', null);
+  const saved = kept || (recent && Date.now() - (recent.at || 0) < ROOM_KEEP_MS ? recent : null);
+  const resume = saved ? { code: saved.code, token: saved.token } : null;
   host.key = (resume && unbase32(saved.key || '')) || null;
   if (host.key?.length !== 16) host.key = crypto.getRandomValues(new Uint8Array(16));
-  const res = await signal.request({ t: 'host', password, resume: resume || undefined, name: chatName() }, ['hosted']);
+  const res = await signal.request({ t: 'host', password, resume: resume || undefined, name: chatName(), permanent, access }, ['hosted']);
+  host.permanent = permanent;
+  host.access = access;
+  if (!permanent) store.remove('ss-permanent-room');
   applyHosted(res);
   return Boolean(resume && res.code === resume.code);
 }
@@ -380,7 +392,7 @@ async function openRoom(password) {
 // After a lost server connection: take the room back with its token (password as fallback).
 async function reclaimRoom() {
   try {
-    const res = await host.signal.request({ t: 'host', password: host.password, resume: { code: host.code, token: host.token }, name: chatName() }, ['hosted']);
+    const res = await host.signal.request({ t: 'host', password: host.password, resume: { code: host.code, token: host.token }, name: chatName(), permanent: host.permanent, access: host.access }, ['hosted']);
     const changed = res.code !== host.code;
     applyHosted(res);
     if (changed) toast('A korábbi szoba lejárt, új link készült – küldd el újra a nézőknek.', 'warn', 8000);
@@ -393,7 +405,10 @@ const ROOM_KEEP_MS = 10 * 60 * 1000; // as long as the server waits for a sharer
 
 /** The room, for coming back to it: kept on this computer while sharing (the time says how fresh). */
 function keepRoom() {
-  if (host.code && host.token) store.set('ss-host-room', { code: host.code, token: host.token, key: base32(host.key), at: Date.now() });
+  if (!host.code || !host.token) return;
+  const room = { code: host.code, token: host.token, key: base32(host.key), at: Date.now() };
+  store.set('ss-host-room', room);
+  if (host.permanent) store.set('ss-permanent-room', room);
 }
 
 function applyHosted(res) {
@@ -449,6 +464,7 @@ async function startHosting(e) {
   host.password = password;
   if ($('#rememberPassword').checked) store.set('ss-host-password', password);
   else store.remove('ss-host-password');
+  store.set('ss-room-options', { permanent: host.permanent, access: host.permanent ? host.access : '' });
 
   host.active = true;
   showView('view-host');
@@ -853,6 +869,11 @@ async function initHostUi() {
 
   const saved = store.get('ss-host-password', '');
   if (saved) $('#hostPassword').value = saved;
+  const options = store.get('ss-room-options', null);
+  if (options) {
+    $('#permanentRoom').checked = Boolean(options.permanent);
+    $('#roomAccess').value = options.access || '';
+  }
 
   populateAudioSources();
   $('#setAudioSource').addEventListener('change', onAudioSourceChange);
@@ -1440,7 +1461,8 @@ const viewer = {
   idleTimer: null,
   hostStats: null, // the sender's encoder info (hardware, encode time)
   direct: null, // the connection to the sharer, see "DIRECT MODE: the viewer"
-  key: null, // the room's key from the link (see base32): the sharer has to prove it holds it
+  key: null, // the room's key from the link (see room-key.js): the sharer has to prove it holds it
+  access: '', // the room's entry password (when it has one)
   tick: 0,
   unread: 0, // chat messages that came while the panel was closed
 };
@@ -1468,6 +1490,7 @@ async function startViewing(code, key = null) {
   if (location.hash.slice(1) !== room) history.replaceState(null, '', `#${room}`);
   viewer.code = code;
   viewer.key = key;
+  try { viewer.access = sessionStorage.getItem(`ss-access-${code}`) || ''; } catch { viewer.access = ''; }
   setOverlay('Csatlakozás a szobához…');
   await directReady;
   if (!canDirect.ok) {
@@ -1495,7 +1518,7 @@ async function joinRoom() {
   clearTimeout(viewer.retryTimer);
   if (viewer.closed) return;
   try {
-    const res = await viewer.signal.request({ t: 'join', code: viewer.code, caps: viewer.caps, name: chatName() }, ['joined']);
+    const res = await viewer.signal.request({ t: 'join', code: viewer.code, caps: viewer.caps, name: chatName(), ...(viewer.access ? { access: viewer.access } : {}) }, ['joined']);
     viewer.id = res.id;
     viewerChat().joined(res, res.id);
     viewer.iceServers = res.iceServers || [];
@@ -1507,10 +1530,53 @@ async function joinRoom() {
     watchForOffer();
   } catch (err) {
     if (err.code === 'offline') return; // reconnect will call joinRoom again
+    if (err.code === 'access') {
+      askAccess();
+      return;
+    }
+    // a room it was in and is not there now: the server started again – its sharer brings it back
+    if (err.code === 'notfound' && viewer.id) {
+      setOverlay('A szoba épp újraindul (a szerver újraindult) – várakozás a megosztóra…', { actions: [{ label: 'Vissza a főoldalra', onClick: goHome }] });
+      viewer.retryTimer = setTimeout(joinRoom, 3000);
+      return;
+    }
     const delay = err.code === 'rate' ? 30000 : 5000;
     setOverlay(`${errorText(err)} Újrapróbálom…`, { actions: [{ label: 'Vissza a főoldalra', onClick: goHome }] });
     viewer.retryTimer = setTimeout(joinRoom, delay);
   }
+}
+
+/** The room asks for its entry password: a field for it in the overlay (kept for this tab's reloads). */
+function askAccess() {
+  const wrong = Boolean(viewer.access);
+  setOverlay(wrong ? 'Hibás jelszó. Próbáld újra:' : 'Ebbe a szobába jelszóval lehet belépni:', { spinner: false });
+  const form = document.createElement('form');
+  form.className = 'access-form';
+  const input = document.createElement('input');
+  input.type = 'password';
+  input.autocomplete = 'current-password';
+  input.placeholder = 'A szoba jelszava';
+  input.setAttribute('aria-label', 'A szoba jelszava');
+  const button = document.createElement('button');
+  button.type = 'submit';
+  button.className = 'btn btn-primary';
+  button.textContent = 'Belépés';
+  const home = document.createElement('button');
+  home.type = 'button';
+  home.className = 'btn';
+  home.textContent = 'Vissza a főoldalra';
+  home.addEventListener('click', goHome);
+  form.append(input, button, home);
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!input.value) return;
+    viewer.access = input.value;
+    try { sessionStorage.setItem(`ss-access-${viewer.code}`, input.value); } catch { /* fine */ }
+    setOverlay('Belépés…');
+    joinRoom();
+  });
+  $('#overlayActions').replaceChildren(form);
+  input.focus();
 }
 
 // A sharer that sends nothing our way (an old iPhone app speaks only WebRTC): say so.
