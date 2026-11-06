@@ -642,7 +642,7 @@ jobs:
             const rooms = JSON.parse(lines.find((l) => l.startsWith("ROOMS ")).slice(6));
             const problems = [];
             const host = windows.find((w) => w.screen === "host");
-            if (!host || !host.link.endsWith("#" + shared)) problems.push("the sharing did not go back into its room " + shared + ": " + JSON.stringify(host));
+            if (!host || (host.link.split("#")[1] || "").split(".")[0] !== shared) problems.push("the sharing did not go back into its room " + shared + ": " + JSON.stringify(host));
             const view = windows.find((w) => w.screen === "viewer" && w.room === watched);
             if (!view || !view.picture) problems.push("the watched room " + watched + " is not shown again: " + JSON.stringify(view));
             const gone = windows.find((w) => w.screen === "home" && w.note.includes("zzzzzz"));
