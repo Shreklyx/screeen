@@ -48,8 +48,8 @@ struct HostPipeline::Impl {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     ScreenCapture cap;
     std::unique_ptr<VideoEncoder> enc;
-    int failures = 0;
-    bool software = false;
+    int failures = 0, gpuTries = 0;
+    bool software = false, hadGpu = false;
     double lastBitrate = 0;
     while (!quit) {
       // (re)open: at the start, after a display mode change, a UAC prompt, a full-screen game …
@@ -63,13 +63,27 @@ struct HostPipeline::Impl {
         Sleep(200);
         continue;
       }
-      enc = software ? nullptr : openEncoder(cap, why);
-      if (!enc) {
-        // no GPU encoder: Windows' software encoder, at most 1080p 30
-        if (!software) {
-          software = true;
+      // The GPU's encoder – tried again at every (re)open: one that would not open for a moment (a display
+      // mode change, a UAC prompt, a game starting, another app's encoder session) works a moment later.
+      // Before, one such moment left the share on the processor until it ended: 1080p 30, pixelated.
+      enc = openEncoder(cap, why);
+      if (enc) {
+        gpuTries = 0;
+        hadGpu = true;
+        if (software) { // the GPU's encoder works again: its full size and frame rate
+          software = false;
+          enc.reset();
           continue;
         }
+      } else if (!software && hadGpu && ++gpuTries <= 5) {
+        Sleep(300); // (again in a moment)
+        continue;
+      } else if (!software) {
+        software = true; // (the capture again at the processor's size)
+        continue;
+      }
+      if (!enc) {
+        // no GPU encoder: Windows' software encoder, at most 1080p 30
         enc = createMfEncoder(cap.adapterLuid(), false);
         why = enc->open(cap.device(), cap.context(), cap.frame(), cap.width(), cap.height(), fps, int(bitrate.load()));
         if (!why.empty()) {
@@ -95,6 +109,7 @@ struct HostPipeline::Impl {
       // last one was due, not from when its encoding ended, which held back an image that came in
       // time (a 60 Hz screen at 60 FPS waited part of a frame, and every few frames one was lost).
       const double slack = interval / 4;
+      const double openedAt = nowMs();
       double nextAt = -1e9;
       int encoded = 0;
       bool pending = false, have = false;
@@ -105,6 +120,8 @@ struct HostPipeline::Impl {
           lastBitrate = bitrate;
           enc->setBitrate(int(lastBitrate));
         }
+        // on the processor although the GPU's encoder worked in this share: it is tried again every 15 s
+        if (software && hadGpu && nowMs() - openedAt > 15000) break;
         // waiting for the next image – while someone watches, only until the next frame's turn (a still
         // screen gives no new image: the last one goes again then, below)
         unsigned timeout = streaming && (pending || have) ? unsigned(std::max(0.0, std::ceil(nextAt - slack - nowMs()))) : 50;

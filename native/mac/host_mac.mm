@@ -212,6 +212,8 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
                                                onScreenWindowsOnly:YES
                                                  completionHandler:^(SCShareableContent* content, NSError* error) {
                                                    if (!self->running) return;
+                                                   if (!content && error.code != -3801 && self->restarts > 0) // (starting again: a locked screen has none yet)
+                                                     return dispatch_async(self->videoQueue, ^{ self->retry(); });
                                                    if (!content) return self->fail(error.code == -3801 ? "permission" : "no-screen-access");
                                                    // on the video queue, as stop() is
                                                    dispatch_async(self->videoQueue, ^{
@@ -229,7 +231,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     SCDisplay* display = nil;
     for (SCDisplay* d in content.displays)
       if (d.displayID == wanted) display = d;
-    if (!display) return fail("display-not-found");
+    if (!display) return restarts > 0 ? retry() : fail("display-not-found"); // (asleep, being reconnected: it comes back)
     auto [srcW, srcH] = pixelSize(display.displayID);
     double scale = 1;
     if (opts.maxWidth > 0 && opts.maxHeight > 0) {
@@ -239,7 +241,7 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     }
     scale = std::max({scale, srcW / 4096.0, srcH / 4096.0}); // H.264 hardware limit
     int w = std::max(16, int(srcW / scale) & ~1), h = std::max(16, int(srcH / scale) & ~1);
-    if (!makeEncoder(w, h)) return fail("no-hw-encoder");
+    if (!makeEncoder(w, h)) return restarts > 0 ? retry() : fail("no-hw-encoder");
     SCStreamConfiguration* cfg = [SCStreamConfiguration new];
     cfg.width = size_t(w); // scaled on the GPU
     cfg.height = size_t(h);
@@ -281,7 +283,9 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     engine.setEncoder("VideoToolbox", true);
     auto self = shared_from_this();
     [stream startCaptureWithCompletionHandler:^(NSError* error) {
-      if (error) self->fail(error.code == -3801 ? "permission" : "capture-failed");
+      if (!error) return;
+      if (error.code != -3801 && self->restarts > 0) return dispatch_async(self->videoQueue, ^{ self->retry(); });
+      self->fail(error.code == -3801 ? "permission" : "capture-failed");
     }];
     // the screen stands still (ScreenCaptureKit sends no new image): the last one again at its turn – a
     // steady frame rate (the viewers' FPS does not fall to 0; a still picture costs a few hundred bytes a
@@ -417,16 +421,24 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
   void onStopped(NSError* error) override {
     // not allowed (-3801), or stopped by the person from the menu bar (-3817): that is the end
     if (error.code == -3801 || error.code == -3817 || !running) return fail(error.code == -3801 ? "permission" : "capture-stopped");
-    // stopped by the system (the display changed or woke, the sound's capture failed…): the picture
-    // and the sound start again in a second – a few times a minute at most
+    auto self = shared_from_this();
+    dispatch_async(videoQueue, ^{ self->retry(); });
+  }
+
+  /** Stopped by the system (the display changed, slept or woke, the sound's capture failed, the screen is
+   *  locked…): the picture and the sound start again in a second – and while that keeps failing, every
+   *  5 s until it works: a share never stops for good by itself (before, after the fifth time in a
+   *  minute the picture stood still until the share was started again). On the video queue. */
+  void retry() {
+    if (!running) return;
     double now = nowMs();
     if (now - restartsSince > 60000) {
       restarts = 0;
       restartsSince = now;
     }
-    if (++restarts > 5) return fail("capture-stopped");
+    double delay = ++restarts > 5 ? 5 : 1;
     auto self = shared_from_this();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), videoQueue, ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, int64_t(delay * NSEC_PER_SEC)), videoQueue, ^{
       if (!self->running) return;
       if (self->timer) dispatch_source_cancel(self->timer);
       self->timer = nil;
@@ -466,7 +478,10 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
 MacHost::MacHost(Engine& engine) : impl_(std::make_shared<Impl>(engine)) {}
 MacHost::~MacHost() { stop(); }
 
-void MacHost::start(const Options& options) { impl_->start(options); }  // (macOS 12.3+: the app's minimum)
+void MacHost::start(const Options& options) {  // (macOS 12.3+: the app's minimum)
+  impl_->restarts = 0; // (a new share: a failure to start is told, not tried again)
+  impl_->start(options);
+}
 
 void MacHost::stop() { impl_->stop(); }
 

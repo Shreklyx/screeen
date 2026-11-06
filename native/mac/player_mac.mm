@@ -74,6 +74,7 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
   VTDecompressionSessionRef session = nullptr;
   std::vector<uint8_t> sps, pps;
   bool needKey = true;
+  bool broken = false; // the session failed: made anew at the next keyframe
   std::atomic<int> waiting{0}; // frames handed over, not decoded yet
   double lastDraw = 0;
   CVPixelBufferRef shown = nullptr; // kept while it is on screen
@@ -262,7 +263,13 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
       }
       i = end;
     }
-    if ((newSets || !session) && !sps.empty() && !pps.empty() && !makeSession()) return keyframe();
+    // a new session for new parameter sets – and after a failure: a session that failed once (after the
+    // Mac slept or woke, the GPU changed …) may fail for good, and with the same parameter sets it was
+    // never made again – the picture stood still until the viewer joined again
+    if ((newSets || !session || broken) && !sps.empty() && !pps.empty()) {
+      broken = false;
+      if (!makeSession()) return keyframe();
+    }
     if (!session || avcc.empty()) return;
     needKey = false;
     CMBlockBufferRef block = nullptr;
@@ -280,11 +287,17 @@ struct MacPlayer::Impl : std::enable_shared_from_this<MacPlayer::Impl> {
                                                                       auto s = weak.lock();
                                                                       if (!s) return;
                                                                       // (it may run on VideoToolbox's thread: the keyframe request goes via the queue)
-                                                                      if (status != noErr || !image) return dispatch_async(s->queue, ^{ s->keyframe(); });
+                                                                      if (status != noErr || !image) return dispatch_async(s->queue, ^{
+                                                                               if (status != noErr) s->broken = true;
+                                                                               s->keyframe();
+                                                                             });
                                                                       s->show(image, capture);
                                                                     });
     CFRelease(sample);
-    if (st != noErr) keyframe();
+    if (st != noErr) {
+      broken = true;
+      keyframe();
+    }
   }
 
   void show(CVImageBufferRef image, double capture) {
