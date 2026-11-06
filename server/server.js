@@ -22,6 +22,7 @@ const STATIC_FILES = {
   '/direct-audio.js': ['direct-audio.js', 'text/javascript; charset=utf-8'], // direct mode: audio playback worklet
   '/direct-web.js': ['direct-web.js', 'text/javascript; charset=utf-8'], // direct mode in the browser (WebSocket)
   '/capture-audio.js': ['capture-audio.js', 'text/javascript; charset=utf-8'], // sharing sound without MediaStreamTrackProcessor
+  '/room-key.js': ['room-key.js', 'text/javascript; charset=utf-8'], // the room's own key in the link (end to end)
   // our C/C++ code as WebAssembly: X25519, an Opus decoder (native/web)
   '/ss-web.js': ['ss-web.js', 'text/javascript; charset=utf-8'],
   '/ss-web.wasm': ['ss-web.wasm', 'application/wasm'],

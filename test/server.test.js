@@ -72,7 +72,10 @@ test('serves the page with security headers', async () => {
   assert.match(res.headers.get('permissions-policy'), /display-capture=\(self\)/);
   assert.match(res.headers.get('permissions-policy'), /microphone=\(self\)/); // audio source picker
   assert.equal((await fetch(`http://${base}/app.js`)).status, 200);
-  for (const f of ['/direct-web.js', '/direct-audio.js', '/capture-audio.js', '/ss-web.js']) assert.equal((await fetch(`http://${base}${f}`)).status, 200, f);
+  for (const f of ['/direct-web.js', '/direct-audio.js', '/capture-audio.js', '/room-key.js', '/ss-web.js']) assert.equal((await fetch(`http://${base}${f}`)).status, 200, f);
+  // every script the page loads is served
+  const page = await (await fetch(`http://${base}/`)).text();
+  for (const [, src] of page.matchAll(/<script src="([^"]+)"/g)) assert.equal((await fetch(`http://${base}/${src}`)).status, 200, src);
   const wasm = await fetch(`http://${base}/ss-web.wasm`);
   assert.equal(wasm.headers.get('content-type'), 'application/wasm');
   assert.ok(WebAssembly.validate(new Uint8Array(await wasm.arrayBuffer())));
