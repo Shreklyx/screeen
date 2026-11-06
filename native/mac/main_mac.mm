@@ -66,13 +66,27 @@ struct Quality {
   int w, h, fps;
 };
 static const Quality kQualities[] = {
-    {"Automatikus", "A legszebb, amit a gép és a hálózat bír: akár 4K, 60 FPS.", 3840, 2160, 60},
-    {"1440p · 60 FPS", "2560×1440, 60 FPS.", 2560, 1440, 60},
-    {"1080p · 60 FPS", "1920×1080, 60 FPS.", 1920, 1080, 60},
-    {"1080p · 120 FPS", "1920×1080, 120 FPS – játékhoz, gyors mozgáshoz.", 1920, 1080, 120},
+    {"Automatikus", "A képernyő saját felbontása (akár 4K), 60 FPS – fix minőség, nem romlik.", 3840, 2160, 60},
+    {"4K · 60 FPS", "3840×2160, 60 FPS – kb. 80 Mbit/s.", 3840, 2160, 60},
+    {"4K · 120 FPS", "3840×2160, 120 FPS – ProMotion (120 Hz) kijelzőhöz, kb. 120 Mbit/s.", 3840, 2160, 120},
+    {"1440p · 60 FPS", "2560×1440, 60 FPS – kb. 35 Mbit/s.", 2560, 1440, 60},
+    {"1440p · 120 FPS", "2560×1440, 120 FPS – kb. 70 Mbit/s.", 2560, 1440, 120},
+    {"1080p · 60 FPS", "1920×1080, 60 FPS – kb. 20 Mbit/s.", 1920, 1080, 60},
+    {"1080p · 120 FPS", "1920×1080, 120 FPS – játékhoz, gyors mozgáshoz, kb. 40 Mbit/s.", 1920, 1080, 120},
     {"720p · 60 FPS", "1280×720, 60 FPS – gyenge internetre.", 1280, 720, 60},
     {"Eredeti", "A képernyő saját felbontása, 60 FPS.", 0, 0, 60},
 };
+// (the list before 4K and 1440p at 120: its saved place → the same choice in this one)
+static const int kOldQuality[] = {0, 3, 5, 6, 7, 8};
+
+/** The quality chosen last (saved as "quality2"; the older list's place moved over). */
+static NSInteger savedQuality() {
+  NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
+  NSInteger n = NSInteger(std::size(kQualities));
+  if ([ud objectForKey:@"quality2"]) return std::min(std::max<NSInteger>([ud integerForKey:@"quality2"], 0), n - 1);
+  NSInteger old = std::min(std::max<NSInteger>([ud integerForKey:@"quality"], 0), NSInteger(std::size(kOldQuality)) - 1);
+  return kOldQuality[old];
+}
 
 /* ------------------------------------------------ the password in the Keychain */
 
@@ -1145,7 +1159,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   [_displayPopup selectItemAtIndex:0];
   _qualityPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
   for (const Quality& q : kQualities) [_qualityPopup addItemWithTitle:@(q.name)];
-  [_qualityPopup selectItemAtIndex:std::min<NSInteger>(std::max<NSInteger>([ud integerForKey:@"quality"], 0), NSInteger(std::size(kQualities)) - 1)];
+  [_qualityPopup selectItemAtIndex:savedQuality()];
   _qualityPopup.target = self;
   _qualityPopup.action = @selector(qualityChanged);
   _audio = makeSwitch(!([ud objectForKey:@"audio"] && ![ud boolForKey:@"audio"]));
@@ -1653,7 +1667,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   NSInteger quality = std::max<NSInteger>(_qualityPopup.indexOfSelectedItem, 0);
   NSInteger monitor = std::max<NSInteger>(_displayPopup.indexOfSelectedItem, 0);
   NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
-  [ud setInteger:quality forKey:@"quality"];
+  [ud setInteger:quality forKey:@"quality2"];
   [ud setBool:_audio.state == NSControlStateValueOn forKey:@"audio"];
   [ud setBool:_remember.state == NSControlStateValueOn forKey:@"rememberPassword"];
   // into the keychain once the server took it (a mistyped one is not remembered), only when it changes

@@ -1151,6 +1151,9 @@ async function configureDirectEncoder(pipe, want) {
     }
   };
   let config = { ...want, hardwareAcceleration: 'prefer-hardware' };
+  // 4K 120 is more macroblocks a second than level 5.2's 2 073 600: level 6.0 where the encoder knows it
+  const mbs = Math.ceil(want.width / 16) * Math.ceil(want.height / 16) * want.framerate;
+  if (mbs > 2073600 && (await supported({ ...config, codec: 'avc1.64003C' }))) config.codec = 'avc1.64003C';
   const hw = direct.hw !== false && (await supported(config));
   if (!hw) {
     // no GPU encoder: the processor manages at most 1080p 30 without falling behind

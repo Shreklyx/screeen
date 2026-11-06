@@ -115,13 +115,18 @@ struct Quality {
   int w, h, fps;
 };
 const Quality kQualities[] = {
-    {L"Automatikus", L"A legszebb, amit a gép és a hálózat bír: akár 4K, 60 FPS.", 3840, 2160, 60},
-    {L"1440p · 60 FPS", L"2560×1440, 60 FPS.", 2560, 1440, 60},
-    {L"1080p · 60 FPS", L"1920×1080, 60 FPS.", 1920, 1080, 60},
-    {L"1080p · 120 FPS", L"1920×1080, 120 FPS – játékhoz, gyors mozgáshoz.", 1920, 1080, 120},
+    {L"Automatikus", L"A képernyő saját felbontása (akár 4K), 60 FPS – fix minőség, nem romlik.", 3840, 2160, 60},
+    {L"4K · 60 FPS", L"3840×2160, 60 FPS – kb. 80 Mbit/s.", 3840, 2160, 60},
+    {L"4K · 120 FPS", L"3840×2160, 120 FPS – 120 Hz-es kijelzőhöz, kb. 120 Mbit/s.", 3840, 2160, 120},
+    {L"1440p · 60 FPS", L"2560×1440, 60 FPS – kb. 35 Mbit/s.", 2560, 1440, 60},
+    {L"1440p · 120 FPS", L"2560×1440, 120 FPS – kb. 70 Mbit/s.", 2560, 1440, 120},
+    {L"1080p · 60 FPS", L"1920×1080, 60 FPS – kb. 20 Mbit/s.", 1920, 1080, 60},
+    {L"1080p · 120 FPS", L"1920×1080, 120 FPS – játékhoz, gyors mozgáshoz, kb. 40 Mbit/s.", 1920, 1080, 120},
     {L"720p · 60 FPS", L"1280×720, 60 FPS – gyenge internetre.", 1280, 720, 60},
     {L"Eredeti", L"A képernyő saját felbontása, 60 FPS.", 0, 0, 60},
 };
+// (the list before 4K and 1440p at 120: its saved place → the same choice in this one)
+const int kOldQuality[] = {0, 3, 5, 6, 7, 8};
 
 struct Hit {
   Rect r;
@@ -1347,7 +1352,7 @@ void openMenu(int id) {
   DestroyMenu(m);
   if (cmd >= kMenuQuality0 && cmd < kMenuQuality0 + std::size(kQualities)) {
     g.quality = int(cmd - kMenuQuality0);
-    saveDword(L"Quality", DWORD(g.quality));
+    saveDword(L"Quality2", DWORD(g.quality));
   } else if (cmd >= kMenuMonitor0 && cmd < kMenuMonitor0 + g.monitors.size()) {
     g.monitor = int(cmd - kMenuMonitor0);
     saveDword(L"Monitor", DWORD(g.monitor));
@@ -1596,7 +1601,7 @@ void startSharing(const std::string& resumeCode = "", const std::string& resumeT
     setError(g.shareErr, L"Nem találok képernyőt.", "shareErr");
     return;
   }
-  saveDword(L"Quality", DWORD(g.quality));
+  saveDword(L"Quality2", DWORD(g.quality));
   saveDword(L"Monitor", DWORD(g.monitor));
   saveDword(L"Audio", g.audio);
   saveDword(L"Remember", g.remember);
@@ -2246,7 +2251,8 @@ void createControls() {
   g.video = CreateWindowExW(0, L"SSVideo", L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, g.wnd, nullptr, g.inst, nullptr);
   g.remember = loadDword(L"Remember", 1) != 0; // (on unless turned off, as on the Mac)
   g.audio = loadDword(L"Audio", 1) != 0;
-  g.quality = int(std::min<DWORD>(loadDword(L"Quality", 0), DWORD(std::size(kQualities) - 1)));
+  DWORD old = std::min<DWORD>(loadDword(L"Quality", 0), DWORD(std::size(kOldQuality) - 1));
+  g.quality = int(std::min<DWORD>(loadDword(L"Quality2", DWORD(kOldQuality[old])), DWORD(std::size(kQualities) - 1)));
   g.monitors = listMonitors();
   g.monitor = int(std::min<DWORD>(loadDword(L"Monitor", 0), DWORD(g.monitors.empty() ? 0 : g.monitors.size() - 1)));
   g.volume = float(std::min<DWORD>(loadDword(L"Volume", 100), 100)) / 100.0f;

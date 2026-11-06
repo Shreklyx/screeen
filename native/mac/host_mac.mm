@@ -183,6 +183,8 @@ struct MacHost::Impl : MacHostImplBase, std::enable_shared_from_this<MacHost::Im
     set(kVTCompressionPropertyKey_AllowFrameReordering, @NO); // no B-frames
     set(kVTCompressionPropertyKey_MaxKeyFrameInterval, @(opts.fps * 600)); // keyframes when a viewer needs one
     set(kVTCompressionPropertyKey_ExpectedFrameRate, @(opts.fps));
+    // 120 FPS: the media engine's fastest way (each frame within its 8 ms; the bitrate keeps the quality)
+    if (opts.fps > 60) set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, @YES);
     set(kVTCompressionPropertyKey_AverageBitRate, @(int64_t(bitrate.load())));
     set(kVTCompressionPropertyKey_ColorPrimaries, (__bridge id)kCVImageBufferColorPrimaries_ITU_R_709_2);
     set(kVTCompressionPropertyKey_TransferFunction, (__bridge id)kCVImageBufferTransferFunction_ITU_R_709_2);

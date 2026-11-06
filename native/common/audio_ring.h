@@ -36,12 +36,12 @@ class AudioRing {
   std::vector<std::vector<float>> ring_;
   std::vector<OpusDecoder*> decoders_;
   long long read_, end_;
-  int target_ = 480;
+  int target_ = 240;
   long long calm_ = 0;   // samples played since it last ran dry
   long long since_ = -1; // samples since it ran dry (-1: long enough ago)
   long long dryLen_ = 0; // for how long it was dry
   long long dryEnd_ = 0; // where the sound ended then
-  int dryTarget_ = 480;  // the wait then
+  int dryTarget_ = 240;  // the wait then
   int behind_ = 0;       // packets far too late in a row
   long long low_ = 0, lowFor_ = 0; // the lowest the buffer got in this window
   std::atomic<float> volume_{1.0f};

@@ -31,7 +31,7 @@ void AudioRing::configure(int ch) {
   channels_ = ch;
   ring_.assign(size_t(ch), std::vector<float>(kRing, 0.0f));
   read_ = end_ = LLONG_MIN;
-  target_ = 480; // 10 ms to start with
+  target_ = kMinTarget; // the least to start with: it grows only if the network makes it run dry
   calm_ = 0;
   since_ = -1;
   dryLen_ = dryEnd_ = 0;

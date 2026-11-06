@@ -25,7 +25,7 @@ class DirectAudio extends AudioWorkletProcessor {
     this.ring = Array.from({ length: this.channels }, () => new Float32Array(SIZE));
     this.read = null; // absolute sample index of the next output sample
     this.end = -Infinity; // one past the newest written sample
-    this.target = 480; // 10 ms to start with
+    this.target = MIN_TARGET; // the least to start with: it grows only if the network makes it run dry
     this.calm = 0; // samples played since the last underrun
     this.since = -1; // samples since it ran dry (-1: long enough ago)
     this.dryLen = 0; // for how long it was dry
