@@ -72,7 +72,8 @@ struct Offer {
   static Offer fromJson(const Json& j);
 };
 
-extern const char* const kAes128Gcm;        // "aes-128-gcm": the apps' first choice (AES instructions)
+extern const char* const kAegis128L;        // "aegis-128l": between two apps with AES instructions (fastest)
+extern const char* const kAes128Gcm;        // "aes-128-gcm": what every side has (an older app: only this)
 extern const char* const kChaCha20Poly1305; // "chacha20-poly1305": a browser's (no AES instructions there)
 
 struct MediaMeta {
@@ -159,10 +160,9 @@ class DirectEndpoint {
   void ensureTurn(const TurnInfo& info, std::function<void()> done);
   void openTcp(Peer& p);
   void setState(Peer& p, const std::string& state, const Json& diag = Json());
-  /** The AEADs this side offers: AES-128-GCM first (the CPU's AES instructions), ChaCha20-Poly1305 too. */
-  std::vector<std::string> aeadList() const {
-    return preferChaCha ? std::vector<std::string>{kChaCha20Poly1305, kAes128Gcm} : std::vector<std::string>{kAes128Gcm, kChaCha20Poly1305};
-  }
+  /** The AEADs this side offers, the fastest here first: with the CPU's AES instructions AEGIS-128L, without
+   *  them (or as a browser, in the tests) ChaCha20-Poly1305. */
+  std::vector<std::string> aeadList() const;
   void startProbing(Peer& p, double ms);
   void probe(Peer& p, double t);
   void onProbeAck(Peer& p, const uint8_t* body, size_t n, const Rinfo& from);
@@ -217,10 +217,11 @@ struct Keys {
   std::array<uint8_t, 32> toViewer{}; // (AES-128-GCM: the first 16 bytes)
   std::array<uint8_t, 32> toHost{};
 };
-/** ChaCha20-Poly1305 when both sides have it and one prefers it (a browser), else AES-128-GCM – the same
- *  answer on both sides. */
-bool useChaCha(const std::vector<std::string>& mine, const std::vector<std::string>& theirs);
-bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk = Bytes(), bool chacha = false);
+/** The cipher both sides use (the same answer on both): ChaCha20-Poly1305 when both have it and one prefers
+ *  it (a browser, or a CPU without AES instructions); else AEGIS-128L when both have it (two apps); else
+ *  AES-128-GCM (an older side). */
+const char* chooseAead(const std::vector<std::string>& mine, const std::vector<std::string>& theirs);
+bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk = Bytes(), const std::string& aead = kAes128Gcm);
 Bytes seal(Aead& key, uint8_t dir, uint8_t type, uint32_t session, uint64_t counter, const uint8_t* payload, size_t n);
 bool unseal(Aead& key, uint8_t dir, const uint8_t* packet, size_t n, Bytes& body);
 Bytes registration(int role, uint32_t session, const Bytes& secret);

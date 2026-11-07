@@ -9,6 +9,7 @@
 
 #include "clock.h"
 #include "crypto.h"
+#include "crypto_core.h"
 #include "direct.h"
 #include "engine.h"
 #include "json.h"
@@ -63,15 +64,28 @@ static void packetTests() {
   direct_detail::Keys ph, pv, po;
   CHECK(direct_detail::deriveKeys(h, vp, 42, ph, psk) && direct_detail::deriveKeys(v, hp, 42, pv, psk) && ph.toViewer == pv.toViewer && ph.toHost == pv.toHost, "with the room's key: both sides the same keys");
   CHECK(direct_detail::deriveKeys(v, hp, 42, po, other) && po.toViewer != ph.toViewer && ph.toViewer != kh.toViewer, "another room key (or none): other keys");
-  // the cipher: ChaCha20-Poly1305 when both have it and one prefers it (a browser), else AES-128-GCM
-  const std::vector<std::string> app = {kAes128Gcm, kChaCha20Poly1305}, web = {kChaCha20Poly1305, kAes128Gcm}, old;
-  CHECK(!direct_detail::useChaCha(app, app) && direct_detail::useChaCha(app, web) && direct_detail::useChaCha(web, app) && direct_detail::useChaCha(web, web),
-        "the cipher: AES-128-GCM between two apps, ChaCha20-Poly1305 with a browser");
-  CHECK(!direct_detail::useChaCha(app, old) && !direct_detail::useChaCha(web, old) && !direct_detail::useChaCha(old, web), "an older side (no list): AES-128-GCM");
-  direct_detail::Keys ch, cv;
-  CHECK(direct_detail::deriveKeys(h, vp, 42, ch, psk, true) && direct_detail::deriveKeys(v, hp, 42, cv, psk, true) && ch.toViewer == cv.toViewer && ch.toHost == cv.toHost &&
-            !std::equal(ch.toViewer.begin(), ch.toViewer.begin() + 16, ph.toViewer.begin()),
+  // the cipher: AEGIS-128L between two apps (with AES instructions), ChaCha20-Poly1305 with a browser (or a
+  // CPU without them), AES-128-GCM with an older side – the same answer on both sides
+  using direct_detail::chooseAead;
+  const std::vector<std::string> app = {kAegis128L, kAes128Gcm, kChaCha20Poly1305}, web = {kChaCha20Poly1305, kAes128Gcm}, slowCpu = web,
+                                 lastVersion = {kAes128Gcm, kChaCha20Poly1305}, older;
+  auto both = [&](const std::vector<std::string>& a, const std::vector<std::string>& b, const char* want) {
+    return std::string(chooseAead(a, b)) == want && std::string(chooseAead(b, a)) == want;
+  };
+  CHECK(both(app, app, kAegis128L) && both(app, web, kChaCha20Poly1305) && both(web, web, kChaCha20Poly1305) && both(app, slowCpu, kChaCha20Poly1305),
+        "the cipher: AEGIS-128L between two apps, ChaCha20-Poly1305 with a browser or a CPU without AES");
+  CHECK(both(app, lastVersion, kAes128Gcm) && both(app, older, kAes128Gcm) && both(web, older, kAes128Gcm), "an older app: AES-128-GCM");
+  direct_detail::Keys ch, cv, ah, av;
+  CHECK(direct_detail::deriveKeys(h, vp, 42, ch, psk, kChaCha20Poly1305) && direct_detail::deriveKeys(v, hp, 42, cv, psk, kChaCha20Poly1305) && ch.toViewer == cv.toViewer &&
+            ch.toHost == cv.toHost && !std::equal(ch.toViewer.begin(), ch.toViewer.begin() + 16, ph.toViewer.begin()),
         "ChaCha20-Poly1305's keys: the same on both sides, 32 bytes, not AES's");
+  CHECK(direct_detail::deriveKeys(h, vp, 42, ah, psk, kAegis128L) && direct_detail::deriveKeys(v, hp, 42, av, psk, kAegis128L) && ah.toViewer == av.toViewer && ah.toHost == av.toHost &&
+            !std::equal(ah.toViewer.begin(), ah.toViewer.begin() + 16, ph.toViewer.begin()) && !std::equal(ah.toViewer.begin(), ah.toViewer.begin() + 16, ch.toViewer.begin()),
+        "AEGIS-128L's keys: the same on both sides, its own");
+  Aegis128L asend(ah.toViewer.data()), arecv(av.toViewer.data()), awrong(av.toHost.data());
+  packet = direct_detail::seal(asend, 1, 3, 42, 9, reinterpret_cast<const uint8_t*>(msg), 5);
+  CHECK(direct_detail::unseal(arecv, 1, packet.data(), packet.size(), body) && std::string(body.begin(), body.end()) == "frame" && !direct_detail::unseal(awrong, 1, packet.data(), packet.size(), body),
+        "AEGIS-128L packets: open with the right key only");
   ChaCha20Poly1305 csend(ch.toViewer.data()), crecv(cv.toViewer.data()), cwrong(cv.toHost.data());
   packet = direct_detail::seal(csend, 1, 3, 42, 8, reinterpret_cast<const uint8_t*>(msg), 5);
   CHECK(direct_detail::unseal(crecv, 1, packet.data(), packet.size(), body) && std::string(body.begin(), body.end()) == "frame" && !direct_detail::unseal(cwrong, 1, packet.data(), packet.size(), body),
@@ -156,7 +170,7 @@ static void endpointTest(bool lossy, bool chacha = false) {
     cv.wait_for(l, std::chrono::seconds(8), [&] { return hostState.rfind("connected", 0) == 0 && viewState == "connected"; });
   }
   CHECK(ready && hostState.rfind("connected", 0) == 0 && viewState == "connected", ("endpoints connect (" + hostState + ")").c_str());
-  const std::string want = chacha ? kChaCha20Poly1305 : kAes128Gcm;
+  const std::string want = chacha || !crypto::hasAesInstructions() ? kChaCha20Poly1305 : kAegis128L;
   CHECK(hostAead == want && viewAead == want, ("both use " + want).c_str());
   // 30 frames of ~5 packets each
   loop.post([&] {

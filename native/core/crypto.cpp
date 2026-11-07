@@ -82,6 +82,24 @@ bool AesGcm::open(const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8
   return crypto::gcmOpen(impl_->g, iv, aad, aadLen, data, n, tag);
 }
 
+/* ------------------------------------------------ AEGIS-128L */
+
+Aegis128L::Aegis128L(const uint8_t key[16]) { std::memcpy(key_, key, 16); }
+
+Aegis128L::~Aegis128L() { crypto::wipe(key_, sizeof key_); }
+
+void Aegis128L::seal(const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, uint8_t tag[16]) {
+  uint8_t nonce[16] = {0};
+  std::memcpy(nonce, iv, 12);
+  crypto::aegisSeal(key_, nonce, aad, aadLen, data, n, tag);
+}
+
+bool Aegis128L::open(const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, const uint8_t tag[16]) {
+  uint8_t nonce[16] = {0};
+  std::memcpy(nonce, iv, 12);
+  return crypto::aegisOpen(key_, nonce, aad, aadLen, data, n, tag);
+}
+
 /* ------------------------------------------------ ChaCha20-Poly1305 */
 
 ChaCha20Poly1305::ChaCha20Poly1305(const uint8_t key[32]) { std::memcpy(key_, key, 32); }

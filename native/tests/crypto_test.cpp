@@ -2,6 +2,7 @@
 // values computed apart from our code (Python's hashlib / hmac and OpenSSL, through the cryptography package):
 //   SHA-256, SHA-1 (FIPS 180-4) · MD5 (RFC 1321) · HMAC (RFC 4231, RFC 2202) · HKDF (RFC 5869)
 //   X25519 (RFC 7748) · AES-128-GCM (the GCM specification's test cases, McGrew & Viega) · scrypt (RFC 7914)
+//   ChaCha20-Poly1305 (RFC 8439) · AEGIS-128L (RFC 10032)
 // Built twice: crypto_test runs on this CPU's AES and carry-less multiply instructions, crypto_portable_test
 // on the portable code – the same answers from both. "--expect hardware" / "--expect portable" also checks
 // which one ran (CI: the fast one must be the one in use).
@@ -316,6 +317,51 @@ static void chachaTests() {
   CHECK(roundTrip, "ChaCha20-Poly1305: all of them open again");
 }
 
+/** AEGIS-128L (between two apps): RFC 10032's vectors – the valid ones, and the four that must not open. */
+static void aegisTests() {
+  struct V {
+    const char *key, *nonce, *ad, *msg, *ct, *tag;
+  } v[] = {
+      {"10010000000000000000000000000000", "10000200000000000000000000000000", "", "00000000000000000000000000000000", "c1c0e58bd913006feba00f4b3cc3594e", "abe0ece80c24868a226a35d16bdae37a"},
+      {"10010000000000000000000000000000", "10000200000000000000000000000000", "", "", "", "c2b879a67def9d74e6c14f708bbcc9b4"},
+      {"10010000000000000000000000000000", "10000200000000000000000000000000", "0001020304050607", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+       "79d94593d8c2119d7e8fd9b8fc77845c5c077a05b2528b6ac54b563aed8efe84", "cc6f3372f6aa1bb82388d695c3962d9a"},
+      {"10010000000000000000000000000000", "10000200000000000000000000000000", "0001020304050607", "000102030405060708090a0b0c0d", "79d94593d8c2119d7e8fd9b8fc77", "5c04b3dba849b2701effbe32c7f0fab7"},
+      {"10010000000000000000000000000000", "10000200000000000000000000000000", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829",
+       "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031323334353637", "b31052ad1cca4e291abcf2df3502e6bdb1bfd6db36798be3607b1f94d34478aa7ede7f7a990fec10",
+       "7542a745733014f9474417b337399507"},
+  };
+  int n = 1;
+  for (const V& t : v) {
+    Bytes key = hex(t.key), nonce = hex(t.nonce), ad = hex(t.ad), msg = hex(t.msg), data = msg;
+    uint8_t tag[16];
+    crypto::aegisSeal(key.data(), nonce.data(), ad.data(), ad.size(), data.data(), data.size(), tag);
+    bool sealed = hexOf(data) == t.ct && hexOf(tag, 16) == t.tag;
+    bool opens = crypto::aegisOpen(key.data(), nonce.data(), ad.data(), ad.size(), data.data(), data.size(), tag) && data == msg;
+    CHECK(sealed && opens, ("AEGIS-128L RFC 10032 test vector " + std::to_string(n++)).c_str());
+  }
+  Bytes k = hex("10010000000000000000000000000000"), nonce = hex("10000200000000000000000000000000"), ad = hex("0001020304050607"), ct = hex("79d94593d8c2119d7e8fd9b8fc77"),
+        tag = hex("5c04b3dba849b2701effbe32c7f0fab7");
+  auto opens = [&](const Bytes& key, const Bytes& non, const Bytes& a, Bytes c, const Bytes& t) { return crypto::aegisOpen(key.data(), non.data(), a.data(), a.size(), c.data(), c.size(), t.data()); };
+  CHECK(!opens(nonce, k, ad, ct, tag) && !opens(k, nonce, ad, hex("79d94593d8c2119d7e8fd9b8fc78"), tag) && !opens(k, nonce, hex("0001020304050608"), ct, tag) &&
+            !opens(k, nonce, ad, ct, hex("6c04b3dba849b2701effbe32c7f0fab8")) && opens(k, nonce, ad, ct, tag),
+        "AEGIS-128L RFC 10032 test vectors 6-9: refused");
+  // the class (a 12-byte iv: the nonce with four zero bytes after it): every length opens again, a change is refused
+  Aegis128L a(k.data());
+  bool all = true;
+  for (size_t len : {0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1200, 4103}) {
+    uint8_t iv[12] = {1, 2, 3}, t[16];
+    Bytes p = pattern(len, 31, 11), d = p, h = pattern(14, 7, 3);
+    a.seal(iv, h.data(), h.size(), d.data(), len, t);
+    all &= a.open(iv, h.data(), h.size(), d.data(), len, t) && d == p;
+    if (len) {
+      d[len / 2] ^= 1;
+      all &= !a.open(iv, h.data(), h.size(), d.data(), len, t);
+    }
+  }
+  CHECK(all, "AEGIS-128L: every length opens again, a changed byte is refused");
+}
+
 /** scrypt (the server's password hashes): RFC 7914's vectors, and more as OpenSSL makes them. */
 static void scryptTests() {
   auto run = [](const char* pass, const char* salt, uint64_t N, uint32_t r, uint32_t p) {
@@ -361,8 +407,10 @@ static double speedOf(Aead& a) {
 static void speed() {
   uint8_t key[32] = {7};
   AesGcm g(key);
+  Aegis128L a(key);
   ChaCha20Poly1305 c(key);
   std::printf("     AES-128-GCM: %.0f MB/s on 1200-byte packets (%s)\n", speedOf(g), cryptoEngine());
+  std::printf("     AEGIS-128L: %.0f MB/s on 1200-byte packets\n", speedOf(a));
   std::printf("     ChaCha20-Poly1305: %.0f MB/s on 1200-byte packets\n", speedOf(c));
 }
 
@@ -378,6 +426,7 @@ int main(int argc, char** argv) {
   x25519();
   gcm();
   chachaTests();
+  aegisTests();
   scryptTests();
   speed();
   std::printf(failures ? "%d FAILED\n" : "ALL PASS\n", failures);

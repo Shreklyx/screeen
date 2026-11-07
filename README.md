@@ -218,9 +218,10 @@ lehető legrövidebb úton:
 - a titkosítás **mindenhol saját kód** (`native/core/crypto_core.cpp`) – az alkalmazásokban, a weboldalon
   (ugyanez a C++ kód WebAssemblyként) és a szerveren is –, könyvtár nélkül, de szabványos algoritmusokkal (X25519,
   HKDF-SHA256, AES-128-GCM, HMAC, a szerver jelszavaihoz scrypt – saját titkosító algoritmust kitalálni nem
-  biztonságos). Az alkalmazásokban a processzor AES-utasításain fut (x86: AES-NI + PCLMULQDQ, Apple Silicon: ARMv8
-  AES + PMULL), egyszerre nyolc blokkal: egy mag több GB/s-ot titkosít, a csomagonkénti költség mikroszekundum
-  alatti. Ahol nincs AES-utasítás (régi processzor), állandó idejű (a kulcsot az időzítésen sem eláruló) kód fut,
+  biztonságos). **Két alkalmazás között AEGIS-128L** (RFC 10032 – a CAESAR-verseny győztese): az AES körfüggvényére
+  épül, a processzor AES-utasításain fut (x86: AES-NI, Apple Silicon: ARMv8 AES), és kb. 1,6–2×-ese az AES-GCM
+  sebességének – egy mag ~6–7 GB/s; egy régebbi alkalmazással AES-128-GCM (egyszerre nyolc blokk, AES-NI +
+  PCLMULQDQ / ARMv8 AES + PMULL). Ahol nincs AES-utasítás (régi processzor), állandó idejű (a kulcsot az időzítésen sem eláruló) kód fut,
   SIMD-del nyolc blokk egyszerre. **Böngészővel** a kapcsolat ChaCha20-Poly1305-öt használ (RFC 8439 – a két fél
   egyezteti; két alkalmazás között AES-128-GCM marad): a WebAssemblynek nincs AES-utasítása, a ChaCha20 viszont
   szoftverben is gyors – a saját kódunk a böngészőben ~550–670 MB/s, gyorsabb a böngésző beépített AES-ének

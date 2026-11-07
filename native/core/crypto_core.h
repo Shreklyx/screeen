@@ -41,6 +41,13 @@ bool gcmOpen(const Gcm& g, const uint8_t iv[12], const uint8_t* aad, size_t aadL
 void chachaSeal(const uint8_t key[32], const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, uint8_t tag[16]);
 bool chachaOpen(const uint8_t key[32], const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, const uint8_t tag[16]);
 
+/** AEGIS-128L (RFC 10032): a 16-byte key and nonce, a 16-byte tag; data en- / decrypted in place (open:
+ *  false, and data wiped, when the tag does not match). Fast on the CPU's AES instructions. */
+void aegisSeal(const uint8_t key[16], const uint8_t nonce[16], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, uint8_t tag[16]);
+bool aegisOpen(const uint8_t key[16], const uint8_t nonce[16], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, const uint8_t tag[16]);
+/** Whether this CPU has AES instructions (otherwise AES and AEGIS run in software). */
+bool hasAesInstructions();
+
 /** What runs AES and GHASH here: "x86 AES-NI + PCLMULQDQ", "ARMv8 AES + PMULL" or "portable". */
 const char* engineName();
 /** Zeros the compiler keeps (a key out of memory). */

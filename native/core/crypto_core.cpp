@@ -1373,6 +1373,171 @@ void chachaTag(const uint32_t state[16], const uint8_t* aad, size_t aadLen, cons
   wipe(&mac, sizeof mac);
 }
 
+/* ------------------------------------------------ AEGIS-128L (RFC 10032) */
+
+// Between two apps: an AEAD built on the AES round itself (eight blocks of state, one AES round on each per
+// 32 bytes, no GHASH) – about twice as fast as AES-GCM on the CPU's AES instructions; the CAESAR competition's
+// choice for speed, now RFC 10032. A 128-bit key and nonce, a 128-bit tag. (Where there are no AES
+// instructions the apps do not offer it: the same rounds in software are slower than ChaCha20.)
+const uint8_t kAegisC0[16] = {0x00, 0x01, 0x01, 0x02, 0x03, 0x05, 0x08, 0x0d, 0x15, 0x22, 0x37, 0x59, 0x90, 0xe9, 0x79, 0x62};
+const uint8_t kAegisC1[16] = {0xdb, 0x3d, 0x18, 0x55, 0x6d, 0xc2, 0x2f, 0xf1, 0x20, 0x11, 0x31, 0x42, 0x73, 0xb5, 0x28, 0xdd};
+
+/** The lengths block: LE64(ad bits) || LE64(message bits). */
+inline void aegisLengths(uint8_t out[16], size_t aadLen, size_t n) {
+  for (int i = 0; i < 8; i++) {
+    out[i] = uint8_t((uint64_t(aadLen) * 8) >> (8 * i));
+    out[8 + i] = uint8_t((uint64_t(n) * 8) >> (8 * i));
+  }
+}
+
+/** AEGIS-128L over any 128-bit block type B with the AES round R(in, rk) = MixColumns(ShiftRows(SubBytes(in))) ⊕ rk:
+ *  one pass – encrypt, or decrypt (then data is the ciphertext, and comes out decrypted). */
+template <typename Ops>
+void aegisRun(const uint8_t key[16], const uint8_t nonce[16], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, bool encrypt, uint8_t tag[16]) {
+  typedef typename Ops::B B;
+  const B k = Ops::load(key), nv = Ops::load(nonce), c0 = Ops::load(kAegisC0), c1 = Ops::load(kAegisC1);
+  B s[8] = {Ops::x(k, nv), c1, c0, c1, Ops::x(k, nv), Ops::x(k, c0), Ops::x(k, c1), Ops::x(k, c0)};
+  for (int i = 0; i < 10; i++) Ops::update(s, nv, k);
+  uint8_t buf[32];
+  for (size_t i = 0; i < aadLen; i += 32) {
+    if (aadLen - i >= 32) {
+      Ops::update(s, Ops::load(aad + i), Ops::load(aad + i + 16));
+    } else {
+      memset(buf, 0, 32);
+      memcpy(buf, aad + i, aadLen - i);
+      Ops::update(s, Ops::load(buf), Ops::load(buf + 16));
+    }
+  }
+  for (size_t i = 0; i < n; i += 32) {
+    const B z0 = Ops::x(Ops::x(s[1], s[6]), Ops::a(s[2], s[3])), z1 = Ops::x(Ops::x(s[2], s[5]), Ops::a(s[6], s[7]));
+    const size_t len = n - i < 32 ? n - i : 32;
+    uint8_t* d = data + i;
+    if (len == 32) {
+      const B t0 = Ops::load(d), t1 = Ops::load(d + 16), o0 = Ops::x(t0, z0), o1 = Ops::x(t1, z1);
+      Ops::store(d, o0);
+      Ops::store(d + 16, o1);
+      if (encrypt) Ops::update(s, t0, t1); // (the state takes the plaintext)
+      else Ops::update(s, o0, o1);
+    } else {
+      memset(buf, 0, 32);
+      memcpy(buf, d, len);
+      const B t0 = Ops::load(buf), t1 = Ops::load(buf + 16);
+      Ops::store(buf, Ops::x(t0, z0));
+      Ops::store(buf + 16, Ops::x(t1, z1));
+      memcpy(d, buf, len);
+      if (!encrypt) { // DecPartial: the plaintext, padded with zeros
+        memset(buf, 0, 32);
+        memcpy(buf, d, len);
+        Ops::update(s, Ops::load(buf), Ops::load(buf + 16));
+      } else {
+        Ops::update(s, t0, t1);
+      }
+    }
+  }
+  aegisLengths(buf, aadLen, n);
+  const B t = Ops::x(s[2], Ops::load(buf));
+  for (int i = 0; i < 7; i++) Ops::update(s, t, t);
+  Ops::store(tag, Ops::x(Ops::x(Ops::x(s[0], s[1]), Ops::x(s[2], s[3])), Ops::x(Ops::x(s[4], s[5]), s[6])));
+  wipe(buf, sizeof buf);
+  wipe(s, sizeof s);
+}
+
+/** The portable blocks: 16 bytes; the eight rounds of an update at once, bitsliced (constant time). */
+struct AegisSoft {
+  struct B {
+    uint8_t b[16];
+  };
+  static B load(const uint8_t* p) {
+    B v;
+    memcpy(v.b, p, 16);
+    return v;
+  }
+  static void store(uint8_t* p, const B& v) { memcpy(p, v.b, 16); }
+  static B x(const B& a, const B& c) {
+    B v;
+    for (int i = 0; i < 16; i++) v.b[i] = uint8_t(a.b[i] ^ c.b[i]);
+    return v;
+  }
+  static B a(const B& p, const B& q) {
+    B v;
+    for (int i = 0; i < 16; i++) v.b[i] = uint8_t(p.b[i] & q.b[i]);
+    return v;
+  }
+  static void update(B s[8], const B& m0, const B& m1) {
+    uint8_t in[128], out[128];
+    for (int i = 0; i < 8; i++) memcpy(in + 16 * i, s[(i + 7) & 7].b, 16); // block i: AESRound(S(i−1), …)
+    for (int h = 0; h < 128; h += 64) {
+      Planes p;
+      toPlanes(in + h, p);
+      subBytes(p);
+      shiftRows(p);
+      mixColumns(p);
+      fromPlanes(p, out + h);
+    }
+    for (int i = 0; i < 8; i++)
+      for (int j = 0; j < 16; j++) s[i].b[j] = uint8_t(out[16 * i + j] ^ s[i].b[j] ^ (i == 0 ? m0.b[j] : i == 4 ? m1.b[j] : 0));
+    wipe(in, sizeof in);
+    wipe(out, sizeof out);
+  }
+};
+
+#if SS_X86
+struct AegisX86 {
+  typedef __m128i B;
+  SS_X86_FN static B load(const uint8_t* p) { return loadX86(p); }
+  SS_X86_FN static void store(uint8_t* p, B v) { storeX86(p, v); }
+  SS_X86_FN static B x(B p, B q) { return _mm_xor_si128(p, q); }
+  SS_X86_FN static B a(B p, B q) { return _mm_and_si128(p, q); }
+  SS_X86_FN static void update(B s[8], B m0, B m1) { // (AESENC is exactly AESRound)
+    const B t = s[7];
+    s[7] = _mm_aesenc_si128(s[6], s[7]);
+    s[6] = _mm_aesenc_si128(s[5], s[6]);
+    s[5] = _mm_aesenc_si128(s[4], s[5]);
+    s[4] = _mm_aesenc_si128(s[3], _mm_xor_si128(s[4], m1));
+    s[3] = _mm_aesenc_si128(s[2], s[3]);
+    s[2] = _mm_aesenc_si128(s[1], s[2]);
+    s[1] = _mm_aesenc_si128(s[0], s[1]);
+    s[0] = _mm_aesenc_si128(t, _mm_xor_si128(s[0], m0));
+  }
+};
+// (flatten: everything inlined into this function – which has the AES instructions – not called across)
+#ifdef _MSC_VER
+#define SS_FLATTEN
+#else
+#define SS_FLATTEN __attribute__((flatten))
+#endif
+SS_TARGET("aes,pclmul,ssse3") SS_FLATTEN
+void aegisX86(const uint8_t key[16], const uint8_t nonce[16], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, bool encrypt, uint8_t tag[16]) {
+  aegisRun<AegisX86>(key, nonce, aad, aadLen, data, n, encrypt, tag);
+}
+#endif
+
+#if SS_ARM
+struct AegisArm {
+  typedef uint8x16_t B;
+  static B load(const uint8_t* p) { return vld1q_u8(p); }
+  static void store(uint8_t* p, B v) { vst1q_u8(p, v); }
+  static B x(B p, B q) { return veorq_u8(p, q); }
+  static B a(B p, B q) { return vandq_u8(p, q); }
+  /** AESRound: AESE with a zero key is SubBytes and ShiftRows, AESMC the MixColumns. */
+  static B round(B in, B rk) { return veorq_u8(vaesmcq_u8(vaeseq_u8(in, vdupq_n_u8(0))), rk); }
+  static void update(B s[8], B m0, B m1) {
+    const B t = s[7];
+    s[7] = round(s[6], s[7]);
+    s[6] = round(s[5], s[6]);
+    s[5] = round(s[4], s[5]);
+    s[4] = round(s[3], veorq_u8(s[4], m1));
+    s[3] = round(s[2], s[3]);
+    s[2] = round(s[1], s[2]);
+    s[1] = round(s[0], s[1]);
+    s[0] = round(t, veorq_u8(s[0], m0));
+  }
+};
+#endif
+
+/** AEGIS-128L on what this CPU has. */
+void aegisRunHere(const uint8_t key[16], const uint8_t nonce[16], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, bool encrypt, uint8_t tag[16]);
+
 /* ------------------------------------------------ which code runs here */
 
 enum class Engine { Portable, X86, Arm };
@@ -1400,6 +1565,34 @@ Engine engine() {
 #endif
 }
 
+void aegisRunHere(const uint8_t key[16], const uint8_t nonce[16], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, bool encrypt, uint8_t tag[16]) {
+#if SS_X86
+  if (engine() == Engine::X86) return aegisX86(key, nonce, aad, aadLen, data, n, encrypt, tag);
+#endif
+#if SS_ARM
+  if (engine() == Engine::Arm) return aegisRun<AegisArm>(key, nonce, aad, aadLen, data, n, encrypt, tag);
+#endif
+  aegisRun<AegisSoft>(key, nonce, aad, aadLen, data, n, encrypt, tag);
+}
+}  // namespace
+
+void aegisSeal(const uint8_t key[16], const uint8_t nonce[16], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, uint8_t tag[16]) {
+  aegisRunHere(key, nonce, aad, aadLen, data, n, true, tag);
+}
+
+bool aegisOpen(const uint8_t key[16], const uint8_t nonce[16], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, const uint8_t tag[16]) {
+  uint8_t mine[16];
+  aegisRunHere(key, nonce, aad, aadLen, data, n, false, mine);
+  uint8_t diff = 0; // (compared in constant time)
+  for (int i = 0; i < 16; i++) diff |= uint8_t(mine[i] ^ tag[i]);
+  if (diff) wipe(data, n); // (nothing of a forged message is kept)
+  wipe(mine, sizeof mine);
+  return diff == 0;
+}
+
+bool hasAesInstructions() { return engine() != Engine::Portable; }
+
+namespace {
 }  // namespace
 
 void sha256(const uint8_t* data, size_t n, uint8_t out[32]) {

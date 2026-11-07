@@ -61,6 +61,21 @@ class AesGcm : public Aead {
   std::unique_ptr<Impl> impl_;
 };
 
+/** AEGIS-128L (RFC 10032), a 16-byte key: between two apps – on the CPU's AES instructions about twice as
+ *  fast as AES-GCM. (The 12-byte iv is its 16-byte nonce with four zero bytes after it.) */
+class Aegis128L : public Aead {
+ public:
+  explicit Aegis128L(const uint8_t key[16]);
+  ~Aegis128L() override;
+  Aegis128L(const Aegis128L&) = delete;
+  Aegis128L& operator=(const Aegis128L&) = delete;
+  void seal(const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, uint8_t tag[16]) override;
+  bool open(const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, const uint8_t tag[16]) override;
+
+ private:
+  uint8_t key_[16];
+};
+
 /** ChaCha20-Poly1305 (RFC 8439), a 32-byte key: with a browser – fast in software, where AES is not. */
 class ChaCha20Poly1305 : public Aead {
  public:

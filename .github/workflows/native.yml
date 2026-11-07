@@ -47,10 +47,10 @@ jobs:
         run: |
           PORT=8090 HOST_PASSWORD=ci DIRECT_PORT=3479 node server/server.js &
           sleep 2
-          # (udp-chacha, tcp-chacha: the viewer prefers ChaCha20-Poly1305, as a browser does – between two apps
-          # it is AES-128-GCM)
+          # (between two apps the cipher is AEGIS-128L; udp-chacha, tcp-chacha: the viewer prefers
+          # ChaCha20-Poly1305, as a browser does)
           for path in udp tcp udp-chacha tcp-chacha; do
-            flag=""; aead=aes-128-gcm
+            flag=""; aead=aegis-128l
             case "$path" in tcp*) flag="--tcp" ;; esac
             case "$path" in *chacha) flag="$flag --chacha"; aead=chacha20-poly1305 ;; esac
             build/ss-cli host --server http://127.0.0.1:8090 --password ci --h264 native/tests/data/test.h264 --seconds 12 --tone $flag > host.log &

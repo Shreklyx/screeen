@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "clock.h"
+#include "crypto_core.h"
 
 namespace ss {
 
@@ -28,6 +29,8 @@ const char* INFO = "screenshare-direct-v1";
 const char* INFO2 = "screenshare-direct-v2"; // (the room's own key mixed in)
 const char* INFO_CHACHA = "screenshare-direct-v1-chacha20"; // (ChaCha20-Poly1305's keys: 32 bytes each way)
 const char* INFO2_CHACHA = "screenshare-direct-v2-chacha20";
+const char* INFO_AEGIS = "screenshare-direct-v1-aegis128l"; // (AEGIS-128L's: 16 bytes each way)
+const char* INFO2_AEGIS = "screenshare-direct-v2-aegis128l";
 const double NaN = std::nan("");
 
 /** Parity for a frame's packets, a group of g at a time: each the XOR of the group's data (padded to
@@ -101,13 +104,16 @@ namespace direct_detail {
 // The keys from the key agreement – and, when both ends proved they hold the room's link, its own key
 // too (v2): a key the server never sees, so a server that put its own public key in between would not
 // have the keys even then.
-bool useChaCha(const std::vector<std::string>& mine, const std::vector<std::string>& theirs) {
-  auto has = [](const std::vector<std::string>& l) { return std::find(l.begin(), l.end(), kChaCha20Poly1305) != l.end(); };
-  auto first = [](const std::vector<std::string>& l) { return !l.empty() && l[0] == kChaCha20Poly1305; };
-  return has(mine) && has(theirs) && (first(mine) || first(theirs));
+const char* chooseAead(const std::vector<std::string>& mine, const std::vector<std::string>& theirs) {
+  auto has = [](const std::vector<std::string>& l, const char* name) { return std::find(l.begin(), l.end(), name) != l.end(); };
+  auto first = [](const std::vector<std::string>& l, const char* name) { return !l.empty() && l[0] == name; };
+  if (has(mine, kChaCha20Poly1305) && has(theirs, kChaCha20Poly1305) && (first(mine, kChaCha20Poly1305) || first(theirs, kChaCha20Poly1305))) return kChaCha20Poly1305;
+  if (has(mine, kAegis128L) && has(theirs, kAegis128L)) return kAegis128L;
+  return kAes128Gcm;
 }
 
-bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk, bool chacha) {
+bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk, const std::string& aead) {
+  const bool chacha = aead == kChaCha20Poly1305, aegis = aead == kAegis128L;
   if (peerPub.size() != 32) return false;
   uint8_t ikm[48];
   if (!mine.shared(peerPub.data(), ikm)) return false;
@@ -116,7 +122,8 @@ bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys
     std::memcpy(ikm + 32, psk.data(), 16);
     ikmLen = 48;
   }
-  const char* info = chacha ? (ikmLen == 48 ? INFO2_CHACHA : INFO_CHACHA) : (ikmLen == 48 ? INFO2 : INFO);
+  const bool v2 = ikmLen == 48;
+  const char* info = chacha ? (v2 ? INFO2_CHACHA : INFO_CHACHA) : aegis ? (v2 ? INFO2_AEGIS : INFO_AEGIS) : (v2 ? INFO2 : INFO);
   const size_t keyLen = chacha ? 32 : 16;
   uint8_t salt[4];
   putU32(salt, session);
@@ -186,8 +193,14 @@ bool validCandidate(const Json& c) {
 
 using namespace direct_detail;
 
+const char* const kAegis128L = "aegis-128l";
 const char* const kAes128Gcm = "aes-128-gcm";
 const char* const kChaCha20Poly1305 = "chacha20-poly1305";
+
+std::vector<std::string> DirectEndpoint::aeadList() const {
+  if (preferChaCha || !crypto::hasAesInstructions()) return {kChaCha20Poly1305, kAes128Gcm};
+  return {kAegis128L, kAes128Gcm, kChaCha20Poly1305};
+}
 
 Json Offer::toJson() const {
   Json c = Json::array();
@@ -797,22 +810,25 @@ void DirectEndpoint::connectPeer(const std::string& id, const Offer& other, cons
   if (it == peers_.end()) return;
   Peer& p = *it->second;
   Keys keys;
-  const bool chacha = useChaCha(aeadList(), other.aead); // (with a browser: ChaCha20-Poly1305)
-  if (!deriveKeys(p.kp, base64Decode(other.pub), p.session, keys, psk, chacha)) {
+  const std::string aead = chooseAead(aeadList(), other.aead); // (two apps: AEGIS-128L; with a browser: ChaCha20-Poly1305)
+  if (!deriveKeys(p.kp, base64Decode(other.pub), p.session, keys, psk, aead)) {
     setState(p, "failed");
     return;
   }
   bool host = role_ == Role::Host;
   const uint8_t* send = host ? keys.toViewer.data() : keys.toHost.data();
   const uint8_t* recv = host ? keys.toHost.data() : keys.toViewer.data();
-  if (chacha) {
+  if (aead == kChaCha20Poly1305) {
     p.sendKey.reset(new ChaCha20Poly1305(send));
     p.recvKey.reset(new ChaCha20Poly1305(recv));
+  } else if (aead == kAegis128L) {
+    p.sendKey.reset(new Aegis128L(send));
+    p.recvKey.reset(new Aegis128L(recv));
   } else {
     p.sendKey.reset(new AesGcm(send));
     p.recvKey.reset(new AesGcm(recv));
   }
-  p.aead = chacha ? kChaCha20Poly1305 : kAes128Gcm;
+  p.aead = aead;
   keys = Keys();
   p.tcpOnly = other.tcp; // a browser: only the WebSocket reaches it
   p.cands = other.cands;
