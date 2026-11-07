@@ -14,11 +14,8 @@
 
 #include "bytes.h"
 #include "clock.h"
+#include "crypto.h"
 #include "net.h"
-
-extern "C" {
-#include "bearssl.h"
-}
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -112,10 +109,7 @@ void serveEcho(Sock c, bool slowAcks) {
   size_t from = head.find_first_not_of(" \t", at + 18), to = head.find("\r\n", at);
   std::string key = head.substr(from, to - from) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
   uint8_t digest[20];
-  br_sha1_context sc;
-  br_sha1_init(&sc);
-  br_sha1_update(&sc, key.data(), key.size());
-  br_sha1_out(&sc, digest);
+  sha1(reinterpret_cast<const uint8_t*>(key.data()), key.size(), digest);
   std::string reply = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + base64Encode(digest, 20) + "\r\n\r\n";
   if (!writeAll(c, reinterpret_cast<const uint8_t*>(reply.data()), reply.size())) return;
   Bytes message;

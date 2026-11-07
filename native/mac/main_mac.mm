@@ -2599,7 +2599,6 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
   NSMutableDictionary* link = [small mutableCopy];
   link[NSLinkAttributeName] = [NSURL URLWithString:kSite];
   [credits appendAttributedString:[[NSAttributedString alloc] initWithString:@"mozizas.hu" attributes:link]];
-  [credits appendAttributedString:[[NSAttributedString alloc] initWithString:@"\nBearSSL (MIT)" attributes:small]];
   [NSApp orderFrontStandardAboutPanelWithOptions:@{
     NSAboutPanelOptionApplicationName : @"Screen Share",
     NSAboutPanelOptionApplicationVersion : @SS_VERSION,

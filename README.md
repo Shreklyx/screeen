@@ -215,6 +215,12 @@ lehető legrövidebb úton:
   egyenesen az UDP-re mennek;
 - a képkockák ~1,1 KB-os UDP-csomagokban mennek, AES-GCM titkosítással (a kulcsot a két alkalmazás X25519-cel
   egyezteti, a szerver sem látja a képet), a küldés gyors és csak enyhén tagolt (a célbitráta 3-szorosával);
+- a titkosítás **saját kód** (`native/core/crypto.cpp`), könyvtár nélkül, de szabványos algoritmusokkal (X25519,
+  HKDF-SHA256, AES-128-GCM – saját titkosító algoritmust kitalálni nem biztonságos): a processzor AES-utasításain
+  fut (x86: AES-NI + PCLMULQDQ, Apple Silicon: ARMv8 AES + PMULL), egyszerre négy blokkal – egy mag ~2–3 GB/s-ot
+  titkosít, a csomagonkénti költség mikroszekundum alatti; régi, AES-utasítás nélküli processzoron állandó idejű
+  (a kulcsot az időzítésen sem eláruló) hordozható kód fut. A tesztek (`native/tests/crypto_test.cpp`) a szabványok
+  tesztvektoraival és OpenSSL-lel számolt hosszú sorozatokkal ellenőrzik mindkét változatot;
 - a néző **puffer nélkül** dolgozik: minden teljes képkockát azonnal dekódol, és egy alacsony késleltetésű
   („desynchronized”) vásznon rajzolja ki, amely nem vár a böngésző képösszeállítására; ha a gép nem bírja a tempót,
   mindig csak a legfrissebb kép kerül ki;
@@ -303,7 +309,7 @@ szerver 3479/udp reléjét vagy a WebSocketet használják. A `ss-web.wasm` repr
   alkalmazásoknak 24 órás TURN jelszavakat ad (TURN REST API). Jelszó- és csatlakozási próbálkozások IP-nként korlátozva.
 - `public/` – a böngészős oldal, WebRTC nélkül: a megosztó a képernyőt `getDisplayMedia()`-val rögzíti, WebCodecs-szel
   egyszer kódolja (H.264, a hang veszteségmentes FLAC), és a közvetlen mód protokolljával küldi minden nézőnek (lásd lent).
-- Közvetlen mód: `native/core` (a natív alkalmazások közös C++ magja: X25519 + AES-GCM titkosítás – BearSSL –,
+- Közvetlen mód: `native/core` (a natív alkalmazások közös C++ magja: X25519 + AES-GCM titkosítás – saját kód, lásd lent –,
   darabolás, NACK, kulcskocka-kérés, óra-egyeztetés, lyukasztás a NAT-on, szerveres / TURN relé, WebSocket-tartalék,
   a megosztó és a néző logikája), `server/direct-relay.js` (a szerver 3479/udp portja: címfelderítés és relé, csak a
   munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része (WebCodecs kódolás/dekódolás,

@@ -1,6 +1,7 @@
 // Screen Share native core – the cryptography of direct mode (same as test/direct-reference.cjs and
 // public/direct-web.js): X25519 key agreement, HKDF-SHA256, AES-128-GCM, HMAC-SHA256; for the
-// TURN client MD5, HMAC-SHA1 and CRC-32. BearSSL underneath (third_party/bearssl, MIT).
+// TURN client MD5, HMAC-SHA1 and CRC-32; SHA-1 for the WebSocket handshake. Our own code (crypto.cpp),
+// the standard algorithms from their specifications – no library.
 #pragma once
 
 #include <array>
@@ -22,7 +23,11 @@ struct X25519 {
   bool shared(const uint8_t peer[32], uint8_t out[32]) const;
 };
 
+/** What runs AES and GHASH here: "x86 AES-NI + PCLMULQDQ", "ARMv8 AES + PMULL" or "portable". */
+const char* cryptoEngine();
+
 void sha256(const uint8_t* data, size_t n, uint8_t out[32]);
+void sha1(const uint8_t* data, size_t n, uint8_t out[20]);
 void hmacSha256(const uint8_t* key, size_t keyLen, const uint8_t* data, size_t n, uint8_t out[32]);
 void hmacSha1(const uint8_t* key, size_t keyLen, const uint8_t* data, size_t n, uint8_t out[20]);
 void md5(const uint8_t* data, size_t n, uint8_t out[16]);

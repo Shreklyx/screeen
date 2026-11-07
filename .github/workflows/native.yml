@@ -27,6 +27,8 @@ jobs:
       - name: Core tests
         run: |
           build/sscore_test
+          build/crypto_test --expect hardware
+          build/crypto_portable_test --expect portable
           build/lossless_test
           build/spatial_test
           build/audio_ring_test
@@ -295,6 +297,8 @@ jobs:
         shell: bash
         run: |
           build/sscore_test.exe
+          build/crypto_test.exe --expect hardware
+          build/crypto_portable_test.exe --expect portable
           build/audio_ring_test.exe
       - name: "Smoke: the app shares the screen, a native viewer receives it; the app watches a native sharer"
         shell: bash
@@ -497,6 +501,8 @@ jobs:
       - name: Core tests
         run: |
           build-arm64/sscore_test
+          build-arm64/crypto_test --expect hardware
+          build-arm64/crypto_portable_test --expect portable
           build-arm64/audio_ring_test
       # the app signs itself and its updates with this Mac's own identity (sign_local.sh): two different
       # builds must get the same designated requirement, so that macOS keeps the permissions it gave
@@ -784,17 +790,18 @@ jobs:
           # the files first, the version files after them: no updater sees a version before its file
           gh release upload desktop-latest ScreenShare-Setup.exe ScreenShare-Native-Setup.exe ScreenShare-mac.dmg ScreenShare-Native-Mac.zip --clobber
           gh release upload desktop-latest latest.yml latest-mac.yml native-latest.json --clobber
-          # what only the Electron app used
-          for old in ScreenShare-mac.zip ss-audio.exe ScreenShare-Setup.exe.blockmap ScreenShare-mac.dmg.blockmap ScreenShare-mac.zip.blockmap; do
+          # what only the Electron app and the (WebRTC) iPhone app used
+          for old in ScreenShare-mac.zip ss-audio.exe ScreenShare-Setup.exe.blockmap ScreenShare-mac.dmg.blockmap ScreenShare-mac.zip.blockmap ScreenShare-iOS.ipa; do
             gh release delete-asset desktop-latest "$old" -y 2>/dev/null || true
           done
           cat > notes.md <<NOTES
-          Windows (64 bites): **ScreenShare-Setup.exe** · Mac (csak Apple Silicon – M1 és újabb, macOS 12.3+): **ScreenShare-mac.dmg** · iPhone / iPad: **ScreenShare-iOS.ipa**
+          Windows (64 bites): **ScreenShare-Setup.exe** · Mac (csak Apple Silicon – M1 és újabb, macOS 12.3+): **ScreenShare-mac.dmg** · iPhone / iPad: a böngészőből (mozizas.hu)
 
           Natív alkalmazás – Electron és Chromium nélkül (Windowson ~1 MB, Macen ~2 MB):
           - Windows: DXGI képernyőkép, NVENC / Intel / AMD hardveres kódolás (vagy a Windows szoftveres kódolója), a gép teljes hangja (5.1 / 7.1 is), Direct3D 11 megjelenítés.
           - Mac: ScreenCaptureKit + VideoToolbox, a gép hangja macOS 13-tól (semmit nem kell mellé telepíteni).
           - Saját, titkosított átvitel (UDP, ha kell a szerveren át), puffer nélkül – a lehető legkisebb késés.
+          - Saját titkosítás (X25519, AES-128-GCM – szabványos algoritmusok, saját kód, a processzor AES-utasításaival).
           - Magát frissíti. A korábbi (Electron) alkalmazás is erre frissül: Windowson magától, Macen letölti ezt a lemezképet (húzd az Alkalmazások mappába).
 
           Az alkalmazás nincs Microsofttal / Apple-lel aláírva:

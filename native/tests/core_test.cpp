@@ -1,5 +1,5 @@
-// Core tests: known-answer vectors for the cryptography, JSON, packets, and two endpoints
-// exchanging frames over loopback (with lost packets asked for again).
+// Core tests: JSON, packets, room keys, and two endpoints exchanging frames over loopback (with lost
+// packets asked for again). The cryptography's own tests: crypto_test.cpp.
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -34,64 +34,6 @@ static Bytes hex(const char* s) {
 }
 
 static std::string hexOf(const uint8_t* p, size_t n) { return toHex(p, n); }
-
-static void cryptoVectors() {
-  // RFC 7748 section 6.1
-  X25519 alice;
-  Bytes a = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
-  std::memcpy(alice.secret.data(), a.data(), 32);
-  Bytes bobPub = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
-  uint8_t shared[32];
-  CHECK(alice.shared(bobPub.data(), shared) && hexOf(shared, 32) == "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742", "X25519 RFC 7748 shared secret");
-  X25519 k = X25519::generate();
-  X25519 check;
-  check.secret = k.secret;
-  uint8_t s1[32], s2[32];
-  X25519 other = X25519::generate();
-  CHECK(k.shared(other.pub.data(), s1) && other.shared(k.pub.data(), s2) && std::memcmp(s1, s2, 32) == 0, "X25519 both sides agree");
-
-  // GCM test case 4 (McGrew & Viega)
-  Bytes key = hex("feffe9928665731c6d6a8f9467308308");
-  Bytes iv = hex("cafebabefacedbaddecaf888");
-  Bytes pt = hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39");
-  Bytes aad = hex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
-  AesGcm gcm(key.data());
-  Bytes data = pt;
-  uint8_t tag[16];
-  gcm.seal(iv.data(), aad.data(), aad.size(), data.data(), data.size(), tag);
-  CHECK(hexOf(data.data(), data.size()) == "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091" &&
-            hexOf(tag, 16) == "5bc94fbc3221a5db94fae95ae7121a47",
-        "AES-128-GCM test case 4");
-  CHECK(gcm.open(iv.data(), aad.data(), aad.size(), data.data(), data.size(), tag) && data == pt, "AES-128-GCM opens");
-  data[0] ^= 1;
-  CHECK(!gcm.open(iv.data(), aad.data(), aad.size(), data.data(), data.size(), tag), "AES-128-GCM rejects a changed packet");
-
-  // RFC 5869 test case 1
-  Bytes ikm = hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
-  Bytes salt = hex("000102030405060708090a0b0c");
-  Bytes info = hex("f0f1f2f3f4f5f6f7f8f9");
-  Bytes okm = hkdfSha256(salt.data(), salt.size(), ikm.data(), ikm.size(), info.data(), info.size(), 42);
-  CHECK(hexOf(okm.data(), okm.size()) == "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865", "HKDF-SHA256 RFC 5869");
-
-  // RFC 4231 test case 2
-  const char* k2 = "Jefe";
-  const char* d2 = "what do ya want for nothing?";
-  uint8_t mac[32];
-  hmacSha256(reinterpret_cast<const uint8_t*>(k2), 4, reinterpret_cast<const uint8_t*>(d2), std::strlen(d2), mac);
-  CHECK(hexOf(mac, 32) == "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", "HMAC-SHA256 RFC 4231");
-  uint8_t m5[16];
-  md5(reinterpret_cast<const uint8_t*>("abc"), 3, m5);
-  CHECK(hexOf(m5, 16) == "900150983cd24fb0d6963f7d28e17f72", "MD5");
-  CHECK(crc32(reinterpret_cast<const uint8_t*>("123456789"), 9) == 0xCBF43926u, "CRC-32");
-  uint8_t r[16] = {0};
-  randomBytes(r, 16);
-  bool nonzero = false;
-  for (uint8_t b : r) nonzero |= b != 0;
-  CHECK(nonzero, "random bytes");
-  std::string b64 = base64Encode(reinterpret_cast<const uint8_t*>("hello!?"), 7);
-  Bytes back = base64Decode(b64);
-  CHECK(b64 == "aGVsbG8hPw==" && std::string(back.begin(), back.end()) == "hello!?", "base64");
-}
 
 static void jsonTests() {
   Json j = Json::parse(R"({"t":"signal","data":{"type":"direct-offer","udp":4294967295,"cands":[{"address":"10.0.0.2","port":5000}],"tcp":true,"s":"é\n\"x\""},"n":-1.5,"z":null})");
@@ -232,7 +174,6 @@ static void endpointTest(bool lossy) {
 
 int main() {
   netInit();
-  cryptoVectors();
   jsonTests();
   packetTests();
   roomKeyTests();

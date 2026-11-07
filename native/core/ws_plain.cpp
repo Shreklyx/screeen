@@ -14,10 +14,6 @@
 #include "net.h"
 #include "websocket.h"
 
-extern "C" {
-#include "bearssl.h"
-}
-
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -247,10 +243,7 @@ class PlainWebSocket : public WebSocket, public std::enable_shared_from_this<Pla
     }
     std::string accept = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     uint8_t digest[20];
-    br_sha1_context sc;
-    br_sha1_init(&sc);
-    br_sha1_update(&sc, accept.data(), accept.size());
-    br_sha1_out(&sc, digest);
+    sha1(reinterpret_cast<const uint8_t*>(accept.data()), accept.size(), digest);
     if (head.compare(0, 12, "HTTP/1.1 101") != 0 || head.find(base64Encode(digest, 20)) == std::string::npos) return finish();
     open_ = true;
     cv_.notify_all();
