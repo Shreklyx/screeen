@@ -177,6 +177,42 @@ static void dropOldPassword() {
 #pragma clang diagnostic pop
 }
 
+/* ------------------------------------------------ the Nézés tab: what was typed in it, kept */
+
+// The room (code or link) in the settings, its password in the keychain – read once (every window shows
+// them), saved a moment after the typing stops, away from the main thread (the tool takes a few ms), and
+// at quit what is still waiting.
+static NSString *gWatchAccess, *gWatchAccessSaved;
+static int gWatchAccessGen = 0;
+
+static dispatch_queue_t keychainQueue() {
+  static dispatch_queue_t q = dispatch_queue_create("hu.mozizas.screenshare.keychain", DISPATCH_QUEUE_SERIAL);
+  return q;
+}
+
+static NSString* watchAccess() {
+  if (!gWatchAccess) gWatchAccess = gWatchAccessSaved = loadPassword(@"watch-access");
+  return gWatchAccess;
+}
+
+/** Into the keychain if it changed (`now`: before returning – the app quits). */
+static void saveWatchAccess(bool now) {
+  NSString* pw = [watchAccess() copy];
+  if ([pw isEqualToString:gWatchAccessSaved ?: @""]) return;
+  gWatchAccessSaved = pw;
+  if (now) dispatch_sync(keychainQueue(), ^{ savePassword(pw, nullptr, @"watch-access"); });
+  else dispatch_async(keychainQueue(), ^{ savePassword(pw, nullptr, @"watch-access"); });
+}
+
+static void setWatchAccess(NSString* pw) {
+  watchAccess();
+  gWatchAccess = [pw copy] ?: @"";
+  int gen = ++gWatchAccessGen;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, int64_t(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    if (gen == gWatchAccessGen) saveWatchAccess(false);
+  });
+}
+
 /* ------------------------------------------------ the rooms this app is in: rooms = {code: {host, token, pid, at}} */
 
 // kept in its settings while it is in them: after a crash, an update or the Mac restarting the app goes
@@ -1218,15 +1254,18 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   stretch(_qualityHint, _sharePane, 12);
 
   // watching
+  // (both keep what was typed in them – after a restart too: see watchAccess)
   _code = [NSTextField new];
   _code.placeholderString = @"abc123 vagy link";
   _code.bezelStyle = NSTextFieldRoundedBezel;
   _code.delegate = self;
+  _code.stringValue = [ud stringForKey:@"watchCode"] ?: @"";
   sizeTo(_code, 220, 0);
   _joinAccess = [NSSecureTextField new];
   _joinAccess.placeholderString = @"ha a szobának van";
   _joinAccess.bezelStyle = NSTextFieldRoundedBezel;
   _joinAccess.delegate = self;
+  _joinAccess.stringValue = watchAccess();
   sizeTo(_joinAccess, 220, 0);
   SSGroup* room = [SSGroup new];
   [room setRows:@[ formRow(@"Szobakód vagy link", nil, _code), formRow(@"Jelszó", nil, _joinAccess) ]];
@@ -1307,6 +1346,8 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
 
 - (void)controlTextDidChange:(NSNotification*)n {
   if ((n.object == _code || n.object == _joinAccess) && !_joinError.hidden) [self setError:_joinError text:@""];
+  if (n.object == _code) [NSUserDefaults.standardUserDefaults setObject:_code.stringValue forKey:@"watchCode"];
+  if (n.object == _joinAccess) setWatchAccess(_joinAccess.stringValue);
 }
 
 /* ---- sharing */
@@ -2086,15 +2127,16 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
     _restoring = false;
   } else if (type == "join-error" && e["code"].str() == "access") {
     // the room has an entry password: back to the Nézés tab, the room in its field, the password asked
+    // (a wrong one stays, selected: what is typed now takes its place)
     std::string room = _watchRoom;
     bool wrong = _joinAccess.stringValue.length > 0;
     [self stopToHome];
     _tabs.selectedSegment = 1;
     [self applyTab];
-    _code.stringValue = S(room);
-    _joinAccess.stringValue = @"";
+    if (parseCode(_code.stringValue) != room) _code.stringValue = S(room); // (the link typed stays as it was)
     [self setError:_joinError text:wrong ? @"Hibás jelszó – próbáld újra." : @"Ebbe a szobába jelszóval lehet belépni – írd be a jelszót."];
     [_window makeFirstResponder:_joinAccess];
+    [_joinAccess selectText:nil];
   } else if (type == "join-error" && _restoring && e["code"].str() == "notfound") {
     std::string code = codeOnly(_savedCode);
     [self stopToHome];
@@ -2417,6 +2459,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
 }
 
 - (void)applicationWillTerminate:(NSNotification*)n {
+  saveWatchAccess(true); // (the Nézés tab's password, if it still waits to be saved)
   for (SSWin* w in [_windows copy]) [w goAway:_keepRooms];
 }
 

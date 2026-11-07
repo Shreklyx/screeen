@@ -467,7 +467,7 @@ async function startHosting(e) {
   host.password = password;
   if ($('#rememberPassword').checked) store.set('ss-host-password', password);
   else store.remove('ss-host-password');
-  store.set('ss-room-options', { permanent: host.permanent, access: host.permanent ? host.access : '' });
+  store.set('ss-room-options', { permanent: host.permanent, access: host.access }); // (kept as the apps keep it)
 
   host.active = true;
   showView('view-host');
@@ -1539,14 +1539,22 @@ function surroundSpeakers() {
   }
 }
 
-async function startViewing(code, key = null) {
+/** The password that let us into a room, kept for it (in this browser – a reload, a link opened again,
+ *  the browser started again: no need to type it again). */
+const roomAccess = {
+  get: (code) => store.get(`ss-access-${code}`, ''),
+  set: (code, pw) => (pw ? store.set(`ss-access-${code}`, pw) : store.remove(`ss-access-${code}`)),
+};
+
+/** `access`: the password typed on the home page (else the one kept for the room). */
+async function startViewing(code, key = null, access = '') {
   showView('view-viewer');
   $('#viewerRoom').textContent = code;
   const room = key ? `${code}.${base32(key)}` : code; // (the key stays in the address: a reload keeps it)
   if (location.hash.slice(1) !== room) history.replaceState(null, '', `#${room}`);
   viewer.code = code;
   viewer.key = key;
-  try { viewer.access = sessionStorage.getItem(`ss-access-${code}`) || ''; } catch { viewer.access = ''; }
+  viewer.access = access || roomAccess.get(code);
   setOverlay('Csatlakozás a szobához…');
   await directReady;
   if (!canDirect.ok) {
@@ -1575,6 +1583,7 @@ async function joinRoom() {
   if (viewer.closed) return;
   try {
     const res = await viewer.signal.request({ t: 'join', code: viewer.code, caps: viewer.caps, name: chatName(), ...(viewer.access ? { access: viewer.access } : {}) }, ['joined']);
+    if (viewer.access) roomAccess.set(viewer.code, viewer.access); // (it let us in: kept for this room)
     viewer.id = res.id;
     viewerChat().joined(res, res.id);
     viewer.iceServers = res.iceServers || [];
@@ -1605,6 +1614,7 @@ async function joinRoom() {
 /** The room asks for its entry password: a field for it in the overlay (kept for this tab's reloads). */
 function askAccess() {
   const wrong = Boolean(viewer.access);
+  if (wrong && roomAccess.get(viewer.code) === viewer.access) roomAccess.set(viewer.code, ''); // (the room's password changed)
   setOverlay(wrong ? 'Hibás jelszó. Próbáld újra:' : 'Ebbe a szobába jelszóval lehet belépni:', { spinner: false });
   const form = document.createElement('form');
   form.className = 'access-form';
@@ -1613,6 +1623,7 @@ function askAccess() {
   input.autocomplete = 'current-password';
   input.placeholder = 'A szoba jelszava';
   input.setAttribute('aria-label', 'A szoba jelszava');
+  input.value = viewer.access; // (a wrong one stays, selected: what is typed now takes its place)
   const button = document.createElement('button');
   button.type = 'submit';
   button.className = 'btn btn-primary';
@@ -1627,12 +1638,13 @@ function askAccess() {
     e.preventDefault();
     if (!input.value) return;
     viewer.access = input.value;
-    try { sessionStorage.setItem(`ss-access-${viewer.code}`, input.value); } catch { /* fine */ }
+    store.set('ss-join-access', input.value); // (the home page's field shows it too, next time)
     setOverlay('Belépés…');
     joinRoom();
   });
   $('#overlayActions').replaceChildren(form);
   input.focus();
+  input.select();
 }
 
 // A sharer that sends nothing our way (an old iPhone app speaks only WebRTC): say so.
@@ -2460,11 +2472,17 @@ function init() {
   initHostUi();
   initViewerUi();
 
+  // the Nézés card keeps what was typed in it (in this browser: after a reload, a restart too)
+  for (const [id, key] of [['#joinCode', 'ss-join-code'], ['#joinAccess', 'ss-join-access']]) {
+    const input = $(id);
+    input.value = store.get(key, '');
+    input.addEventListener('input', () => store.set(key, input.value));
+  }
   $('#joinForm').addEventListener('submit', (e) => {
     e.preventDefault();
     const code = parseCode($('#joinCode').value);
     if (code.length < 4) { toast('Érvénytelen szobakód.', 'warn'); return; }
-    startViewing(code, parseRoomKey($('#joinCode').value));
+    startViewing(code, parseRoomKey($('#joinCode').value), $('#joinAccess').value);
   });
 
   window.addEventListener('hashchange', () => { if (!host.active) location.reload(); });

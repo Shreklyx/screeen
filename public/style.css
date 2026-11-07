@@ -159,7 +159,8 @@ select { cursor: pointer; }
   background: var(--accent-soft);
 }
 .card-icon svg { width: 22px; height: 22px; fill: none; stroke: var(--accent); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.join { display: flex; gap: 10px; margin-top: auto; }
+.join { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-top: auto; }
+.join .btn { align-self: flex-start; }
 .share-form { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; margin-top: auto; }
 .share-form input[type="password"] { width: 100%; font-size: 16px; }
 .share-form .hint { margin: 0; }
@@ -172,7 +173,8 @@ input[type="password"] {
   padding: 10px 12px;
   min-width: 0;
 }
-.join input { flex: 1; font-size: 16px; font-family: var(--mono); letter-spacing: 0.04em; }
+.join input { width: 100%; font-size: 16px; }
+.join #joinCode { font-family: var(--mono); letter-spacing: 0.04em; }
 
 .features {
   list-style: none;
@@ -629,7 +631,6 @@ input[type="password"] {
   .topbar-note { display: none; }
   .cards { grid-template-columns: minmax(0, 1fr); }
   .features { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .join { flex-direction: column; }
   .card > .btn, .join .btn, .share-form .btn { width: 100%; }
   .player { border-radius: 12px; max-height: none; }
   .volume, .latency, #viewerInfo { display: none; }

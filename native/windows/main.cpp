@@ -1900,13 +1900,14 @@ void onEngineEvent(const Json& e) {
     g.restoring = false;
   } else if (type == "join-error" && e["code"].str() == "access") {
     // the room has an entry password: back to the Nézés tab, the room in its field, the password asked
+    // (a wrong one stays, selected: what is typed now takes its place)
     std::wstring room = toW(g.watchRoom);
     bool wrong = !getText(g.joinAccess).empty();
     stopToHome(wrong ? L"Hibás jelszó – próbáld újra." : L"Ebbe a szobába jelszóval lehet belépni – írd be a jelszót.");
     setTab(1);
-    SetWindowTextW(g.code, room.c_str());
-    SetWindowTextW(g.joinAccess, L"");
+    if (parseCode(getText(g.code)) != g.watchRoom) SetWindowTextW(g.code, room.c_str()); // (the link typed stays as it was)
     SetFocus(g.joinAccess);
+    SendMessageW(g.joinAccess, EM_SETSEL, 0, -1);
   } else if (type == "join-error" && g.restoring && e["code"].str() == "notfound") {
     std::wstring code = toW(codeOnly(g.savedCode));
     stopToHome(L"A szoba (" + code + L"), amit néztél, közben bezárult.");
@@ -2340,9 +2341,11 @@ void createControls() {
   g.fieldBrush = CreateSolidBrush(kFieldGdi);
   std::wstring pw = loadPassword();
   g.pass = makeEdit(ID_PASSWORD, ES_PASSWORD, pw, L"megosztási jelszó");
-  g.code = makeEdit(ID_CODE, 0, L"", L"abc123 vagy link");
+  // the Nézés tab keeps what was typed in it – after a restart too (the link holds the room's key and the
+  // password is a password: both encrypted for this Windows user)
+  g.code = makeEdit(ID_CODE, 0, loadSecret(L"WatchCode"), L"abc123 vagy link");
   g.access = makeEdit(ID_ACCESS, ES_PASSWORD, loadSecret(L"RoomAccess"), L"nem kötelező");
-  g.joinAccess = makeEdit(ID_JOIN_ACCESS, ES_PASSWORD, L"", L"ha a szobának van");
+  g.joinAccess = makeEdit(ID_JOIN_ACCESS, ES_PASSWORD, loadSecret(L"WatchAccess"), L"ha a szobának van");
   g.chatEdit = makeEdit(ID_CHAT, 0, L"", L"Üzenet…");
   SendMessageW(g.chatEdit, EM_LIMITTEXT, 500, 0);
   g.nameEdit = makeEdit(ID_NAME, 0, loadString(L"ChatName"), L"a neved a chatben");
@@ -2562,6 +2565,13 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         animate();
       }
       return 0;
+    case WM_COMMAND:
+      // the Nézés tab's room and password: kept as they are typed (see createControls)
+      if (HIWORD(wp) == EN_CHANGE && (HWND(lp) == g.code || HWND(lp) == g.joinAccess)) {
+        saveSecret(HWND(lp) == g.code ? L"WatchCode" : L"WatchAccess", getText(HWND(lp)));
+        return 0;
+      }
+      return DefWindowProcW(h, msg, wp, lp);
     case WM_SYSCOMMAND:
       if ((wp & 0xFFF0) == kSysAbout) {
         showAbout();
