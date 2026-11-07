@@ -7,6 +7,7 @@
 // Watching: the window grows, the picture fills it, a floating glass bar over it that fades away
 // (F / double click: full screen, S: statistics, M: mute). The server is always mozizas.hu.
 #import <AppKit/AppKit.h>
+#import <MediaPlayer/MediaPlayer.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Security/Security.h>
 
@@ -1000,8 +1001,10 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   NSProgressIndicator* _overlaySpinner;
   NSSlider* _volume;
   NSButton* _muteButton;
-  NSButton* _spatialButton; // spatial sound for headphones (with AirPods: it follows the head)
-  bool _spatial;
+  NSButton* _spatialButton; // spatial sound: macOS's own on Bluetooth headphones (AirPods), ours on wired ones
+  bool _spatial;            // ours (wired headphones)
+  bool _systemSpatial;      // macOS's own allowed (Bluetooth headphones) – on unless turned off
+  NSString* _nowPlaying;    // what macOS shows as playing (nil: nothing)
   double _lastMove;
   // the room's chat: the sharer's box, the viewer's panel at the right of the picture (in full screen
   // too); closed, a count on its button and the newest message over the picture for a few seconds
@@ -1558,6 +1561,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   full.toolTip = @"Teljes képernyő (F)";
   _muteButton.toolTip = @"Némítás (M)";
   _spatial = [NSUserDefaults.standardUserDefaults boolForKey:@"spatial"];
+  _systemSpatial = ![NSUserDefaults.standardUserDefaults objectForKey:@"systemSpatial"] || [NSUserDefaults.standardUserDefaults boolForKey:@"systemSpatial"];
   _spatialButton = iconButton(@"headphones", self, @selector(toggleSpatial));
   _spatialButton.toolTip = @"Térhatású hang (H) – a macOS saját térhangja: AirPods / Beats fejhallgatón a Vezérlőközpont → Hang → "
                            @"Térhatású hang menüjében válaszd a Fejkövetés vagy a Rögzített módot";
@@ -1923,7 +1927,9 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
   _player.reset(new MacPlayer(_video.layer));
   _audioOut.reset(new MacAudioOut());
   _audioOut->setVolume(_muted ? 0.0f : float(_volume.doubleValue / 100));
-  _audioOut->setSpatial(_spatial);
+  __weak SSWin* weakWin = self;
+  _audioOut->onRouteChange([weakWin] { [weakWin applySpatial]; }); // (AirPods came or went: the button says which)
+  [self applySpatial]; // (the player's spatial sound – AirPods: macOS's own – and the button)
   EngineCallbacks cb = [self callbacks:session];
   MacPlayer* player = _player.get();
   MacAudioOut* audio = _audioOut.get();
@@ -2071,18 +2077,84 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
 }
 
 - (void)toggleSpatial {
-  _spatial = !_spatial;
-  [NSUserDefaults.standardUserDefaults setBool:_spatial forKey:@"spatial"];
+  if (_audioOut && _audioOut->bluetooth()) { // AirPods, Beats: macOS's own spatial audio, allowed or not
+    _systemSpatial = !_systemSpatial;
+    [NSUserDefaults.standardUserDefaults setBool:_systemSpatial forKey:@"systemSpatial"];
+  } else {
+    _spatial = !_spatial;
+    [NSUserDefaults.standardUserDefaults setBool:_spatial forKey:@"spatial"];
+  }
   [self applySpatial];
+  springScale(_spatialButton, 0.72, 0.36, 0.5);
 }
 
-/** Spatial sound on or off: the player (the speakers around the head – with AirPods, where the head
- *  looks), and the button's look. */
+/** Spatial sound: the player, and the button – on Bluetooth headphones it is macOS's own (Control
+ *  Center offers Fixed / Head Tracked for the app), on anything else ours. */
 - (void)applySpatial {
-  if (_audioOut) _audioOut->setSpatial(_spatial);
-  springScale(_spatialButton, 0.72, 0.36, 0.5);
-  _spatialButton.contentTintColor = _spatial ? NSColor.controlAccentColor : nil;
-  _spatialButton.image = symbol(_spatial ? @"headphones.circle.fill" : @"headphones", 15);
+  if (_audioOut) {
+    _audioOut->setSpatial(_spatial);
+    _audioOut->setSystemSpatial(_systemSpatial);
+  }
+  bool bt = _audioOut && _audioOut->bluetooth();
+  bool on = bt ? _systemSpatial : _spatial;
+  _spatialButton.contentTintColor = on ? NSColor.controlAccentColor : nil;
+  _spatialButton.image = symbol(on ? @"headphones.circle.fill" : @"headphones", 15);
+  _spatialButton.toolTip = bt ? @"Térhang (H) – AirPods / Beats: a macOS saját térhangja. Válaszd a Vezérlőközpont → Hang → Térhatású hang "
+                                @"menüben: Fejkövetés vagy Rögzített. Kikapcsolva: sima sztereó."
+                              : @"Térhatású hang fejhallgatóhoz (H) – a saját fejmodellünk vezetékes fejhallgatóhoz (AirPods-on a macOS "
+                                @"saját térhangja szól, a Vezérlőközpontból választható).";
+  [self updateNowPlaying];
+}
+
+/** What macOS shows as playing – while the sound goes through the system's spatial audio (AirPods): the
+ *  room, and the play / pause keys (and AirPods' press) turn its sound on and off. */
+- (void)updateNowPlaying {
+  bool want = _current == _viewer && _audioOut && _audioOut->systemSpatial();
+  NSString* key = want ? [NSString stringWithFormat:@"%@|%d", _window.title, int(_muted)] : nil;
+  if ((key == nil && _nowPlaying == nil) || [key isEqualToString:_nowPlaying]) return;
+  _nowPlaying = key;
+  static __weak SSWin* owner = nil;
+  MPNowPlayingInfoCenter* center = MPNowPlayingInfoCenter.defaultCenter;
+  if (!want) {
+    if (owner == self) {
+      owner = nil;
+      center.nowPlayingInfo = nil;
+      center.playbackState = MPNowPlayingPlaybackStateStopped;
+    }
+    return;
+  }
+  static bool commands = false;
+  if (!commands) {
+    commands = true;
+    MPRemoteCommandCenter* rc = MPRemoteCommandCenter.sharedCommandCenter;
+    [rc.togglePlayPauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent*) {
+      SSWin* w = owner;
+      if (!w) return MPRemoteCommandHandlerStatusNoActionableNowPlayingItem;
+      [w toggleMute];
+      return MPRemoteCommandHandlerStatusSuccess;
+    }];
+    [rc.pauseCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent*) {
+      SSWin* w = owner;
+      if (!w) return MPRemoteCommandHandlerStatusNoActionableNowPlayingItem;
+      [w setMuted:true];
+      return MPRemoteCommandHandlerStatusSuccess;
+    }];
+    [rc.playCommand addTargetWithHandler:^MPRemoteCommandHandlerStatus(MPRemoteCommandEvent*) {
+      SSWin* w = owner;
+      if (!w) return MPRemoteCommandHandlerStatusNoActionableNowPlayingItem;
+      [w setMuted:false];
+      return MPRemoteCommandHandlerStatusSuccess;
+    }];
+  }
+  owner = self;
+  center.nowPlayingInfo = @{
+    MPMediaItemPropertyTitle : _window.title ?: @"Screen Share",
+    MPMediaItemPropertyArtist : @"Screen Share",
+    MPNowPlayingInfoPropertyIsLiveStream : @YES,
+    MPNowPlayingInfoPropertyMediaType : @(MPNowPlayingInfoMediaTypeVideo),
+    MPNowPlayingInfoPropertyPlaybackRate : @(_muted ? 0.0 : 1.0),
+  };
+  center.playbackState = _muted ? MPNowPlayingPlaybackStatePaused : MPNowPlayingPlaybackStatePlaying;
 }
 
 - (void)toggleMute {
@@ -2092,6 +2164,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
 - (void)setMuted:(bool)m {
   if (m != _muted) springScale(_muteButton, 0.72, 0.36, 0.5);
   _muted = m;
+  [self updateNowPlaying];
   if (_audioOut) _audioOut->setVolume(m ? 0.0f : float(_volume.doubleValue / 100));
   _muteButton.image = symbol(m ? @"speaker.slash.fill" : @"speaker.wave.2.fill", 15);
 }
@@ -2264,7 +2337,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
 
 - (void)tick {
   if (!_savedCode.empty() && nowMs() - _savedAt > 20000) [self rememberRoom:_savedCode host:_savedHost token:_savedToken];
-  if (_audioOut && _spatial) _audioOut->systemSpatial(); // (macOS's spatial audio gave up: our own takes over)
+  [self updateNowPlaying]; // (and if macOS's spatial audio gave up: the plain output takes over – systemSpatial)
   if (_current == _host && _hostPipe) {
     MacHost::Info i = _hostPipe->info();
     std::string s;

@@ -583,8 +583,66 @@ struct MacAudioOut::Impl {
   /** The system's renderer gave up (it can, e.g. with no output at all): the output unit again. */
   bool systemFailed() const { return sys && sys->failed; }
 
+  /* -- which way the sound goes. Bluetooth headphones (AirPods, Beats): through the system's renderer
+   *    above, with its spatial audio allowed – Control Center then offers Spatial Audio (Fixed, Head
+   *    Tracked) for the app, no button needed (Bluetooth itself delays ~150 ms: 40 ms more is not
+   *    heard). Anything else: the output unit, the least delay, and our head model if it is on. The
+   *    default output is watched: AirPods connecting or going away switch the way at once. */
+  bool own = false;            // our head model (wired headphones)
+  bool systemAllowed = true;   // macOS's spatial audio (Bluetooth headphones)
+  bool bluetooth = false;      // what the output is now
+  std::function<void()> onRoute;
+  AudioObjectPropertyListenerBlock routeListener = nil;
+
+  static AudioObjectPropertyAddress defaultOutput() {
+    return {kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+  }
+
+  static bool outputIsBluetooth() {
+    AudioObjectPropertyAddress a = defaultOutput();
+    AudioDeviceID dev = 0;
+    UInt32 size = sizeof dev;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, nullptr, &size, &dev) != noErr || !dev) return false;
+    AudioObjectPropertyAddress t = {kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    UInt32 type = 0;
+    size = sizeof type;
+    if (AudioObjectGetPropertyData(dev, &t, 0, nullptr, &size, &type) != noErr) return false;
+    return type == kAudioDeviceTransportTypeBluetooth || type == kAudioDeviceTransportTypeBluetoothLE;
+  }
+
+  void route() {
+    bluetooth = outputIsBluetooth();
+    if (bluetooth && systemAllowed && startSystem()) {
+      ring.setSpatial(false); // (the system's spatial audio: ours would be a second one)
+      track(false);
+      return;
+    }
+    stopSystem();
+    // (Bluetooth where the system's could not start – it gave up: ours, following the head with AirPods)
+    bool ours = bluetooth ? systemAllowed : own;
+    ring.setSpatial(ours);
+    track(ours && bluetooth);
+  }
+
+  void watchRoute() {
+    auto still = alive;
+    Impl* self = this;
+    routeListener = ^(UInt32, const AudioObjectPropertyAddress*) {
+      if (!*still) return;
+      bool was = self->bluetooth;
+      self->route();
+      if (was != self->bluetooth && self->onRoute) self->onRoute();
+    };
+    AudioObjectPropertyAddress a = defaultOutput();
+    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &a, dispatch_get_main_queue(), routeListener);
+  }
+
   ~Impl() {
     *alive = false;
+    if (routeListener) {
+      AudioObjectPropertyAddress a = defaultOutput();
+      AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &a, dispatch_get_main_queue(), routeListener);
+    }
     track(false);
     stopSystem();
     if (unit) {
@@ -595,28 +653,34 @@ struct MacAudioOut::Impl {
   }
 };
 
-MacAudioOut::MacAudioOut() : impl_(new Impl) { impl_->open(); }
+MacAudioOut::MacAudioOut() : impl_(new Impl) {
+  impl_->open();
+  impl_->route();
+  impl_->watchRoute();
+}
 MacAudioOut::~MacAudioOut() = default;
 void MacAudioOut::push(int sub, const uint8_t* data, size_t n, double tsUs) { impl_->ring.push(sub, data, n, tsUs); }
 void MacAudioOut::setVolume(float v) { impl_->ring.setVolume(v); }
 
 void MacAudioOut::setSpatial(bool on) {
-  // macOS's own spatial audio (see Impl::startSystem): the system renders it, our head model stays off
-  if (on && impl_->startSystem()) {
-    impl_->ring.setSpatial(false);
-    impl_->track(false);
-    return;
-  }
-  impl_->stopSystem();
-  impl_->ring.setSpatial(on); // (where the system's cannot start: our own head model)
-  impl_->track(on);
+  impl_->own = on;
+  impl_->route();
 }
 
+void MacAudioOut::setSystemSpatial(bool on) {
+  impl_->systemAllowed = on;
+  impl_->route();
+}
+
+bool MacAudioOut::bluetooth() const { return impl_->bluetooth; }
+
+void MacAudioOut::onRouteChange(std::function<void()> f) { impl_->onRoute = std::move(f); }
+
 bool MacAudioOut::systemSpatial() {
-  if (impl_->systemFailed()) { // (its renderer gave up: our own head model from here on)
+  if (impl_->systemFailed()) { // (its renderer gave up: the output unit, and our head model, from here on)
     impl_->stopSystem();
-    impl_->ring.setSpatial(true);
-    impl_->track(true);
+    impl_->ring.setSpatial(impl_->bluetooth ? impl_->systemAllowed : impl_->own);
+    impl_->track(impl_->bluetooth && impl_->systemAllowed);
   }
   return impl_->sys != nullptr;
 }
