@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Screen Share – 4K képernyőmegosztás hanggal</title>
   <meta name="description" content="Képernyőmegosztás 4K-ban, 60 FPS-sel és rendszerhanggal, minimális késleltetéssel. Regisztráció és telepítés nélkül, közvetlenül a böngészőből.">
-  <meta name="theme-color" content="#0b0b10">
+  <meta name="theme-color" content="#1c1c1f">
   <!-- home-screen app: iPhone / iPad (Safari → Megosztás → Főképernyőhöz adás), Android -->
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -21,6 +21,14 @@
   <script src="app.js" defer></script>
 </head>
 <body>
+  <!-- Liquid Glass: the light behind a glass panel bent a little (style.css, backdrop-filter) -->
+  <svg class="lg-defs" aria-hidden="true" focusable="false">
+    <filter id="liquid-glass" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.006 0.009" numOctaves="2" seed="11" result="noise"/>
+      <feGaussianBlur in="noise" stdDeviation="3" result="soft"/>
+      <feDisplacementMap in="SourceGraphic" in2="soft" scale="34" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </svg>
   <header class="topbar">
     <a class="brand" href="/" aria-label="Screen Share – főoldal">
       <svg class="brand-icon" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8"/><path d="M8 10.5h16v10H8zM13 24h6" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
