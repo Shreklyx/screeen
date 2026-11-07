@@ -48,6 +48,7 @@ class AudioRing {
   std::vector<OpusDecoder*> decoders_;
   long long read_, end_;
   int target_ = 240;
+  int lastPacket_ = 120; // frames a packet brings (the least wait: a device period and one of these)
   long long calm_ = 0;   // samples played since it last ran dry
   long long since_ = -1; // samples since it ran dry (-1: long enough ago)
   long long dryLen_ = 0; // for how long it was dry

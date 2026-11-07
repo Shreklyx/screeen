@@ -61,6 +61,7 @@ class DirectAudio extends AudioWorkletProcessor {
   }
 
   write({ pair, ts, frames, planes }) {
+    this.lastPacket = frames;
     const at = Math.round((ts * RATE) / 1e6);
     if (this.read == null) this.read = at - this.target;
     if (at + frames <= this.read) {
@@ -104,6 +105,10 @@ class DirectAudio extends AudioWorkletProcessor {
     const out = outputs[0];
     const n = out[0].length;
     if (this.read == null) return true;
+    // the least wait there can be: one render quantum and one packet (and a hair) – with less, the next
+    // quantum would ask for sound whose packet is not here yet (as the apps' buffer, audio_ring.cpp)
+    const floor = Math.min(MAX_TARGET, n + Math.max(48, this.lastPacket || 120) + 16);
+    if (this.target < floor) this.target = floor;
     const buffered = this.end - this.read;
     if (buffered < n) {
       // ran dry: since when, and where the sound ended, is kept (the packets that come decide what it was)
@@ -136,8 +141,8 @@ class DirectAudio extends AudioWorkletProcessor {
     }
     skip = Math.max(0, Math.min(skip, buffered - n));
     this.calm += n;
-    if (this.calm > RATE * 3 && this.target > MIN_TARGET) {
-      this.target -= 48;
+    if (this.calm > RATE * 3 && this.target > floor) {
+      this.target = Math.max(floor, this.target - 48);
       this.calm = 0;
     }
     const ch = this.channels;

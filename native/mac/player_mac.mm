@@ -418,8 +418,8 @@ struct MacAudioOut::Impl {
     AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &fmt, sizeof fmt);
     AURenderCallbackStruct cb = {render, this};
     AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
-    // a small device buffer: ~2.7 ms
-    UInt32 frames = 128;
+    // a small device buffer: ~1.3 ms (the sound buffer waits one of these and a packet: ~4 ms)
+    UInt32 frames = 64;
     AudioUnitSetProperty(unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &frames, sizeof frames);
     return AudioUnitInitialize(unit) == noErr && AudioOutputUnitStart(unit) == noErr;
   }

@@ -2093,7 +2093,13 @@ function drawDirectFrame(d, frame) {
 
 async function openDirectAudio(d, channels) {
   closeDirectAudio(d);
-  const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+  // (latencyHint 0: the device's least latency the browser gives – where it takes a number)
+  let ctx;
+  try {
+    ctx = new AudioContext({ sampleRate: 48000, latencyHint: 0 });
+  } catch {
+    ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+  }
   try {
     await ctx.audioWorklet.addModule('/direct-audio.js');
   } catch (err) {

@@ -13,7 +13,7 @@ namespace ss {
 namespace {
 const int kRate = 48000;
 const int kRing = kRate; // one second
-const int kMinTarget = 240, kMaxTarget = 4800; // 5 … 100 ms
+const int kMinTarget = 240, kMaxTarget = 4800; // to start with (5 ms; then see pull) … 100 ms
 const int kFade = 96;                          // 2 ms: playing past what is too much is crossfaded
 const int kWindow = kRate / 2;                 // the buffer's lowest level is looked at every half second
 const float K = 0.70710678f;
@@ -99,6 +99,7 @@ void AudioRing::write(int sub, const float* pcm, int frames, double tsUs) {
 
 void AudioRing::place(int pair, int pc, const float* pcm, int frames, double tsUs) {
   if (!std::isfinite(tsUs)) return;
+  lastPacket_ = frames;
   long long at = llround(tsUs * kRate / 1e6);
   if (read_ == LLONG_MIN) read_ = at - target_;
   if (at + frames <= read_) {
@@ -133,6 +134,12 @@ void AudioRing::pull(float* out, int outs, int n) {
   std::fill(out, out + size_t(n) * size_t(outs), 0.0f);
   std::lock_guard<std::mutex> l(mu_);
   if (read_ == LLONG_MIN || !channels_) return;
+  // The least wait there can be: one period of the device and one packet (and a hair) – with less, the
+  // device would ask for sound whose packet is not here yet, every time. No more than that is kept
+  // unless the network makes it run dry: a 2.7 ms period (Mac, Windows' low-latency engine) and 2.5 ms
+  // packets: ~5 ms; a 1.3 ms one: ~4 ms; a 10 ms period: ~13 ms (and no click at the start any more).
+  int floor = int(std::min<long long>(kMaxTarget, n + std::max(48, lastPacket_) + 16));
+  if (target_ < floor) target_ = floor;
   long long buffered = end_ - read_;
   if (buffered < n) {
     // ran dry: since when, and where the sound ended, is kept (the packets that come decide what it was)
@@ -164,8 +171,8 @@ void AudioRing::pull(float* out, int outs, int n) {
   }
   skip = std::max(0LL, std::min(skip, buffered - n));
   calm_ += n;
-  if (calm_ > kRate * 3 && target_ > kMinTarget) {
-    target_ -= 48;
+  if (calm_ > kRate * 3 && target_ > floor) {
+    target_ = std::max(floor, target_ - 48);
     calm_ = 0;
   }
   float v = volume_;
