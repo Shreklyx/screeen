@@ -1,6 +1,5 @@
 #include "player_mac.h"
 
-#import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMotion/CoreMotion.h>
 #import <CoreMedia/CoreMedia.h>
@@ -458,193 +457,9 @@ struct MacAudioOut::Impl {
     }
   }
 
-  /* -- macOS's own spatial audio. Control Center (Sound → AirPods / Beats → Spatial Audio: Fixed, Head
-   *    Tracked) offers it only for sound that AVFoundation plays – for an output unit it says "Not
-   *    Available". With spatial on, the sound goes through an AVSampleBufferAudioRenderer that allows it
-   *    (stereo and 5.1 / 7.1 as they are: the system places the speakers and follows the head); off, the
-   *    output unit again (the least delay). The renderer is fed from the ring on a timer, kLead ahead of
-   *    its clock – it is given no more than that. */
-  static const int kStep = 240;       // 5 ms a sample buffer
-  static const int64_t kLead = 1920;  // 40 ms ahead of the renderer's clock
-  struct System {
-    AVSampleBufferAudioRenderer* renderer = nil;
-    AVSampleBufferRenderSynchronizer* sync = nil;
-    dispatch_queue_t queue = nil;
-    dispatch_source_t timer = nil;
-    CMAudioFormatDescriptionRef format = nullptr;
-    int channels = 0;
-    int64_t next = 0; // the next sample's time on the renderer's clock (48 kHz)
-    bool started = false;
-    std::atomic<bool> failed{false};
-    std::vector<float> buf;
-    ~System() {
-      if (format) CFRelease(format);
-    }
-  };
-  std::unique_ptr<System> sys;
-
-  /** The format for the sound's own channels (the order Windows sends them in: L R C LFE BL BR SL SR). */
-  static CMAudioFormatDescriptionRef formatFor(int channels) {
-    AudioStreamBasicDescription f = {};
-    f.mSampleRate = 48000;
-    f.mFormatID = kAudioFormatLinearPCM;
-    f.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-    f.mChannelsPerFrame = UInt32(channels);
-    f.mBitsPerChannel = 32;
-    f.mBytesPerFrame = f.mBytesPerPacket = UInt32(4 * channels);
-    f.mFramesPerPacket = 1;
-    AudioChannelLayout layout = {};
-    layout.mChannelLayoutTag = channels == 1   ? kAudioChannelLayoutTag_Mono
-                               : channels == 6 ? kAudioChannelLayoutTag_WAVE_5_1_A
-                               : channels == 8 ? kAudioChannelLayoutTag_WAVE_7_1
-                                               : kAudioChannelLayoutTag_Stereo;
-    CMAudioFormatDescriptionRef fmt = nullptr;
-    CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &f, sizeof layout, &layout, 0, nullptr, nullptr, &fmt);
-    return fmt;
-  }
-
-  /** On the renderer's queue: the ring's sound up to kLead ahead of the clock. */
-  void feed(System* s) {
-    if (s->failed) return;
-    if (s->renderer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-      s->failed = true;
-      return;
-    }
-    int64_t now = 0;
-    if (s->started) {
-      CMTime t = s->sync.currentTime;
-      if (CMTIME_IS_NUMERIC(t)) now = CMTimeConvertScale(t, 48000, kCMTimeRoundingMethod_RoundTowardZero).value;
-    }
-    // behind (the timer was late, the output changed): from a little ahead of now again – the gap is silence
-    if (s->started && s->next < now + kStep) s->next = now + kStep;
-    // the sound's own channels (5.1 / 7.1 too: the system places them); others the ring mixes to stereo
-    int src = ring.sourceChannels();
-    int ch = src == 1 || src == 6 || src == 8 ? src : 2;
-    if (ch != s->channels || !s->format) {
-      if (s->format) CFRelease(s->format);
-      s->format = formatFor(ch);
-      s->channels = ch;
-    }
-    if (!s->format) return;
-    s->buf.resize(size_t(kStep) * size_t(ch));
-    const size_t bytes = s->buf.size() * sizeof(float);
-    while (s->next < now + kLead) {
-      ring.pull(s->buf.data(), ch, kStep);
-      CMBlockBufferRef block = nullptr;
-      if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, nullptr, bytes, kCFAllocatorDefault, nullptr, 0, bytes, kCMBlockBufferAssureMemoryNowFlag, &block) != noErr)
-        return;
-      CMBlockBufferReplaceDataBytes(s->buf.data(), block, 0, bytes);
-      CMSampleBufferRef sample = nullptr;
-      OSStatus st = CMAudioSampleBufferCreateReadyWithPacketDescriptions(kCFAllocatorDefault, block, s->format, kStep, CMTimeMake(s->next, 48000), nullptr, &sample);
-      CFRelease(block);
-      if (st != noErr || !sample) return;
-      [s->renderer enqueueSampleBuffer:sample];
-      CFRelease(sample);
-      s->next += kStep;
-    }
-    if (!s->started) { // (the first kLead is there: the clock starts from 0)
-      s->started = true;
-      [s->sync setRate:1.0 time:kCMTimeZero];
-    }
-  }
-
-  bool startSystem() {
-    if (sys) return true;
-    auto s = std::make_unique<System>();
-    s->renderer = [AVSampleBufferAudioRenderer new];
-    s->renderer.allowedAudioSpatializationFormats = AVAudioSpatializationFormatMonoStereoAndMultichannel;
-    s->sync = [AVSampleBufferRenderSynchronizer new];
-    if (!s->renderer || !s->sync) return false;
-    [s->sync addRenderer:s->renderer];
-    s->queue = dispatch_queue_create("hu.mozizas.screenshare.spatial", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
-    s->timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, s->queue);
-    if (!s->timer) return false; // (from here on it is resumed: a suspended one may not be let go)
-    if (unit) AudioOutputUnitStop(unit); // (one of the two plays)
-    System* raw = s.get();
-    sys = std::move(s);
-    dispatch_source_set_event_handler(raw->timer, ^{ this->feed(raw); });
-    dispatch_source_set_timer(raw->timer, dispatch_time(DISPATCH_TIME_NOW, 0), 2500 * NSEC_PER_USEC, 250 * NSEC_PER_USEC);
-    dispatch_resume(raw->timer);
-    return true;
-  }
-
-  void stopSystem() {
-    if (!sys) return;
-    std::unique_ptr<System> s = std::move(sys);
-    dispatch_source_cancel(s->timer);
-    dispatch_sync(s->queue, ^{}); // (a feed under way ends first)
-    [s->sync setRate:0];
-    [s->renderer stopRequestingMediaData];
-    [s->renderer flush];
-    [s->sync removeRenderer:s->renderer atTime:kCMTimeInvalid completionHandler:nil];
-    if (unit) AudioOutputUnitStart(unit);
-  }
-
-  /** The system's renderer gave up (it can, e.g. with no output at all): the output unit again. */
-  bool systemFailed() const { return sys && sys->failed; }
-
-  /* -- which way the sound goes. Bluetooth headphones (AirPods, Beats): through the system's renderer
-   *    above, with its spatial audio allowed – Control Center then offers Spatial Audio (Fixed, Head
-   *    Tracked) for the app, no button needed (Bluetooth itself delays ~150 ms: 40 ms more is not
-   *    heard). Anything else: the output unit, the least delay, and our head model if it is on. The
-   *    default output is watched: AirPods connecting or going away switch the way at once. */
-  bool own = false;            // our head model (wired headphones)
-  bool systemAllowed = true;   // macOS's spatial audio (Bluetooth headphones)
-  bool bluetooth = false;      // what the output is now
-  std::function<void()> onRoute;
-  AudioObjectPropertyListenerBlock routeListener = nil;
-
-  static AudioObjectPropertyAddress defaultOutput() {
-    return {kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-  }
-
-  static bool outputIsBluetooth() {
-    AudioObjectPropertyAddress a = defaultOutput();
-    AudioDeviceID dev = 0;
-    UInt32 size = sizeof dev;
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, nullptr, &size, &dev) != noErr || !dev) return false;
-    AudioObjectPropertyAddress t = {kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
-    UInt32 type = 0;
-    size = sizeof type;
-    if (AudioObjectGetPropertyData(dev, &t, 0, nullptr, &size, &type) != noErr) return false;
-    return type == kAudioDeviceTransportTypeBluetooth || type == kAudioDeviceTransportTypeBluetoothLE;
-  }
-
-  void route() {
-    bluetooth = outputIsBluetooth();
-    if (bluetooth && systemAllowed && startSystem()) {
-      ring.setSpatial(false); // (the system's spatial audio: ours would be a second one)
-      track(false);
-      return;
-    }
-    stopSystem();
-    // (Bluetooth where the system's could not start – it gave up: ours, following the head with AirPods)
-    bool ours = bluetooth ? systemAllowed : own;
-    ring.setSpatial(ours);
-    track(ours && bluetooth);
-  }
-
-  void watchRoute() {
-    auto still = alive;
-    Impl* self = this;
-    routeListener = ^(UInt32, const AudioObjectPropertyAddress*) {
-      if (!*still) return;
-      bool was = self->bluetooth;
-      self->route();
-      if (was != self->bluetooth && self->onRoute) self->onRoute();
-    };
-    AudioObjectPropertyAddress a = defaultOutput();
-    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &a, dispatch_get_main_queue(), routeListener);
-  }
-
   ~Impl() {
     *alive = false;
-    if (routeListener) {
-      AudioObjectPropertyAddress a = defaultOutput();
-      AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &a, dispatch_get_main_queue(), routeListener);
-    }
     track(false);
-    stopSystem();
     if (unit) {
       AudioOutputUnitStop(unit);
       AudioUnitUninitialize(unit);
@@ -653,36 +468,14 @@ struct MacAudioOut::Impl {
   }
 };
 
-MacAudioOut::MacAudioOut() : impl_(new Impl) {
-  impl_->open();
-  impl_->route();
-  impl_->watchRoute();
-}
+MacAudioOut::MacAudioOut() : impl_(new Impl) { impl_->open(); }
 MacAudioOut::~MacAudioOut() = default;
 void MacAudioOut::push(int sub, const uint8_t* data, size_t n, double tsUs) { impl_->ring.push(sub, data, n, tsUs); }
 void MacAudioOut::setVolume(float v) { impl_->ring.setVolume(v); }
 
 void MacAudioOut::setSpatial(bool on) {
-  impl_->own = on;
-  impl_->route();
-}
-
-void MacAudioOut::setSystemSpatial(bool on) {
-  impl_->systemAllowed = on;
-  impl_->route();
-}
-
-bool MacAudioOut::bluetooth() const { return impl_->bluetooth; }
-
-void MacAudioOut::onRouteChange(std::function<void()> f) { impl_->onRoute = std::move(f); }
-
-bool MacAudioOut::systemSpatial() {
-  if (impl_->systemFailed()) { // (its renderer gave up: the output unit, and our head model, from here on)
-    impl_->stopSystem();
-    impl_->ring.setSpatial(impl_->bluetooth ? impl_->systemAllowed : impl_->own);
-    impl_->track(impl_->bluetooth && impl_->systemAllowed);
-  }
-  return impl_->sys != nullptr;
+  impl_->ring.setSpatial(on);
+  impl_->track(on);
 }
 
 }  // namespace ss

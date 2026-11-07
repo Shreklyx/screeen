@@ -45,19 +45,9 @@ class MacAudioOut {
   ~MacAudioOut();
   void push(int sub, const uint8_t* data, size_t n, double tsUs);
   void setVolume(float v);
-  /** Our head model (common/spatial.h) – for wired headphones; on Bluetooth headphones macOS's own
-   *  spatial audio takes its place (setSystemSpatial). */
+  /** Spatial sound for headphones (common/spatial.h) – with AirPods (macOS 14+) it follows the head:
+   *  the speakers stay where they are while the head turns. */
   void setSpatial(bool on);
-  /** Bluetooth headphones (AirPods, Beats): the sound goes through AVFoundation with spatialization
-   *  allowed, so Control Center (Sound → Spatial Audio: Fixed / Head Tracked) offers it for the app –
-   *  on unless turned off. */
-  void setSystemSpatial(bool on);
-  /** The output is Bluetooth now (the button is the system's spatial audio then, ours otherwise). */
-  bool bluetooth() const;
-  /** Called on the main thread when the output changes between Bluetooth and anything else. */
-  void onRouteChange(std::function<void()> f);
-  /** The system's spatial audio plays now (if its renderer gave up: the output unit from here on). */
-  bool systemSpatial();
 
  private:
   struct Impl;
