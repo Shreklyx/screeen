@@ -36,6 +36,11 @@ void gcmSeal(const Gcm& g, const uint8_t iv[12], const uint8_t* aad, size_t aadL
 /** data decrypted in place; false (and data undefined) when the tag does not match. */
 bool gcmOpen(const Gcm& g, const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, const uint8_t tag[16]);
 
+/** ChaCha20-Poly1305 (RFC 8439), a 32-byte key and a 12-byte nonce: data en- / decrypted in place (open:
+ *  false, and nothing decrypted, when the tag does not match). */
+void chachaSeal(const uint8_t key[32], const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, uint8_t tag[16]);
+bool chachaOpen(const uint8_t key[32], const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, const uint8_t tag[16]);
+
 /** What runs AES and GHASH here: "x86 AES-NI + PCLMULQDQ", "ARMv8 AES + PMULL" or "portable". */
 const char* engineName();
 /** Zeros the compiler keeps (a key out of memory). */

@@ -1,7 +1,8 @@
 // Screen Share for the website – WebAssembly from the apps' own C++ code: the lossless sound (FLAC, our
 // own encoder and decoder – native/common/lossless.cpp, the same as the apps'), the spatial sound for
 // headphones (native/common/spatial.cpp, the apps' head model) and our own cryptography
-// (native/core/crypto_core.cpp, the apps' too: X25519, HKDF, AES-128-GCM, HMAC – the server's scrypt).
+// (native/core/crypto_core.cpp, the apps' too: X25519, HKDF, ChaCha20-Poly1305 and AES-128-GCM, HMAC – the
+// server's scrypt).
 // No library. public/ss-web.js loads it (the server too: server/own-crypto.js); build: native/web/build.sh.
 // (C headers: there is no C++ library for wasm32-wasi here, and none is needed)
 #include <stdint.h>
@@ -75,6 +76,13 @@ EXPORT(ss_gcm_seal) void ss_gcm_seal(const sc::Gcm* g, const uint8_t* iv, const 
 }
 EXPORT(ss_gcm_open) int ss_gcm_open(const sc::Gcm* g, const uint8_t* iv, const uint8_t* aad, int aadLen, uint8_t* data, int n, const uint8_t* tag) {
   return sc::gcmOpen(*g, iv, aad, size_t(aadLen), data, size_t(n), tag) ? 1 : 0;
+}
+/** ChaCha20-Poly1305 (RFC 8439): a 32-byte key, a 12-byte nonce; seal / open in place. */
+EXPORT(ss_chacha_seal) void ss_chacha_seal(const uint8_t* key, const uint8_t* iv, const uint8_t* aad, int aadLen, uint8_t* data, int n, uint8_t* tag) {
+  sc::chachaSeal(key, iv, aad, size_t(aadLen), data, size_t(n), tag);
+}
+EXPORT(ss_chacha_open) int ss_chacha_open(const uint8_t* key, const uint8_t* iv, const uint8_t* aad, int aadLen, uint8_t* data, int n, const uint8_t* tag) {
+  return sc::chachaOpen(key, iv, aad, size_t(aadLen), data, size_t(n), tag) ? 1 : 0;
 }
 EXPORT(ss_gcm_free) void ss_gcm_free(sc::Gcm* g) {
   if (!g) return;

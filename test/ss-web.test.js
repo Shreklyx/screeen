@@ -85,3 +85,22 @@ test('our crypto in WebAssembly: X25519 (RFC 7748) and with OpenSSL; AES-128-GCM
     g.close();
   }
 });
+
+test('our crypto in WebAssembly: ChaCha20-Poly1305 (RFC 8439) as OpenSSL – the links with a browser', async () => {
+  const nodeCrypto = await import('node:crypto');
+  const key = unhex('808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f');
+  const sealed = c.chacha(key).seal(unhex('070000004041424344454647'), unhex('50515253c0c1c2c3c4c5c6c7'), new TextEncoder().encode("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."));
+  assert.equal(hex(sealed.subarray(-16)), '1ae10b594f09e26a7e902ecbd0600691', 'RFC 8439 2.8.2');
+  for (let n = 0; n < 2100; n += n < 300 ? 1 : 97) {
+    const k = nodeCrypto.randomBytes(32), iv = nodeCrypto.randomBytes(12), aad = nodeCrypto.randomBytes(n % 33), pt = nodeCrypto.randomBytes(n);
+    const ours = c.chacha(k);
+    const s = ours.seal(iv, aad, pt);
+    const e = nodeCrypto.createCipheriv('chacha20-poly1305', k, iv, { authTagLength: 16 });
+    e.setAAD(aad, { plaintextLength: n });
+    assert.equal(hex(s), hex(Buffer.concat([e.update(pt), e.final(), e.getAuthTag()])), `${n} bytes`);
+    assert.equal(hex(ours.open(iv, aad, s)), hex(pt));
+    s[(n * 5) % s.length] ^= 8;
+    assert.equal(ours.open(iv, aad, s), null, 'changed: refused');
+    ours.close();
+  }
+});

@@ -5,8 +5,9 @@
 //
 // A browser cannot send UDP, so its packets travel in a WebSocket to the server
 // (wss://…/direct), which passes them to the other side (the app's "tcp" path). The packets
-// are encrypted end to end like the app's (X25519 + HKDF → AES-128-GCM – our own code: the apps' C++ as
-// WebAssembly, ss-web.js): the server pairs the two ends by session and HMAC, but cannot read the picture.
+// are encrypted end to end like the app's (X25519 + HKDF → ChaCha20-Poly1305, or AES-128-GCM with an older
+// app – our own code: the apps' C++ as WebAssembly, ss-web.js): the server pairs the two ends by session
+// and HMAC, but cannot read the picture.
 // Over the WebSocket a frame goes as one packet (TCP loses nothing, so no NACK); a frame that
 // cannot be sent in time is dropped instead of waiting in a queue, and the viewer asks for a
 // keyframe. The viewer confirms each frame (ACK): a queue anywhere on the way – the server, its
@@ -30,6 +31,16 @@
   const KEY_QUEUE_MS = 1000;
   const INFO = new TextEncoder().encode('screenshare-direct-v1');
   const INFO2 = new TextEncoder().encode('screenshare-direct-v2'); // (the room's own key mixed in)
+  // The cipher. A browser has no AES instructions for WebAssembly, and ChaCha20-Poly1305 (RFC 8439) is
+  // several times faster in software – our own code too; the apps keep AES-128-GCM between themselves
+  // (their CPUs' AES instructions). ChaCha20-Poly1305 when both sides have it and one prefers it; an older
+  // app (no list): AES-128-GCM. Its keys: 32 bytes each way, from their own label.
+  const AES = 'aes-128-gcm';
+  const CHACHA = 'chacha20-poly1305';
+  const AEADS = [CHACHA, AES];
+  const INFO_CHACHA = new TextEncoder().encode('screenshare-direct-v1-chacha20');
+  const INFO2_CHACHA = new TextEncoder().encode('screenshare-direct-v2-chacha20');
+  const useChaCha = (theirs) => Array.isArray(theirs) && theirs.includes(CHACHA); // (ours lists it first)
   const now = () => performance.timeOrigin + performance.now();
 
   const b64 = (bytes) => btoa(String.fromCharCode(...bytes));
@@ -92,8 +103,9 @@
       this.role = role;
       this.kx = null; // our key pair (see newKeys)
       this.hmacKey = null; // the session's secret (the server's HMAC key for this connection)
-      this.sendKey = null; // AES-128-GCM, one key each way (ss-web.js gcm())
+      this.sendKey = null; // one key each way (ss-web.js chacha() or gcm())
       this.recvKey = null;
+      this.aead = null; // which: CHACHA or AES
       this.counter = 0n;
       this.state = 'new';
       this.path = null; // { kind: 'tcp', rtt }
@@ -176,7 +188,7 @@
       peer.hmacKey = unb64(secret);
       this.openSocket(peer);
       // no UDP addresses: the other side uses the WebSocket path at once
-      return { pub: b64(peer.kx.pub), cands: [], tcp: true };
+      return { pub: b64(peer.kx.pub), cands: [], tcp: true, aead: AEADS };
     }
 
     /** The WebSocket to the server; the first message proves the session (HMAC of its secret). */
@@ -216,7 +228,7 @@
     }
 
     /** The other side's answer: the keys, then probes until it answers. */
-    async connectPeer(id, { pub, psk }) {
+    async connectPeer(id, { pub, psk, aead }) {
       const peer = this.peers.get(id);
       if (!peer) return;
       try {
@@ -231,16 +243,20 @@
         }
         const salt = new Uint8Array(4);
         new DataView(salt.buffer).setUint32(0, peer.session);
-        const okm = c.hkdfSha256(salt, ikm, withKey ? INFO2 : INFO, 32);
+        const chacha = useChaCha(aead);
+        const n = chacha ? 32 : 16;
+        const okm = c.hkdfSha256(salt, ikm, chacha ? (withKey ? INFO2_CHACHA : INFO_CHACHA) : withKey ? INFO2 : INFO, 2 * n);
         ikm.fill(0);
         shared.fill(0);
-        const toViewer = c.gcm(okm.subarray(0, 16));
-        const toHost = c.gcm(okm.subarray(16, 32));
+        const key = (raw) => (chacha ? c.chacha(raw) : c.gcm(raw));
+        const toViewer = key(okm.subarray(0, n));
+        const toHost = key(okm.subarray(n, 2 * n));
         okm.fill(0);
         peer.sendKey?.close();
         peer.recvKey?.close();
         peer.sendKey = this.role === 'host' ? toViewer : toHost;
         peer.recvKey = this.role === 'host' ? toHost : toViewer;
+        peer.aead = chacha ? CHACHA : AES;
       } catch {
         this.setState(peer, 'failed', { server: false, turn: false, tcp: peer.ready, remote: 0 });
         return;
@@ -273,7 +289,7 @@
 
     setState(peer, state, diag = null) {
       peer.state = state;
-      this.emit('state', peer.id, { state, path: peer.path?.kind || null, rtt: peer.path?.rtt ?? null, ...(diag ? { diag } : {}) });
+      this.emit('state', peer.id, { state, path: peer.path?.kind || null, rtt: peer.path?.rtt ?? null, aead: peer.aead, ...(diag ? { diag } : {}) });
     }
 
     /* ---- receiving */

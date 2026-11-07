@@ -169,6 +169,7 @@ struct Engine::Impl {
     bool direct = false;
     std::string state; // starting / connecting / connected / failed / lost / closed
     std::string path;
+    std::string aead; // the connection's cipher (kAes128Gcm / kChaCha20Poly1305)
     double rtt = NAN, minRtt = INFINITY;
     Json report;
     int directTimer = 0, retryTimer = 0, retries = 0;
@@ -207,6 +208,7 @@ struct Engine::Impl {
     Offer mine;
     std::string state = "starting";
     std::string path;
+    std::string aead; // the connection's cipher (kAes128Gcm / kChaCha20Poly1305)
     double rtt = NAN;
     Json report;
     uint64_t frames = 0;
@@ -404,6 +406,7 @@ struct Engine::Impl {
     ep->forceRelay = cfg.forceRelay;
     ep->forceTurn = cfg.forceTurn;
     ep->forceTcp = cfg.forceTcp;
+    ep->preferChaCha = cfg.preferChaCha;
     ep->noAcks = cfg.noAcks;
     if (!ep->open()) status("A közvetlen átvitel nem indult el (UDP).", "error");
   }
@@ -643,6 +646,7 @@ struct Engine::Impl {
     const std::string& state = info["state"].str();
     v.state = state;
     v.path = info["path"].str("");
+    v.aead = info["aead"].str(v.aead);
     v.rtt = info["rtt"].num(NAN);
     if (state == "connected") {
       loop.cancel(v.directTimer);
@@ -756,6 +760,7 @@ struct Engine::Impl {
       o.set("id", v.id).set("n", v.n).set("name", v.name);
       std::string state = v.unsupported ? "unsupported" : !v.direct ? "retrying" : v.state;
       o.set("state", state).set("path", v.path);
+      if (!v.aead.empty()) o.set("aead", v.aead);
       if (v.state == "connected") o.set("verified", v.verified); // (came with the link: the room's key checked)
       const Json& r = v.report;
       if (r.isObject() && v.state == "connected") o.set("fps", r["fps"]).set("kbps", r["kbps"]).set("loss", r["loss"]);
@@ -973,6 +978,7 @@ struct Engine::Impl {
     const std::string& state = info["state"].str();
     view->state = state;
     view->path = info["path"].str("");
+    view->aead = info["aead"].str(view->aead);
     if (info["rtt"].isNumber()) view->rtt = info["rtt"].num();
     if (state == "failed") {
       const Json& d = info["diag"];
@@ -1039,6 +1045,7 @@ struct Engine::Impl {
     Json e = Json::object();
     e.set("type", "view-stats").set("fps", std::isnan(fps) ? Json() : Json(fps)).set("kbps", r["kbps"]).set("loss", r["loss"]).set("skips", r["skips"]);
     e.set("rtt", std::isnan(view->rtt) ? Json() : Json(view->rtt)).set("path", view->path).set("lat", std::isnan(lat) ? Json() : Json(lat));
+    if (!view->aead.empty()) e.set("aead", view->aead);
     e.set("encoder", hostStats["encoder"]).set("hw", hostStats["hw"]).set("encodeMs", hostStats["encodeMs"]);
     emit(e);
   }

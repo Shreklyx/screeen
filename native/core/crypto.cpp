@@ -82,6 +82,20 @@ bool AesGcm::open(const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8
   return crypto::gcmOpen(impl_->g, iv, aad, aadLen, data, n, tag);
 }
 
+/* ------------------------------------------------ ChaCha20-Poly1305 */
+
+ChaCha20Poly1305::ChaCha20Poly1305(const uint8_t key[32]) { std::memcpy(key_, key, 32); }
+
+ChaCha20Poly1305::~ChaCha20Poly1305() { crypto::wipe(key_, sizeof key_); }
+
+void ChaCha20Poly1305::seal(const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, uint8_t tag[16]) {
+  crypto::chachaSeal(key_, iv, aad, aadLen, data, n, tag);
+}
+
+bool ChaCha20Poly1305::open(const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, const uint8_t tag[16]) {
+  return crypto::chachaOpen(key_, iv, aad, aadLen, data, n, tag);
+}
+
 /* ------------------------------------------------ base64 */
 
 std::string base64Encode(const uint8_t* p, size_t n) {

@@ -63,6 +63,23 @@ static void packetTests() {
   direct_detail::Keys ph, pv, po;
   CHECK(direct_detail::deriveKeys(h, vp, 42, ph, psk) && direct_detail::deriveKeys(v, hp, 42, pv, psk) && ph.toViewer == pv.toViewer && ph.toHost == pv.toHost, "with the room's key: both sides the same keys");
   CHECK(direct_detail::deriveKeys(v, hp, 42, po, other) && po.toViewer != ph.toViewer && ph.toViewer != kh.toViewer, "another room key (or none): other keys");
+  // the cipher: ChaCha20-Poly1305 when both have it and one prefers it (a browser), else AES-128-GCM
+  const std::vector<std::string> app = {kAes128Gcm, kChaCha20Poly1305}, web = {kChaCha20Poly1305, kAes128Gcm}, old;
+  CHECK(!direct_detail::useChaCha(app, app) && direct_detail::useChaCha(app, web) && direct_detail::useChaCha(web, app) && direct_detail::useChaCha(web, web),
+        "the cipher: AES-128-GCM between two apps, ChaCha20-Poly1305 with a browser");
+  CHECK(!direct_detail::useChaCha(app, old) && !direct_detail::useChaCha(web, old) && !direct_detail::useChaCha(old, web), "an older side (no list): AES-128-GCM");
+  direct_detail::Keys ch, cv;
+  CHECK(direct_detail::deriveKeys(h, vp, 42, ch, psk, true) && direct_detail::deriveKeys(v, hp, 42, cv, psk, true) && ch.toViewer == cv.toViewer && ch.toHost == cv.toHost &&
+            !std::equal(ch.toViewer.begin(), ch.toViewer.begin() + 16, ph.toViewer.begin()),
+        "ChaCha20-Poly1305's keys: the same on both sides, 32 bytes, not AES's");
+  ChaCha20Poly1305 csend(ch.toViewer.data()), crecv(cv.toViewer.data()), cwrong(cv.toHost.data());
+  packet = direct_detail::seal(csend, 1, 3, 42, 8, reinterpret_cast<const uint8_t*>(msg), 5);
+  CHECK(direct_detail::unseal(crecv, 1, packet.data(), packet.size(), body) && std::string(body.begin(), body.end()) == "frame" && !direct_detail::unseal(cwrong, 1, packet.data(), packet.size(), body),
+        "ChaCha20-Poly1305 packets: open with the right key only");
+  Offer withList;
+  withList.aead = web;
+  Offer back = Offer::fromJson(withList.toJson());
+  CHECK(back.aead == web && Offer::fromJson(Offer().toJson()).aead.empty(), "the offer carries the list (none from an older side)");
 }
 
 static void roomKeyTests() {
@@ -78,21 +95,31 @@ static void roomKeyTests() {
 
 /** Two endpoints in one loop exchange frames over loopback. `lossy`: the third packet of every frame
  *  never arrives (nor when it is asked for again) – only the parity can bring it back. */
-static void endpointTest(bool lossy) {
+static void endpointTest(bool lossy, bool chacha = false) {
   Loop loop;
   loop.start();
   std::mutex mu;
   std::condition_variable cv;
   std::vector<std::pair<uint32_t, size_t>> got;
-  std::string hostState, viewState;
+  std::string hostState, viewState, hostAead, viewAead;
   int keyframes = 0;
   DirectEndpoint *host = nullptr, *view = nullptr;
   bool ready = false;
   loop.post([&] {
     DirectEndpoint::Events he, ve;
-    he.state = [&](const std::string&, const Json& i) { std::lock_guard<std::mutex> l(mu); hostState = i["state"].str() + "/" + i["path"].str(""); cv.notify_all(); };
+    he.state = [&](const std::string&, const Json& i) {
+      std::lock_guard<std::mutex> l(mu);
+      hostState = i["state"].str() + "/" + i["path"].str("");
+      hostAead = i["aead"].str(hostAead);
+      cv.notify_all();
+    };
     he.keyframe = [&](const std::string&) { keyframes++; };
-    ve.state = [&](const std::string&, const Json& i) { std::lock_guard<std::mutex> l(mu); viewState = i["state"].str(); cv.notify_all(); };
+    ve.state = [&](const std::string&, const Json& i) {
+      std::lock_guard<std::mutex> l(mu);
+      viewState = i["state"].str();
+      viewAead = i["aead"].str(viewAead);
+      cv.notify_all();
+    };
     ve.media = [&](const MediaMeta& m, const uint8_t* d, size_t n) {
       std::lock_guard<std::mutex> l(mu);
       if (m.stream == 0) got.push_back({d[0] | d[1] << 8, n});
@@ -100,6 +127,7 @@ static void endpointTest(bool lossy) {
     };
     host = new DirectEndpoint(loop, DirectEndpoint::Role::Host, "127.0.0.1", "", nullptr, he);
     view = new DirectEndpoint(loop, DirectEndpoint::Role::Viewer, "127.0.0.1", "", nullptr, ve);
+    view->preferChaCha = chacha; // (the viewer as a browser: ChaCha20-Poly1305)
     if (lossy) {
       host->forceFec = 5;
       view->dropIncoming = [](uint8_t type, const uint8_t* b, size_t n) { return type == 3 && n >= kMediaHeader && b[0] == 0 && getU16(b + 12) == 2; };
@@ -128,6 +156,8 @@ static void endpointTest(bool lossy) {
     cv.wait_for(l, std::chrono::seconds(8), [&] { return hostState.rfind("connected", 0) == 0 && viewState == "connected"; });
   }
   CHECK(ready && hostState.rfind("connected", 0) == 0 && viewState == "connected", ("endpoints connect (" + hostState + ")").c_str());
+  const std::string want = chacha ? kChaCha20Poly1305 : kAes128Gcm;
+  CHECK(hostAead == want && viewAead == want, ("both use " + want).c_str());
   // 30 frames of ~5 packets each
   loop.post([&] {
     for (int n = 0; n < 30; n++) {
@@ -179,6 +209,7 @@ int main() {
   roomKeyTests();
   endpointTest(false);
   endpointTest(true);
+  endpointTest(false, true); // (with ChaCha20-Poly1305, as with a browser)
   std::printf(failures ? "%d FAILED\n" : "ALL PASS\n", failures);
   return failures ? 1 : 0;
 }

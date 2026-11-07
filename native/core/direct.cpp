@@ -26,6 +26,8 @@ const size_t RING = 1 << 14; // video packets kept for retransmission
 const size_t MAX_CANDS = 8;
 const char* INFO = "screenshare-direct-v1";
 const char* INFO2 = "screenshare-direct-v2"; // (the room's own key mixed in)
+const char* INFO_CHACHA = "screenshare-direct-v1-chacha20"; // (ChaCha20-Poly1305's keys: 32 bytes each way)
+const char* INFO2_CHACHA = "screenshare-direct-v2-chacha20";
 const double NaN = std::nan("");
 
 /** Parity for a frame's packets, a group of g at a time: each the XOR of the group's data (padded to
@@ -99,7 +101,13 @@ namespace direct_detail {
 // The keys from the key agreement – and, when both ends proved they hold the room's link, its own key
 // too (v2): a key the server never sees, so a server that put its own public key in between would not
 // have the keys even then.
-bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk) {
+bool useChaCha(const std::vector<std::string>& mine, const std::vector<std::string>& theirs) {
+  auto has = [](const std::vector<std::string>& l) { return std::find(l.begin(), l.end(), kChaCha20Poly1305) != l.end(); };
+  auto first = [](const std::vector<std::string>& l) { return !l.empty() && l[0] == kChaCha20Poly1305; };
+  return has(mine) && has(theirs) && (first(mine) || first(theirs));
+}
+
+bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk, bool chacha) {
   if (peerPub.size() != 32) return false;
   uint8_t ikm[48];
   if (!mine.shared(peerPub.data(), ikm)) return false;
@@ -108,13 +116,16 @@ bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys
     std::memcpy(ikm + 32, psk.data(), 16);
     ikmLen = 48;
   }
-  const char* info = ikmLen == 48 ? INFO2 : INFO;
+  const char* info = chacha ? (ikmLen == 48 ? INFO2_CHACHA : INFO_CHACHA) : (ikmLen == 48 ? INFO2 : INFO);
+  const size_t keyLen = chacha ? 32 : 16;
   uint8_t salt[4];
   putU32(salt, session);
-  Bytes okm = hkdfSha256(salt, 4, ikm, ikmLen, reinterpret_cast<const uint8_t*>(info), std::strlen(info), 32);
+  Bytes okm = hkdfSha256(salt, 4, ikm, ikmLen, reinterpret_cast<const uint8_t*>(info), std::strlen(info), 2 * keyLen);
   std::memset(ikm, 0, sizeof ikm);
-  std::memcpy(out.toViewer.data(), okm.data(), 16);
-  std::memcpy(out.toHost.data(), okm.data() + 16, 16);
+  out = Keys();
+  std::memcpy(out.toViewer.data(), okm.data(), keyLen);
+  std::memcpy(out.toHost.data(), okm.data() + keyLen, keyLen);
+  std::fill(okm.begin(), okm.end(), uint8_t(0));
   return true;
 }
 
@@ -124,7 +135,7 @@ static void nonceFor(uint8_t dir, const uint8_t* packet, uint8_t iv[12]) {
   std::memcpy(iv + 4, packet + 6, 8);
 }
 
-Bytes seal(AesGcm& key, uint8_t dir, uint8_t type, uint32_t session, uint64_t counter, const uint8_t* payload, size_t n) {
+Bytes seal(Aead& key, uint8_t dir, uint8_t type, uint32_t session, uint64_t counter, const uint8_t* payload, size_t n) {
   Bytes out(kHeader + n + kTag);
   out[0] = PEER;
   out[1] = type;
@@ -137,7 +148,7 @@ Bytes seal(AesGcm& key, uint8_t dir, uint8_t type, uint32_t session, uint64_t co
   return out;
 }
 
-bool unseal(AesGcm& key, uint8_t dir, const uint8_t* packet, size_t n, Bytes& body) {
+bool unseal(Aead& key, uint8_t dir, const uint8_t* packet, size_t n, Bytes& body) {
   if (n < kHeader + kTag) return false;
   uint8_t iv[12];
   nonceFor(dir, packet, iv);
@@ -175,6 +186,9 @@ bool validCandidate(const Json& c) {
 
 using namespace direct_detail;
 
+const char* const kAes128Gcm = "aes-128-gcm";
+const char* const kChaCha20Poly1305 = "chacha20-poly1305";
+
 Json Offer::toJson() const {
   Json c = Json::array();
   for (const Candidate& k : cands) {
@@ -186,6 +200,11 @@ Json Offer::toJson() const {
   Json j = Json::object();
   j.set("pub", pub).set("cands", c);
   if (tcp) j.set("tcp", true);
+  if (!aead.empty()) {
+    Json a = Json::array();
+    for (const std::string& name : aead) a.push(Json(name));
+    j.set("aead", a);
+  }
   return j;
 }
 
@@ -193,6 +212,10 @@ Offer Offer::fromJson(const Json& j) {
   Offer o;
   o.pub = j["pub"].str("");
   o.tcp = j["tcp"].b(false);
+  for (const Json& a : j["aead"].items()) {
+    if (o.aead.size() >= 4) break;
+    if (a.isString() && a.str().size() <= 32) o.aead.push_back(a.str());
+  }
   for (const Json& c : j["cands"].items()) {
     if (o.cands.size() >= MAX_CANDS) break;
     if (!validCandidate(c)) continue;
@@ -537,7 +560,8 @@ struct DirectEndpoint::Peer {
   uint32_t session;
   Bytes secret;
   X25519 kp = X25519::generate();
-  std::unique_ptr<AesGcm> sendKey, recvKey;
+  std::unique_ptr<Aead> sendKey, recvKey;
+  std::string aead; // what they are: kAes128Gcm or kChaCha20Poly1305
   uint64_t counter = 0;
   std::string state = "new";
   std::optional<Path> path;
@@ -743,6 +767,7 @@ void DirectEndpoint::addPeer(const std::string& id, const PeerInfo& info, std::f
     Offer o;
     o.pub = base64Encode(peer->kp.pub.data(), 32);
     o.tcp = forceTcp; // (as a browser: the other end reaches this one only in the WebSocket)
+    o.aead = aeadList();
     if (!forced) for (const std::string& ip : localIPv4()) o.cands.push_back({ip, socket_.port(), false});
     // the public address: from the server's UDP port, or from the TURN server
     std::optional<Candidate> pub = peer->publicAddr;
@@ -772,13 +797,23 @@ void DirectEndpoint::connectPeer(const std::string& id, const Offer& other, cons
   if (it == peers_.end()) return;
   Peer& p = *it->second;
   Keys keys;
-  if (!deriveKeys(p.kp, base64Decode(other.pub), p.session, keys, psk)) {
+  const bool chacha = useChaCha(aeadList(), other.aead); // (with a browser: ChaCha20-Poly1305)
+  if (!deriveKeys(p.kp, base64Decode(other.pub), p.session, keys, psk, chacha)) {
     setState(p, "failed");
     return;
   }
   bool host = role_ == Role::Host;
-  p.sendKey.reset(new AesGcm(host ? keys.toViewer.data() : keys.toHost.data()));
-  p.recvKey.reset(new AesGcm(host ? keys.toHost.data() : keys.toViewer.data()));
+  const uint8_t* send = host ? keys.toViewer.data() : keys.toHost.data();
+  const uint8_t* recv = host ? keys.toHost.data() : keys.toViewer.data();
+  if (chacha) {
+    p.sendKey.reset(new ChaCha20Poly1305(send));
+    p.recvKey.reset(new ChaCha20Poly1305(recv));
+  } else {
+    p.sendKey.reset(new AesGcm(send));
+    p.recvKey.reset(new AesGcm(recv));
+  }
+  p.aead = chacha ? kChaCha20Poly1305 : kAes128Gcm;
+  keys = Keys();
   p.tcpOnly = other.tcp; // a browser: only the WebSocket reaches it
   p.cands = other.cands;
   // the other end's TURN address is reached through our own allocation
@@ -870,6 +905,7 @@ void DirectEndpoint::setState(Peer& p, const std::string& state, const Json& dia
   info.set("state", state);
   info.set("path", p.path ? Json(p.path->kind) : Json());
   info.set("rtt", p.path ? Json(p.path->rtt) : Json());
+  if (!p.aead.empty()) info.set("aead", p.aead);
   if (!diag.isNull()) info.set("diag", diag);
   ev_.state(p.id, info);
 }
@@ -960,7 +996,7 @@ void DirectEndpoint::onProbeAck(Peer& p, const uint8_t* body, size_t n, const Ri
       setState(p, "connected");
     } else if (ev_.state) {
       Json info = Json::object();
-      info.set("state", "connected").set("path", kind).set("rtt", candidate.rtt);
+      info.set("state", "connected").set("path", kind).set("rtt", candidate.rtt).set("aead", p.aead);
       ev_.state(p.id, info);
     }
   } else if (p.path && p.path->address == candidate.address && p.path->port == candidate.port) {

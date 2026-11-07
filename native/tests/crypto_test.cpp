@@ -279,6 +279,43 @@ static void gcm() {
   CHECK(roundTrip, "AES-128-GCM: all of them open again");
 }
 
+/** ChaCha20-Poly1305 (the links with a browser): RFC 8439's vector, and every length as OpenSSL. */
+static void chachaTests() {
+  Bytes key = pattern(32, 1, 0x80), iv = hex("070000004041424344454647"), aad = hex("50515253c0c1c2c3c4c5c6c7");
+  Bytes pt = text("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."), data = pt;
+  ChaCha20Poly1305 c(key.data());
+  uint8_t tag[16];
+  c.seal(iv.data(), aad.data(), aad.size(), data.data(), data.size(), tag);
+  CHECK(hexOf(data) ==
+                "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116" &&
+            hexOf(tag, 16) == "1ae10b594f09e26a7e902ecbd0600691",
+        "ChaCha20-Poly1305 RFC 8439 2.8.2");
+  Bytes copy = data;
+  CHECK(c.open(iv.data(), aad.data(), aad.size(), copy.data(), copy.size(), tag) && copy == pt, "ChaCha20-Poly1305 opens");
+  copy = data;
+  copy[7] ^= 0x20;
+  CHECK(!c.open(iv.data(), aad.data(), aad.size(), copy.data(), copy.size(), tag) && copy[7] == (data[7] ^ 0x20), "ChaCha20-Poly1305: a changed byte refused (and nothing decrypted)");
+  Bytes k(32), all;
+  for (int i = 0; i < 32; i++) k[i] = uint8_t(i * 3 + 1);
+  ChaCha20Poly1305 s(k.data());
+  bool roundTrip = true;
+  unsigned idx = 0;
+  for (size_t len : {0, 1, 15, 16, 17, 63, 64, 65, 255, 256, 257, 1000, 1200, 4103, 100003})
+    for (size_t aadLen : {0, 1, 12, 14, 16, 17, 33}) {
+      uint8_t nonce[12];
+      for (int i = 0; i < 11; i++) nonce[i] = uint8_t(100 + i);
+      nonce[11] = uint8_t(idx++);
+      Bytes a = pattern(aadLen, 7, 3), p = pattern(len, 31, 11), d = p;
+      uint8_t t[16];
+      s.seal(nonce, a.data(), aadLen, d.data(), len, t);
+      append(all, d.data(), len);
+      append(all, t, 16);
+      roundTrip &= s.open(nonce, a.data(), aadLen, d.data(), len, t) && d == p;
+    }
+  CHECK(sha256Hex(all) == "0c5081cf478443eb9de00352aa7578af8907ccd512308373690c7e309e6afee7", "ChaCha20-Poly1305: 105 lengths of data and header (as OpenSSL)");
+  CHECK(roundTrip, "ChaCha20-Poly1305: all of them open again");
+}
+
 /** scrypt (the server's password hashes): RFC 7914's vectors, and more as OpenSSL makes them. */
 static void scryptTests() {
   auto run = [](const char* pass, const char* salt, uint64_t N, uint32_t r, uint32_t p) {
@@ -305,9 +342,8 @@ static void scryptTests() {
 }
 
 /** How fast: sealing 1200-byte packets (what direct mode sends) for a third of a second. */
-static void speed() {
-  uint8_t key[16] = {7}, iv[12] = {0}, aad[16] = {0}, tag[16];
-  AesGcm g(key);
+static double speedOf(Aead& a) {
+  uint8_t iv[12] = {0}, aad[14] = {0}, tag[16];
   Bytes packet(1200, 0x5a);
   size_t bytes = 0;
   auto start = std::chrono::steady_clock::now();
@@ -315,12 +351,19 @@ static void speed() {
   do {
     for (int i = 0; i < 64; i++) {
       iv[0]++;
-      g.seal(iv, aad, sizeof aad, packet.data(), packet.size(), tag);
+      a.seal(iv, aad, sizeof aad, packet.data(), packet.size(), tag);
       bytes += packet.size();
     }
     secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   } while (secs < 0.33);
-  std::printf("     AES-128-GCM: %.0f MB/s on 1200-byte packets (%s)\n", double(bytes) / secs / 1e6, cryptoEngine());
+  return double(bytes) / secs / 1e6;
+}
+static void speed() {
+  uint8_t key[32] = {7};
+  AesGcm g(key);
+  ChaCha20Poly1305 c(key);
+  std::printf("     AES-128-GCM: %.0f MB/s on 1200-byte packets (%s)\n", speedOf(g), cryptoEngine());
+  std::printf("     ChaCha20-Poly1305: %.0f MB/s on 1200-byte packets\n", speedOf(c));
 }
 
 int main(int argc, char** argv) {
@@ -334,6 +377,7 @@ int main(int argc, char** argv) {
   macs();
   x25519();
   gcm();
+  chachaTests();
   scryptTests();
   speed();
   std::printf(failures ? "%d FAILED\n" : "ALL PASS\n", failures);

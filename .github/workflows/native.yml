@@ -47,8 +47,12 @@ jobs:
         run: |
           PORT=8090 HOST_PASSWORD=ci DIRECT_PORT=3479 node server/server.js &
           sleep 2
-          for path in udp tcp; do
-            flag=""; [ "$path" = tcp ] && flag="--tcp"
+          # (udp-chacha, tcp-chacha: the viewer prefers ChaCha20-Poly1305, as a browser does – between two apps
+          # it is AES-128-GCM)
+          for path in udp tcp udp-chacha tcp-chacha; do
+            flag=""; aead=aes-128-gcm
+            case "$path" in tcp*) flag="--tcp" ;; esac
+            case "$path" in *chacha) flag="$flag --chacha"; aead=chacha20-poly1305 ;; esac
             build/ss-cli host --server http://127.0.0.1:8090 --password ci --h264 native/tests/data/test.h264 --seconds 12 --tone $flag > host.log &
             host=$!
             for i in $(seq 1 50); do grep -q '^ROOM' host.log && break; sleep 0.2; done
@@ -56,7 +60,7 @@ jobs:
             code=$(grep '^ROOM' host.log | awk '{print $2}')
             build/ss-cli view --server http://127.0.0.1:8090 --code "$code" --seconds 5 $flag | tee view.log | grep RESULT
             # (and the sound, lossless: every FLAC frame whole – 400 a second)
-            node -e "const r=JSON.parse(require('fs').readFileSync('view.log','utf8').split('\n').find(l=>l.startsWith('RESULT ')).slice(7)); if(!(r.frames>100&&r.firstKey)) {console.error('too few frames', r); process.exit(1)} if(!(r.lossless>1000)||r.losslessBad) {console.error('the lossless sound did not come whole', r); process.exit(1)}"
+            node -e "const r=JSON.parse(require('fs').readFileSync('view.log','utf8').split('\n').find(l=>l.startsWith('RESULT ')).slice(7)); if(!(r.frames>100&&r.firstKey)) {console.error('too few frames', r); process.exit(1)} if(!(r.lossless>1000)||r.losslessBad) {console.error('the lossless sound did not come whole', r); process.exit(1)} if(r.aead!=='$aead') {console.error('the cipher is not $aead', r); process.exit(1)}"
             wait $host # (not the server: that one runs on)
           done
       # End to end: a viewer with the link takes only a sharer that proves the room's key – one whose key does

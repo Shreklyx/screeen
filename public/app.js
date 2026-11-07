@@ -612,7 +612,7 @@ async function onViewerSignal(id, data) {
       psk = host.key;
     }
     d.verified = Boolean(psk);
-    DIRECT.connect(v.id, { pub: data.pub, cands: data.cands, tcp: data.tcp === true, psk });
+    DIRECT.connect(v.id, { pub: data.pub, cands: data.cands, tcp: data.tcp === true, aead: data.aead, psk });
   } else if (data.type === 'direct-fail') {
     directFailed(v, typeof data.why === 'string' && WHY_TEXT[data.why] ? data.why : 'failed');
   } else if (data.type === 'stats') {
@@ -1031,7 +1031,7 @@ async function onDirectSession(msg) {
   d.state = 'connecting';
   const proof = await e2eProof(host.key, 'host', v.session, res.pub); // (it holds the room's key)
   if (v.direct !== d) return;
-  host.signal.send({ t: 'signal', to: v.id, data: { type: 'direct-offer', session: v.session, udp: msg.session, pub: res.pub, cands: res.cands, tcp: res.tcp === true, codec: DIRECT_CODEC, proof } });
+  host.signal.send({ t: 'signal', to: v.id, data: { type: 'direct-offer', session: v.session, udp: msg.session, pub: res.pub, cands: res.cands, tcp: res.tcp === true, aead: res.aead, codec: DIRECT_CODEC, proof } });
 }
 
 function onHostDirectEvent(name, id, info) {
@@ -2100,8 +2100,8 @@ async function onDirectOffer(data) {
     if (viewer.direct !== d) return;
   }
   d.state = 'connecting';
-  DIRECT.connect('host', { pub: data.pub, cands: data.cands, tcp: data.tcp === true, psk });
-  sendToHost({ type: 'direct-answer', pub: res.pub, cands: res.cands, tcp: res.tcp === true, ...(proof ? { proof } : {}) });
+  DIRECT.connect('host', { pub: data.pub, cands: data.cands, tcp: data.tcp === true, aead: data.aead, psk });
+  sendToHost({ type: 'direct-answer', pub: res.pub, cands: res.cands, tcp: res.tcp === true, aead: res.aead, ...(proof ? { proof } : {}) });
   if (!hasPicture()) setOverlay('Kapcsolódás a megosztóhoz…');
 }
 
@@ -2120,7 +2120,7 @@ function onViewerDirectEvent(name, id, info) {
   const d = viewer.direct;
   if (!d || id !== 'host' || !info) return;
   if (name === 'state') {
-    Object.assign(d, { state: info.state, path: info.path, rtt: info.rtt ?? d.rtt });
+    Object.assign(d, { state: info.state, path: info.path, rtt: info.rtt ?? d.rtt, aead: info.aead ?? d.aead });
     if (info.state === 'failed') {
       closeDirectView();
       const why = info.diag && !info.diag.server && !info.diag.turn && !info.diag.tcp ? 'udp-blocked' : 'udp';
@@ -2403,7 +2403,7 @@ function directStatsTick() {
   const own = 'saját C++ kód (WebAssembly)';
   renderStatsRows([
     ['Átvitel', 'saját protokoll, végig titkosítva (WebRTC nélkül)'],
-    ['Titkosítás', 'saját: X25519 + AES-128-GCM (az alkalmazások C++ kódja, WebAssembly)'],
+    ['Titkosítás', `saját: X25519 + ${d.aead === 'aes-128-gcm' ? 'AES-128-GCM' : 'ChaCha20-Poly1305'} (az alkalmazások C++ kódja, WebAssembly)`],
     ['Felbontás', res],
     ['FPS', d.drawn ? String(Math.round(fps)) : '–'],
     ['Bitráta', fmtKbps(r?.kbps ?? null)],

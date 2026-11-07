@@ -40,6 +40,12 @@ const RING = 1 << 14; // video packets kept for retransmission
 const MAX_CANDS = 8;
 const WHOLE = 4; // media flag: the whole frame in this one packet (the WebSocket path: TCP loses nothing)
 const INFO = Buffer.from('screenshare-direct-v1');
+const INFO_CHACHA = Buffer.from('screenshare-direct-v1-chacha20'); // (ChaCha20-Poly1305's keys: 32 bytes each way)
+const AES = 'aes-128-gcm';
+const CHACHA = 'chacha20-poly1305';
+/** ChaCha20-Poly1305 when both sides have it and one prefers it (a browser), else AES-128-GCM. */
+const useChaCha = (mine, theirs) =>
+  Array.isArray(theirs) && mine.includes(CHACHA) && theirs.includes(CHACHA) && (mine[0] === CHACHA || theirs[0] === CHACHA);
 const X25519_SPKI = Buffer.from('302a300506032b656e032100', 'hex');
 
 /* ------------------------------------------------ crypto */
@@ -49,16 +55,18 @@ function keyPair() {
   return { privateKey, pub: publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64') };
 }
 
-/** Keys for both directions, from our private key and the other side's public key. */
-function deriveKeys(privateKey, peerPub, session) {
+/** Keys for both directions, from our private key and the other side's public key (ChaCha20-Poly1305's:
+ *  32 bytes each, else AES-128-GCM's: 16). */
+function deriveKeys(privateKey, peerPub, session, chacha = false) {
   const raw = Buffer.from(String(peerPub), 'base64');
   if (raw.length !== 32) throw new Error('invalid public key');
   const publicKey = crypto.createPublicKey({ key: Buffer.concat([X25519_SPKI, raw]), format: 'der', type: 'spki' });
   const shared = crypto.diffieHellman({ privateKey, publicKey });
   const salt = Buffer.alloc(4);
   salt.writeUInt32BE(session >>> 0);
-  const okm = Buffer.from(crypto.hkdfSync('sha256', shared, salt, INFO, 32));
-  return { toViewer: okm.subarray(0, 16), toHost: okm.subarray(16, 32) };
+  const n = chacha ? 32 : 16;
+  const okm = Buffer.from(crypto.hkdfSync('sha256', shared, salt, chacha ? INFO_CHACHA : INFO, 2 * n));
+  return { toViewer: okm.subarray(0, n), toHost: okm.subarray(n, 2 * n) };
 }
 
 function nonce(dir, packet) {
@@ -74,7 +82,7 @@ function seal(key, dir, type, session, counter, payload) {
   out[1] = type;
   out.writeUInt32BE(session >>> 0, 2);
   out.writeBigUInt64BE(counter, 6);
-  const cipher = crypto.createCipheriv('aes-128-gcm', key, nonce(dir, out));
+  const cipher = crypto.createCipheriv(key.length === 32 ? CHACHA : AES, key, nonce(dir, out), { authTagLength: TAG }); // (the key's size: which one)
   cipher.setAAD(out.subarray(0, HEADER));
   cipher.update(payload).copy(out, HEADER);
   cipher.final();
@@ -85,7 +93,7 @@ function seal(key, dir, type, session, counter, payload) {
 function unseal(key, dir, packet) {
   if (packet.length < HEADER + TAG) return null;
   try {
-    const decipher = crypto.createDecipheriv('aes-128-gcm', key, nonce(dir, packet));
+    const decipher = crypto.createDecipheriv(key.length === 32 ? CHACHA : AES, key, nonce(dir, packet), { authTagLength: TAG });
     decipher.setAAD(packet.subarray(0, HEADER));
     decipher.setAuthTag(packet.subarray(packet.length - TAG));
     const body = decipher.update(packet.subarray(HEADER, packet.length - TAG));
@@ -444,7 +452,7 @@ class DirectEndpoint extends EventEmitter {
    * role: 'host' (sends the picture) or 'viewer'
    * serverHost: the signaling server's host name; its UDP port comes with each session
    */
-  constructor({ role, serverHost, tcpUrl = null, forceRelay = false, forceTurn = false, forceTcp = false }) {
+  constructor({ role, serverHost, tcpUrl = null, forceRelay = false, forceTurn = false, forceTcp = false, aead = [AES, CHACHA] }) {
     super();
     this.role = role;
     this.serverHost = serverHost;
@@ -452,6 +460,7 @@ class DirectEndpoint extends EventEmitter {
     this.forceRelay = forceRelay; // tests / troubleshooting: only the server's relay …
     this.forceTurn = forceTurn; // … or only the TURN server …
     this.forceTcp = forceTcp; // … or only the WebSocket
+    this.aead = aead; // the ciphers it has, the one it prefers first (null: none said – as an older app)
     this.turn = null;
     this.turnPromise = null;
     this.socket = null;
@@ -545,7 +554,7 @@ class DirectEndpoint extends EventEmitter {
     const pub = peer.publicAddr || this.turn?.mapped;
     if (pub && !forced) cands.push({ address: pub.address, port: pub.port });
     if (this.turn?.relayed) cands.push({ ...this.turn.relayed, turn: true });
-    return { pub: peer.kp.pub, cands: cands.slice(0, MAX_CANDS) };
+    return { pub: peer.kp.pub, cands: cands.slice(0, MAX_CANDS), ...(this.aead ? { aead: this.aead } : {}) };
   }
 
   /** One TURN allocation per window, shared by all connections; null when it cannot be had. */
@@ -609,10 +618,11 @@ class DirectEndpoint extends EventEmitter {
   }
 
   /** The other side's answer arrived: derive the keys and find a path. */
-  connectPeer(id, { pub, cands, tcp }) {
+  connectPeer(id, { pub, cands, tcp, aead }) {
     const peer = this.peers.get(id);
     if (!peer) return;
-    peer.keys = deriveKeys(peer.kp.privateKey, pub, peer.session);
+    peer.aead = useChaCha(this.aead || [AES], aead) ? CHACHA : AES;
+    peer.keys = deriveKeys(peer.kp.privateKey, pub, peer.session, peer.aead === CHACHA);
     peer.tcpOnly = tcp === true; // a browser: only the WebSocket reaches it
     peer.cands = (Array.isArray(cands) ? cands : []).filter(validCandidate).slice(0, MAX_CANDS).map((c) => ({ address: c.address, port: Number(c.port), turn: c.turn === true }));
     // the other app's TURN address is reached through our own allocation
@@ -675,7 +685,7 @@ class DirectEndpoint extends EventEmitter {
 
   setState(peer, state, diag = null) {
     peer.state = state;
-    this.emit('state', peer.id, { state, path: peer.path?.kind || null, rtt: peer.path?.rtt ?? null, ...(diag ? { diag } : {}) });
+    this.emit('state', peer.id, { state, path: peer.path?.kind || null, rtt: peer.path?.rtt ?? null, aead: peer.aead || null, ...(diag ? { diag } : {}) });
   }
 
   /* ---- finding a path */
@@ -1153,5 +1163,5 @@ class DirectEndpoint extends EventEmitter {
 module.exports = {
   DirectEndpoint,
   MAX_DATA,
-  _test: { keyPair, deriveKeys, seal, unseal, registration, parseRegistrationAck, isPrivate, validCandidate, T, stunEncode, stunParse, xorEncode, xorDecode },
+  _test: { keyPair, deriveKeys, useChaCha, seal, unseal, registration, parseRegistrationAck, isPrivate, validCandidate, T, stunEncode, stunParse, xorEncode, xorDecode },
 };

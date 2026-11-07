@@ -3,9 +3,10 @@
 // weak point; our own code for well-studied ones is not.) Plain bytes, no C++ library (crypto_core.h): the
 // same code runs in the apps, in the website's WebAssembly (native/web) and in the server.
 //
-//   X25519            RFC 7748 – a constant-time Montgomery ladder over 16-bit limbs
-//   SHA-256, SHA-1    FIPS 180-4;  MD5  RFC 1321;  HMAC  RFC 2104;  HKDF  RFC 5869;  scrypt  RFC 7914
-//   AES-128-GCM       FIPS 197 + NIST SP 800-38D (96-bit nonce, 128-bit tag)
+//   X25519             RFC 7748 – a constant-time Montgomery ladder over 16-bit limbs
+//   SHA-256, SHA-1     FIPS 180-4;  MD5  RFC 1321;  HMAC  RFC 2104;  HKDF  RFC 5869;  scrypt  RFC 7914
+//   AES-128-GCM        FIPS 197 + NIST SP 800-38D (96-bit nonce, 128-bit tag) – between two apps
+//   ChaCha20-Poly1305  RFC 8439 – with a browser (no AES instructions there: several times faster)
 //
 // AES runs on the CPU's own AES instructions (x86 AES-NI, ARMv8's AES – every Apple silicon Mac), eight
 // counter blocks at a time, and GHASH on its carry-less multiply (PCLMULQDQ, PMULL), eight blocks to one
@@ -730,7 +731,14 @@ void gcmSoft(const Gcm& g, const uint8_t iv[12], const uint8_t* aad, size_t aadL
     uint8_t* d = data + i;
     memset(block, 0, 16);
     if (!encrypt) memcpy(block, d, len); // (GHASH runs over the ciphertext)
-    for (size_t j = 0; j < len; j++) d[j] ^= k[j];
+    for (size_t j = 0; j + 8 <= len; j += 8) { // (eight bytes at a time)
+      uint64_t a, b;
+      memcpy(&a, d + j, 8);
+      memcpy(&b, k + j, 8);
+      a ^= b;
+      memcpy(d + j, &a, 8);
+    }
+    for (size_t j = len & ~size_t(7); j < len; j++) d[j] ^= k[j];
     if (encrypt) memcpy(block, d, len);
     ghash(block);
   }
@@ -1078,6 +1086,269 @@ void pbkdf2Once(const uint8_t* pass, size_t passLen, const uint8_t* salt, size_t
   wipe(t, sizeof t);
 }
 
+/* ------------------------------------------------ ChaCha20-Poly1305 (RFC 8439) */
+
+// For the links with a browser: there AES has no CPU instructions (WebAssembly has none), and ChaCha20 –
+// additions, XORs and rotations of 32-bit words – is several times faster in software than AES, in
+// constant time by its nature. (TLS 1.3 and WireGuard use it for the same reason.) Four blocks at once
+// on SIMD vectors where the compiler has them; Poly1305 in 26-bit limbs (64-bit products: portable,
+// WebAssembly too).
+#if defined(__GNUC__) || defined(__clang__)
+typedef uint32_t Vec4 __attribute__((vector_size(16)));
+#define SS_VEC4 1
+#endif
+
+template <typename W>
+inline W rotl32(W x, int n) { return (x << n) | (x >> (32 - n)); }
+template <typename W>
+inline void quarter(W& a, W& b, W& c, W& d) {
+  a += b;
+  d = rotl32(d ^ a, 16);
+  c += d;
+  b = rotl32(b ^ c, 12);
+  a += b;
+  d = rotl32(d ^ a, 8);
+  c += d;
+  b = rotl32(b ^ c, 7);
+}
+/** ChaCha20's 20 rounds over a state (columns, then diagonals – ten times). */
+template <typename W>
+inline void chachaRounds(W x[16]) {
+  for (int i = 0; i < 10; i++) {
+    quarter(x[0], x[4], x[8], x[12]);
+    quarter(x[1], x[5], x[9], x[13]);
+    quarter(x[2], x[6], x[10], x[14]);
+    quarter(x[3], x[7], x[11], x[15]);
+    quarter(x[0], x[5], x[10], x[15]);
+    quarter(x[1], x[6], x[11], x[12]);
+    quarter(x[2], x[7], x[8], x[13]);
+    quarter(x[3], x[4], x[9], x[14]);
+  }
+}
+/** The state for one block: the constant, the key, the counter, the nonce (all little-endian words). */
+inline void chachaState(uint32_t s[16], const uint8_t key[32], uint32_t counter, const uint8_t nonce[12]) {
+  s[0] = 0x61707865; // "expand 32-byte k"
+  s[1] = 0x3320646e;
+  s[2] = 0x79622d32;
+  s[3] = 0x6b206574;
+  for (int i = 0; i < 8; i++) s[4 + i] = load32le(key + 4 * i);
+  s[12] = counter;
+  for (int i = 0; i < 3; i++) s[13 + i] = load32le(nonce + 4 * i);
+}
+#if SS_VEC4
+const size_t kChachaBlocks = 4; // (blocks at once)
+#else
+const size_t kChachaBlocks = 1;
+#endif
+/** kChachaBlocks blocks of key stream (64 bytes each) from the counter on. */
+void chachaBlocks(const uint32_t state[16], uint32_t counter, uint8_t* out) {
+#if SS_VEC4
+  Vec4 x[16], in[16];
+  for (int i = 0; i < 16; i++) in[i] = Vec4{state[i], state[i], state[i], state[i]};
+  in[12] = Vec4{counter, counter + 1, counter + 2, counter + 3};
+  for (int i = 0; i < 16; i++) x[i] = in[i];
+  chachaRounds(x);
+  for (int i = 0; i < 16; i++) x[i] += in[i];
+  for (int b = 0; b < 4; b++)
+    for (int i = 0; i < 16; i++) store32le(out + 64 * b + 4 * i, x[i][b]);
+#else
+  uint32_t x[16];
+  for (int i = 0; i < 16; i++) x[i] = state[i];
+  x[12] = counter;
+  chachaRounds(x);
+  for (int i = 0; i < 16; i++) store32le(out + 4 * i, x[i] + (i == 12 ? counter : state[i]));
+#endif
+}
+/** to ⊕= from, n bytes – eight at a time. */
+inline void xorBytes(uint8_t* to, const uint8_t* from, size_t n) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    uint64_t a, b;
+    memcpy(&a, to + i, 8);
+    memcpy(&b, from + i, 8);
+    a ^= b;
+    memcpy(to + i, &a, 8);
+  }
+  for (; i < n; i++) to[i] ^= from[i];
+}
+#if SS_VEC4
+#if defined(__clang__)
+#define SS_SHUFFLE4(a, b, i, j, k, l) __builtin_shufflevector(a, b, i, j, k, l)
+#else
+#define SS_SHUFFLE4(a, b, i, j, k, l) __builtin_shuffle(a, b, Vec4{i, j, k, l})
+#endif
+/** Four rows of four words turned into four columns (lane b of each row → the words of block b). */
+inline void transpose4(Vec4& a, Vec4& b, Vec4& c, Vec4& d) {
+  Vec4 t0 = SS_SHUFFLE4(a, b, 0, 4, 1, 5), t1 = SS_SHUFFLE4(a, b, 2, 6, 3, 7), t2 = SS_SHUFFLE4(c, d, 0, 4, 1, 5), t3 = SS_SHUFFLE4(c, d, 2, 6, 3, 7);
+  a = SS_SHUFFLE4(t0, t2, 0, 1, 4, 5);
+  b = SS_SHUFFLE4(t0, t2, 2, 3, 6, 7);
+  c = SS_SHUFFLE4(t1, t3, 0, 1, 4, 5);
+  d = SS_SHUFFLE4(t1, t3, 2, 3, 6, 7);
+}
+#endif
+/** data ⊕= the key stream from block 1 on (block 0 made the Poly1305 key). */
+void chachaXor(const uint32_t state[16], uint8_t* data, size_t n) {
+  uint32_t counter = 1;
+  size_t p = 0;
+#if SS_VEC4 && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  // whole runs of four blocks: the rows turned into blocks with shuffles, XORed 16 bytes at a time
+  Vec4 in[16];
+  for (int i = 0; i < 16; i++) in[i] = Vec4{state[i], state[i], state[i], state[i]};
+  for (; p + 256 <= n; p += 256, counter += 4) {
+    Vec4 x[16];
+    in[12] = Vec4{counter, counter + 1, counter + 2, counter + 3};
+    for (int i = 0; i < 16; i++) x[i] = in[i];
+    chachaRounds(x);
+    for (int i = 0; i < 16; i++) x[i] += in[i];
+    for (int g = 0; g < 4; g++) transpose4(x[4 * g], x[4 * g + 1], x[4 * g + 2], x[4 * g + 3]);
+    for (int b = 0; b < 4; b++)
+      for (int g = 0; g < 4; g++) { // block b's words 4g … 4g + 3
+        Vec4 d;
+        memcpy(&d, data + p + 64 * b + 16 * g, 16);
+        d ^= x[4 * g + b];
+        memcpy(data + p + 64 * b + 16 * g, &d, 16);
+      }
+  }
+#endif
+  uint8_t ks[64 * kChachaBlocks];
+  for (; p < n; p += sizeof ks) {
+    chachaBlocks(state, counter, ks);
+    counter += uint32_t(kChachaBlocks);
+    xorBytes(data + p, ks, n - p < sizeof ks ? n - p : sizeof ks);
+  }
+  wipe(ks, sizeof ks);
+}
+
+/** Poly1305 (RFC 8439 2.5) over whole 16-byte blocks: the AEAD pads everything to them. */
+struct Poly1305 {
+  uint32_t r[5], s4[4], h[5] = {0, 0, 0, 0, 0}, pad[4];
+  explicit Poly1305(const uint8_t key[32]) {
+    r[0] = load32le(key) & 0x3ffffff; // r, clamped as the standard has it
+    r[1] = (load32le(key + 3) >> 2) & 0x3ffff03;
+    r[2] = (load32le(key + 6) >> 4) & 0x3ffc0ff;
+    r[3] = (load32le(key + 9) >> 6) & 0x3f03fff;
+    r[4] = (load32le(key + 12) >> 8) & 0x00fffff;
+    for (int i = 0; i < 4; i++) s4[i] = r[i + 1] * 5;
+    for (int i = 0; i < 4; i++) pad[i] = load32le(key + 16 + 4 * i);
+  }
+  /** h = (h + block + 2^128) · r  mod 2^130 − 5, block by block. */
+  void blocks(const uint8_t* m, size_t n) {
+    const uint64_t r0 = r[0], r1 = r[1], r2 = r[2], r3 = r[3], r4 = r[4], s1 = s4[0], s2 = s4[1], s3 = s4[2], s4_ = s4[3];
+    uint32_t h0 = h[0], h1 = h[1], h2 = h[2], h3 = h[3], h4 = h[4];
+    for (; n >= 16; m += 16, n -= 16) {
+      h0 += load32le(m) & 0x3ffffff;
+      h1 += (load32le(m + 3) >> 2) & 0x3ffffff;
+      h2 += (load32le(m + 6) >> 4) & 0x3ffffff;
+      h3 += (load32le(m + 9) >> 6) & 0x3ffffff;
+      h4 += (load32le(m + 12) >> 8) | (1u << 24);
+      uint64_t d0 = h0 * r0 + h1 * s4_ + h2 * s3 + h3 * s2 + h4 * s1;
+      uint64_t d1 = h0 * r1 + h1 * r0 + h2 * s4_ + h3 * s3 + h4 * s2;
+      uint64_t d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4_ + h4 * s3;
+      uint64_t d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4_;
+      uint64_t d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+      uint32_t c = uint32_t(d0 >> 26);
+      h0 = uint32_t(d0) & 0x3ffffff;
+      d1 += c;
+      c = uint32_t(d1 >> 26);
+      h1 = uint32_t(d1) & 0x3ffffff;
+      d2 += c;
+      c = uint32_t(d2 >> 26);
+      h2 = uint32_t(d2) & 0x3ffffff;
+      d3 += c;
+      c = uint32_t(d3 >> 26);
+      h3 = uint32_t(d3) & 0x3ffffff;
+      d4 += c;
+      c = uint32_t(d4 >> 26);
+      h4 = uint32_t(d4) & 0x3ffffff;
+      h0 += c * 5;
+      c = h0 >> 26;
+      h0 &= 0x3ffffff;
+      h1 += c;
+    }
+    h[0] = h0;
+    h[1] = h1;
+    h[2] = h2;
+    h[3] = h3;
+    h[4] = h4;
+  }
+  /** The tag: h fully reduced (in constant time), plus the pad. */
+  void final(uint8_t tag[16]) {
+    uint32_t h0 = h[0], h1 = h[1], h2 = h[2], h3 = h[3], h4 = h[4], c;
+    c = h1 >> 26;
+    h1 &= 0x3ffffff;
+    h2 += c;
+    c = h2 >> 26;
+    h2 &= 0x3ffffff;
+    h3 += c;
+    c = h3 >> 26;
+    h3 &= 0x3ffffff;
+    h4 += c;
+    c = h4 >> 26;
+    h4 &= 0x3ffffff;
+    h0 += c * 5;
+    c = h0 >> 26;
+    h0 &= 0x3ffffff;
+    h1 += c;
+    // g = h + 5 − 2^130: if that does not go below zero, h is at least p – then g is h mod p
+    uint32_t g0 = h0 + 5;
+    c = g0 >> 26;
+    g0 &= 0x3ffffff;
+    uint32_t g1 = h1 + c;
+    c = g1 >> 26;
+    g1 &= 0x3ffffff;
+    uint32_t g2 = h2 + c;
+    c = g2 >> 26;
+    g2 &= 0x3ffffff;
+    uint32_t g3 = h3 + c;
+    c = g3 >> 26;
+    g3 &= 0x3ffffff;
+    uint32_t g4 = h4 + c - (1u << 26);
+    uint32_t useG = (g4 >> 31) - 1; // all ones when g4 did not go below zero
+    h0 = (h0 & ~useG) | (g0 & useG);
+    h1 = (h1 & ~useG) | (g1 & useG);
+    h2 = (h2 & ~useG) | (g2 & useG);
+    h3 = (h3 & ~useG) | (g3 & useG);
+    h4 = (h4 & ~useG) | (g4 & useG);
+    // to four 32-bit words (mod 2^128), plus the pad
+    uint32_t w0 = h0 | (h1 << 26), w1 = (h1 >> 6) | (h2 << 20), w2 = (h2 >> 12) | (h3 << 14), w3 = (h3 >> 18) | (h4 << 8);
+    uint64_t f = uint64_t(w0) + pad[0];
+    store32le(tag, uint32_t(f));
+    f = uint64_t(w1) + pad[1] + (f >> 32);
+    store32le(tag + 4, uint32_t(f));
+    f = uint64_t(w2) + pad[2] + (f >> 32);
+    store32le(tag + 8, uint32_t(f));
+    f = uint64_t(w3) + pad[3] + (f >> 32);
+    store32le(tag + 12, uint32_t(f));
+  }
+  /** These bytes, zero-padded to a whole block. */
+  void padded(const uint8_t* m, size_t n) {
+    blocks(m, n & ~size_t(15));
+    if (n & 15) {
+      uint8_t last[16] = {0};
+      memcpy(last, m + (n & ~size_t(15)), n & 15);
+      blocks(last, 16);
+    }
+  }
+};
+
+/** The AEAD's tag over the header and the ciphertext (RFC 8439 2.8). */
+void chachaTag(const uint32_t state[16], const uint8_t* aad, size_t aadLen, const uint8_t* ct, size_t n, uint8_t tag[16]) {
+  uint8_t block0[64 * kChachaBlocks];
+  chachaBlocks(state, 0, block0); // its first 32 bytes: the one-time Poly1305 key
+  Poly1305 mac(block0);
+  wipe(block0, sizeof block0);
+  mac.padded(aad, aadLen);
+  mac.padded(ct, n);
+  uint8_t lengths[16];
+  for (int i = 0; i < 8; i++) {
+    lengths[i] = uint8_t(uint64_t(aadLen) >> (8 * i));
+    lengths[8 + i] = uint8_t(uint64_t(n) >> (8 * i));
+  }
+  mac.blocks(lengths, 16);
+  mac.final(tag);
+  wipe(&mac, sizeof mac);
+}
+
 /* ------------------------------------------------ which code runs here */
 
 enum class Engine { Portable, X86, Arm };
@@ -1188,6 +1459,26 @@ bool scrypt(const uint8_t* pass, size_t passLen, const uint8_t* salt, size_t sal
   free(v);
   free(xy);
   return ok;
+}
+
+void chachaSeal(const uint8_t key[32], const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, uint8_t tag[16]) {
+  uint32_t state[16];
+  chachaState(state, key, 0, iv);
+  chachaXor(state, data, n);
+  chachaTag(state, aad, aadLen, data, n, tag);
+  wipe(state, sizeof state);
+}
+
+bool chachaOpen(const uint8_t key[32], const uint8_t iv[12], const uint8_t* aad, size_t aadLen, uint8_t* data, size_t n, const uint8_t tag[16]) {
+  uint32_t state[16];
+  chachaState(state, key, 0, iv);
+  uint8_t mine[16];
+  chachaTag(state, aad, aadLen, data, n, mine); // (over the ciphertext as it came)
+  uint8_t diff = 0;                             // (compared in constant time)
+  for (int i = 0; i < 16; i++) diff |= uint8_t(mine[i] ^ tag[i]);
+  if (diff == 0) chachaXor(state, data, n);     // (only what is genuine is decrypted)
+  wipe(state, sizeof state);
+  return diff == 0;
 }
 
 const char* engineName() {

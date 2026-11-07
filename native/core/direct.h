@@ -65,9 +65,15 @@ struct Offer {
   std::string pub; // base64, 32 bytes
   std::vector<Candidate> cands;
   bool tcp = false; // only the WebSocket path reaches this side (a browser)
+  // the AEADs this side has, the one it prefers first (an older one sends none: AES-128-GCM only) – see
+  // direct_detail::useChaCha
+  std::vector<std::string> aead;
   Json toJson() const;
   static Offer fromJson(const Json& j);
 };
+
+extern const char* const kAes128Gcm;        // "aes-128-gcm": the apps' first choice (AES instructions)
+extern const char* const kChaCha20Poly1305; // "chacha20-poly1305": a browser's (no AES instructions there)
 
 struct MediaMeta {
   int stream = 0; // 0 video, 1 audio
@@ -120,6 +126,7 @@ class DirectEndpoint {
   bool forceRelay = false;
   bool forceTurn = false;
   bool forceTcp = false;
+  bool preferChaCha = false; // (tests: ChaCha20-Poly1305 first, as a browser)
   // tests: parity for every viewer, one per this many packets (0: as the viewers' losses say); a
   // packet "lost" on its way in (true: dropped)
   int forceFec = 0;
@@ -152,6 +159,10 @@ class DirectEndpoint {
   void ensureTurn(const TurnInfo& info, std::function<void()> done);
   void openTcp(Peer& p);
   void setState(Peer& p, const std::string& state, const Json& diag = Json());
+  /** The AEADs this side offers: AES-128-GCM first (the CPU's AES instructions), ChaCha20-Poly1305 too. */
+  std::vector<std::string> aeadList() const {
+    return preferChaCha ? std::vector<std::string>{kChaCha20Poly1305, kAes128Gcm} : std::vector<std::string>{kAes128Gcm, kChaCha20Poly1305};
+  }
   void startProbing(Peer& p, double ms);
   void probe(Peer& p, double t);
   void onProbeAck(Peer& p, const uint8_t* body, size_t n, const Rinfo& from);
@@ -203,12 +214,15 @@ class DirectEndpoint {
 /* exposed for tests */
 namespace direct_detail {
 struct Keys {
-  std::array<uint8_t, 16> toViewer{};
-  std::array<uint8_t, 16> toHost{};
+  std::array<uint8_t, 32> toViewer{}; // (AES-128-GCM: the first 16 bytes)
+  std::array<uint8_t, 32> toHost{};
 };
-bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk = Bytes());
-Bytes seal(AesGcm& key, uint8_t dir, uint8_t type, uint32_t session, uint64_t counter, const uint8_t* payload, size_t n);
-bool unseal(AesGcm& key, uint8_t dir, const uint8_t* packet, size_t n, Bytes& body);
+/** ChaCha20-Poly1305 when both sides have it and one prefers it (a browser), else AES-128-GCM – the same
+ *  answer on both sides. */
+bool useChaCha(const std::vector<std::string>& mine, const std::vector<std::string>& theirs);
+bool deriveKeys(const X25519& mine, const Bytes& peerPub, uint32_t session, Keys& out, const Bytes& psk = Bytes(), bool chacha = false);
+Bytes seal(Aead& key, uint8_t dir, uint8_t type, uint32_t session, uint64_t counter, const uint8_t* payload, size_t n);
+bool unseal(Aead& key, uint8_t dir, const uint8_t* packet, size_t n, Bytes& body);
 Bytes registration(int role, uint32_t session, const Bytes& secret);
 bool isPrivate(const std::string& address);
 bool validCandidate(const Json& c);

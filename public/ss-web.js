@@ -2,8 +2,8 @@
 
 // The website's WebAssembly (ss-web.wasm, built from the apps' own C++ code – native/web): the lossless
 // sound (FLAC, our own encoder and decoder – the apps' code), the spatial sound's head model, and our own
-// cryptography (the apps' native/core/crypto_core.cpp: X25519, HKDF, AES-128-GCM, HMAC – and scrypt, which
-// the server uses through the same file).
+// cryptography (the apps' native/core/crypto_core.cpp: X25519, HKDF, ChaCha20-Poly1305 and AES-128-GCM,
+// HMAC – and scrypt, which the server uses through the same file).
 //
 // ScreenShareWasm.load() → Promise<{ flac, crypto, module, bytes }>
 
@@ -84,6 +84,33 @@
       fn(at, data.length, at + data.length);
       return bytes().slice(at + data.length, at + data.length + length);
     };
+    /** An AEAD's calls on the module (its seal / open in place, 12-byte nonce, 16-byte tag). */
+    const aead = (seal, open, close) => ({
+      seal(iv, aad, plain, out = new Uint8Array(plain.length + 16), atOut = 0) {
+        const at = room(12 + aad.length + plain.length + 16);
+        const data = at + 12 + aad.length;
+        const m = bytes();
+        m.set(iv, at);
+        m.set(aad, at + 12);
+        m.set(plain, data);
+        seal(at, at + 12, aad.length, data, plain.length, data + plain.length);
+        out.set(bytes().subarray(data, data + plain.length + 16), atOut);
+        return out;
+      },
+      open(iv, aad, sealed) {
+        if (sealed.length < 16) return null;
+        const n = sealed.length - 16;
+        const at = room(12 + aad.length + sealed.length);
+        const data = at + 12 + aad.length;
+        const m = bytes();
+        m.set(iv, at);
+        m.set(aad, at + 12);
+        m.set(sealed, data);
+        if (!open(at, at + 12, aad.length, data, n, data + n)) return null;
+        return bytes().slice(data, data + n);
+      },
+      close,
+    });
     return {
       /** X25519 (RFC 7748): scalar · point (32 bytes each) → 32 bytes, or null for a low-order point. */
       x25519(scalar, point) {
@@ -140,35 +167,31 @@
         let state = x.ss_gcm_new(keyAt);
         wipe(16);
         if (!state) throw new Error('ss-web.wasm: no memory');
-        return {
-          seal(iv, aad, plain, out = new Uint8Array(plain.length + 16), atOut = 0) {
-            const at = room(12 + aad.length + plain.length + 16);
-            const data = at + 12 + aad.length;
-            const m = bytes();
-            m.set(iv, at);
-            m.set(aad, at + 12);
-            m.set(plain, data);
-            x.ss_gcm_seal(state, at, at + 12, aad.length, data, plain.length, data + plain.length);
-            out.set(bytes().subarray(data, data + plain.length + 16), atOut);
-            return out;
-          },
-          open(iv, aad, sealed) {
-            if (sealed.length < 16) return null;
-            const n = sealed.length - 16;
-            const at = room(12 + aad.length + sealed.length);
-            const data = at + 12 + aad.length;
-            const m = bytes();
-            m.set(iv, at);
-            m.set(aad, at + 12);
-            m.set(sealed, data);
-            if (!x.ss_gcm_open(state, at, at + 12, aad.length, data, n, data + n)) return null;
-            return bytes().slice(data, data + n);
-          },
-          close() {
+        return aead(
+          (iv, aad, aadLen, data, n, tag) => x.ss_gcm_seal(state, iv, aad, aadLen, data, n, tag),
+          (iv, aad, aadLen, data, n, tag) => x.ss_gcm_open(state, iv, aad, aadLen, data, n, tag),
+          () => {
             if (state) x.ss_gcm_free(state);
             state = 0;
           },
-        };
+        );
+      },
+      /** ChaCha20-Poly1305 (RFC 8439) with a key (32 bytes) – the same calls as gcm(). Several times
+       *  faster here: WebAssembly has no AES instructions, and ChaCha20 needs none. */
+      chacha(key) {
+        let keyAt = x.ss_malloc(32);
+        if (!keyAt) throw new Error('ss-web.wasm: no memory');
+        bytes().set(key.subarray(0, 32), keyAt);
+        return aead(
+          (iv, aad, aadLen, data, n, tag) => x.ss_chacha_seal(keyAt, iv, aad, aadLen, data, n, tag),
+          (iv, aad, aadLen, data, n, tag) => x.ss_chacha_open(keyAt, iv, aad, aadLen, data, n, tag),
+          () => {
+            if (!keyAt) return;
+            bytes().fill(0, keyAt, keyAt + 32);
+            x.ss_free(keyAt);
+            keyAt = 0;
+          },
+        );
       },
     };
   }

@@ -376,7 +376,7 @@ async function loadWebDirect() {
   return globalThis.ScreenShareWebDirect;
 }
 
-async function webPair(webRole) {
+async function webPair(webRole, { olderApp = false } = {}) {
   const { createApp } = await import('../server/server.js');
   const app = createApp({ port: 0, host: '127.0.0.1', hostPassword: 'x', turnSecret: '', directPort: 0 });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
@@ -388,7 +388,7 @@ async function webPair(webRole) {
   web.onEvent((name, ...args) => events.push([name, ...args]));
   web.onMedia((meta, data) => media.push({ meta, data: Buffer.from(data) }));
   // the app on the other side, with its UDP socket (no path there: the browser has none)
-  const native = new DirectEndpoint({ role: webRole === 'viewer' ? 'host' : 'viewer', serverHost: '127.0.0.1', tcpUrl });
+  const native = new DirectEndpoint({ role: webRole === 'viewer' ? 'host' : 'viewer', serverHost: '127.0.0.1', tcpUrl, ...(olderApp ? { aead: null } : {}) });
   await native.open();
   const nativeStates = [];
   native.on('state', (id, s) => nativeStates.push(s));
@@ -528,5 +528,24 @@ test('browser transport: frames not confirmed in time (a queue on the way) are d
     host.stop();
     viewer.stop();
     await app.close();
+  }
+});
+
+test('browser transport: the browser and an app agree on ChaCha20-Poly1305 (ours against OpenSSL); an older app gets AES-128-GCM', async () => {
+  for (const olderApp of [false, true]) {
+    const p = await webPair('viewer', { olderApp });
+    try {
+      const want = olderApp ? 'aes-128-gcm' : 'chacha20-poly1305';
+      const webState = p.events.filter(([n]) => n === 'state').at(-1)[2];
+      assert.equal(webState.aead, want, olderApp ? 'an older app: AES-128-GCM' : 'with a browser: ChaCha20-Poly1305');
+      for (let n = 0; n < 5; n++) {
+        p.native.sendMedia({ stream: 0, key: n === 0, ts: n, capture: n }, frame(n, 3 * MAX_DATA + n));
+        await sleep(5);
+      }
+      await until(() => p.media.filter((m) => m.meta.stream === 0).length === 5);
+      assert.ok(p.media.every((m) => m.data.equals(frame(m.data.readUInt32BE(0), m.data.length))), 'every frame whole');
+    } finally {
+      await p.close();
+    }
   }
 });

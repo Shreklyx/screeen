@@ -220,8 +220,11 @@ lehető legrövidebb úton:
   HKDF-SHA256, AES-128-GCM, HMAC, a szerver jelszavaihoz scrypt – saját titkosító algoritmust kitalálni nem
   biztonságos). Az alkalmazásokban a processzor AES-utasításain fut (x86: AES-NI + PCLMULQDQ, Apple Silicon: ARMv8
   AES + PMULL), egyszerre nyolc blokkal: egy mag több GB/s-ot titkosít, a csomagonkénti költség mikroszekundum
-  alatti. Ahol nincs AES-utasítás (régi processzor, a böngésző WebAssemblyje), állandó idejű (a kulcsot az
-  időzítésen sem eláruló) kód fut, SIMD-del nyolc blokk egyszerre (~100 MB/s). A véletlenszámok a rendszeréi. A
+  alatti. Ahol nincs AES-utasítás (régi processzor), állandó idejű (a kulcsot az időzítésen sem eláruló) kód fut,
+  SIMD-del nyolc blokk egyszerre. **Böngészővel** a kapcsolat ChaCha20-Poly1305-öt használ (RFC 8439 – a két fél
+  egyezteti; két alkalmazás között AES-128-GCM marad): a WebAssemblynek nincs AES-utasítása, a ChaCha20 viszont
+  szoftverben is gyors – a saját kódunk a böngészőben ~550–670 MB/s, gyorsabb a böngésző beépített AES-ének
+  (WebCrypto) használatánál is, és nem kell ígéretekre (promise) várnia csomagonként. A véletlenszámok a rendszeréi. A
   tesztek (`native/tests/crypto_test.cpp`, `test/ss-web.test.js`) a szabványok tesztvektoraival és OpenSSL-lel
   számolt hosszú sorozatokkal ellenőrzik minden változatát;
 - a néző **puffer nélkül** dolgozik: minden teljes képkockát azonnal dekódol, és egy alacsony késleltetésű
@@ -251,10 +254,10 @@ WebSocketben, a szerver HTTPS-portján (`wss://…/direct`) mennek, és a szerve
 Ezen az úton egy képkocka egy csomag (a TCP nem veszít el semmit, nincs újrakérés); ha a néző vonala nem bírja, a
 megosztó eldobja a képkockákat a következő kulcskockáig ahelyett, hogy sorba állítaná őket (és amint van hely, újra
 kér kulcskockát – a kép nem marad állva). A néző itt is puffer nélkül, minden képet azonnal kirajzol. Így megy alkalmazás → böngésző, böngésző →
-böngésző és böngésző → alkalmazás. A kulcscsere és a titkosítás itt is a saját kódunk (X25519, HKDF, AES-128-GCM –
-az alkalmazásokéval azonos C++ kód WebAssemblyként; a böngészőben nincs AES-utasítás, így a konstans idejű, SIMD-es
-változat fut, ~100 MB/s – egy 4K-s adás ~12 MB/s), és a hang veszteségmentes FLAC is az alkalmazások saját C++
-kódja (`public/ss-web.wasm`, forrás: `native/web`). A megosztó a képet és a hangot a
+böngésző és böngésző → alkalmazás. A kulcscsere és a titkosítás itt is a saját kódunk (X25519, HKDF,
+ChaCha20-Poly1305 – az alkalmazásokéval azonos C++ kód WebAssemblyként; egy még nem frissült alkalmazással
+AES-128-GCM), és a hang veszteségmentes FLAC is az alkalmazások saját C++ kódja (`public/ss-web.wasm`, forrás:
+`native/web`). A megosztó a képet és a hangot a
 `MediaStreamTrackProcessor`-ral olvassa (Chrome, Edge), ahol ez nincs (Firefox, Safari), egy videóelemből
 (`requestVideoFrameCallback`) és egy AudioWorkletből. **WebRTC sehol nincs** az oldalon; ahol a böngésző ezt sem
 tudja (nagyon régi, WebCodecs nélküli böngésző), a néző üzenetet kap, és a megosztó nézőlistájában is látszik, miért

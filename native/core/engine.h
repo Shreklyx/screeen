@@ -27,6 +27,7 @@ struct EngineConfig {
   bool hardware = true;
   // tests / troubleshooting (noAcks: a viewer that does not confirm its frames, as an older one)
   bool forceRelay = false, forceTurn = false, forceTcp = false, noAcks = false;
+  bool preferChaCha = false; // (tests: ChaCha20-Poly1305 first – as a browser)
 };
 
 struct EngineCallbacks {

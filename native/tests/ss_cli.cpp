@@ -7,6 +7,7 @@
 //   host: [--resume CODE:TOKEN (take that room back)] [--keep (leave the room open at the end, as an app quitting)]
 //         [--kbps N (frames padded to that bitrate)] [--relay] [--tcp] [--permanent] [--access PASSWORD (to enter)]
 //         [--tone (a 440/660 Hz stereo tone as the sound: lossless, FLAC)]
+//   both: [--chacha] (ChaCha20-Poly1305 first, as a browser – else AES-128-GCM between two apps)
 //   view: [--tcp] [--no-acks (frames not confirmed)] [--access PASSWORD (the room's entry password)]
 //   ss-cli ws-bench --url ws://127.0.0.1:8095 [--count 240]   (round trips through an echo server; SS_NAGLE=1:
 //                                                             with Nagle's algorithm on, as a control)
@@ -114,6 +115,7 @@ static int host(int argc, char** argv) {
   cfg.server = arg(argc, argv, "--server", "http://127.0.0.1:8090");
   cfg.encoderName = "ss-cli";
   cfg.forceTcp = flag(argc, argv, "--tcp");
+  cfg.preferChaCha = flag(argc, argv, "--chacha"); // (ChaCha20-Poly1305 first, as a browser)
   cfg.forceRelay = flag(argc, argv, "--relay");
   Chat chat(argc, argv);
   EngineCallbacks cb;
@@ -204,6 +206,7 @@ static int view(int argc, char** argv) {
   std::mutex mu;
   uint64_t frames = 0, keys = 0, bytes = 0, audio = 0, lossless = 0, losslessBad = 0;
   double skips = 0; // frames the transport could not complete (it went on from a keyframe)
+  std::string aead;  // the connection's cipher
   bool firstKey = false, sawFrame = false;
   double lastFrameAt = 0, maxGap = 0; // (a picture that stood still: the longest time without a frame)
   std::vector<double> lat;
@@ -213,6 +216,7 @@ static int view(int argc, char** argv) {
   EngineConfig cfg;
   cfg.server = arg(argc, argv, "--server", "http://127.0.0.1:8090");
   cfg.forceTcp = flag(argc, argv, "--tcp");
+  cfg.preferChaCha = flag(argc, argv, "--chacha"); // (ChaCha20-Poly1305 first, as a browser)
   cfg.noAcks = flag(argc, argv, "--no-acks");
   Chat chat(argc, argv);
   EngineCallbacks cb;
@@ -220,6 +224,7 @@ static int view(int argc, char** argv) {
     if (e["type"].str() == "view-stats") {
       std::lock_guard<std::mutex> l(mu);
       skips += e["skips"].num(0);
+      aead = e["aead"].str(aead);
     }
     if (!chat.on(e)) line("EVENT " + e.dump());
   };
@@ -267,6 +272,7 @@ static int view(int argc, char** argv) {
   r.set("latMedian", lat.empty() ? Json() : Json(std::round(lat[lat.size() / 2] * 10) / 10));
   r.set("latP90", lat.empty() ? Json() : Json(std::round(lat[lat.size() * 9 / 10] * 10) / 10));
   r.set("maxGap", std::round(maxGap)).set("lastGap", lastFrameAt ? Json(std::round(nowMs() - lastFrameAt)) : Json()).set("skips", skips);
+  r.set("aead", aead);
   line("RESULT " + r.dump());
   enginePtr = nullptr;
   chat.engine = nullptr;
