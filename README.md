@@ -5,23 +5,30 @@ Saját szerveren futó képernyőmegosztó oldal: **4K / 60 FPS**, **rendszerhan
 Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel bárki tud – regisztráció és telepítés nélkül, telefonon is.
 
 - **Saját átvitel, sehol nincs WebRTC** (*közvetlen mód*, lásd lent) – puffer nélkül, végponttól végpontig titkosítva
-  (X25519 + AES-GCM, a szerver sem látja a képet): két asztali alkalmazás között közvetlenül, UDP-n; böngészőben
+  (X25519 + AES-GCM, a szerver sem látja a képet). **A szoba saját kulcsa a linkben** van a kód után
+  (`mozizas.hu/#abc123.<26 betű>`): a link `#` utáni része soha nem jut el szerverhez, a két fél egymásnak igazolja,
+  hogy ismeri, és belekerül a kulcsokba – így a szerver sem tud „közbeállni”. Aki csak a 6 jelű kódot írja be,
+  annak is működik, de ellenőrzés nélkül. Két asztali alkalmazás között közvetlenül, UDP-n; böngészőben
   (WebCodecs H.264 + Opus) a szerver WebSocketjén át. Ahol a böngészőből hiányzik az X25519 kulcscsere vagy az
   Opus-dekódoló (régebbi Safari / Firefox), az alkalmazások saját C/C++ kódja (BearSSL, libopus) fut az oldalon
   WebAssemblyként (`native/web`).
-- **Alapból a legjobb beállítás, a gép alapján (Automatikus):** ha a videókártya kódol, **4K · 60 FPS**, ha a
-  processzor, 1080p 30 – és ha a kódoló tényleg nem bírja a tempót (a képek negyede kimarad), magától kisebb
-  felbontásra vált. **Állandó minőség és FPS:** a bitráta fix, amennyit a kép mérete és FPS-e kíván (1080p60 ~15,
-  1440p60 ~26, 4K60 40 Mbit/s interneten, helyi hálón akár 100) – nem próbálkozik fölötte, így nem hullámzik; csak
-  tartós gond (egy néző két egymás utáni jelentésében kihagyott kép, 80 ms-mal megnőtt RTT vagy 8% fölötti
-  csomagvesztés) viszi lejjebb, 3 másodpercenként 20%-kal, legfeljebb 40%-ig, és ha rendben van, visszajön. Álló
-  képernyőnél az alkalmazás az utolsó képet küldi újra, így az FPS nem esik 0-ra. Kézzel minden felülírható
-  (felbontás, FPS, bitráta, tartalomtípus).
+- **Minőség: 4K és 1080p 60 / 120 FPS** (az alkalmazásban 4K·60, 4K·120, 1440p·60/120, 1080p·60/120, 720p, eredeti).
+  **A kép minősége soha nem romlik:** a bitráta fix (0,16 bit képpontonként: 1080p60 20, 1080p120 40, 4K60 80,
+  4K120 120 Mbit/s; helyi hálón akár 200) – egy lassú vonal miatt sem megy lejjebb, sem a bitráta, sem a felbontás.
+  Akinek a vonala nem bírja, annál (csak annál) kimarad néhány kép. Böngészőből megosztva az Automatikus az első
+  másodpercekben megkeresi, mekkora képet bír a gép kódolója, aztán az marad. Álló képernyőnél az alkalmazás az
+  utolsó képet küldi újra, így az FPS nem esik 0-ra.
 - **Hardveres kódolás a videókártyán** (H.264): az alkalmazásban NVIDIA NVENC, Intel / AMD (Media Foundation), Apple
   VideoToolbox; böngészőben a WebCodecs a videókártyán kódol, ha tud. A megosztó **egyszer** kódol minden nézőnek.
   A megosztó panelen látszik: *Hardveres kódolás (videókártya) · H.264 · 3840×2160 · 3 ms/kép*.
-- **Rendszerhang**: Opus, 2,5 ms-os csomagokban (az Opus legkisebb késése), zajszűrés / visszhangszűrés /
-  hangerő-szabályzás nélkül (filmhez, zenéhez).
+- **Veszteségmentes hang: FLAC, saját kódolóval és dekódolóval** (`native/common/lossless.cpp`, könyvtár nélkül):
+  a megosztó gép hangja bitre pontosan, 24 biten, 2,5 ms-os csomagokban; minden csomag az előzőt is hozza, így egy
+  elveszett csomag hangja a következővel megérkezik. Szabványos FLAC – az ffmpeg dekódolója bitre ugyanazt adja
+  vissza (CI). A weboldalon ugyanez a C++ kód fut WebAssemblyként.
+- **Térhatású hang fejhallgatóhoz** (fejhallgató gomb, **H**): saját fejmodell (`native/common/spatial.cpp`) – a
+  csatornák hangszórókként a fejed körül (sztereó ±30°, 5.1 / 7.1 a helyükön), fülenkénti késéssel és a fej
+  árnyékával, egy kis térrel. **Macen AirPods-szal követi a fejed** (macOS 14-től): a hang a képernyőnél marad.
+  Windowson, Macen és a weboldalon is (ott WebAssemblyből).
 - **5.1 / 7.1 térhang** (Windows alkalmazás): ha a megosztó gépen 5.1/7.1 hangszóró vagy 7.1-es fejhallgató van
   beállítva, az alkalmazás mind a 8 csatornát átküldi. A térhangos hangszórójú nézők Chrome-ban, Edge-ben vagy az
   alkalmazásban **térhangot** kapnak, a többiek helyesen lekevert sztereót – a középső (párbeszéd) csatornával együtt.
@@ -40,6 +47,11 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   kulcsképpel folytatja – a késés nem nő, és a kép nem áll meg.
 - Élő beállítások megosztás közben (felbontás, FPS, bitráta, tartalomtípus, kodek), forrásváltás, szüneteltetés,
   hangszint-mérő, nézőnkénti statisztika (FPS, bitráta, kodek, HW/SW, RTT, mi korlátozza a minőséget).
+- **A szoba a szerver újraindulása után is megmarad, ugyanazzal a kóddal:** a szoba tokenje aláírt, így újraindulás
+  után a megosztó alkalmazása magától visszaveszi a szobát, a nézők visszakapják a képet.
+- **Állandó szoba, fix jelszóval:** megosztáskor bekapcsolható – mindig ugyanaz a kód, a szerver lemezen tartja
+  (újraindulás után is ott van, a megosztó nélkül is), és **belépési jelszó** állítható a nézőknek (a szerver csak
+  a hash-ét tárolja). A néző a jelszót a Nézés fülön / az oldalon megadja.
 - **A szoba megmarad:** ha a megosztó újratölti az oldalt, bezárja a böngészőt vagy az alkalmazás ablakát, megszakad a
   nete, összeomlik / frissül az alkalmazás vagy újraindul a gép, a szoba (és a link) **10 percig** megmarad, a nézők
   benne várnak. Ha addig újra elindítja (a böngészőben újra megosztja), **ugyanabba a szobába** megy vissza – ugyanaz
