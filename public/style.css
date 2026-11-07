@@ -638,7 +638,7 @@ input[type="password"] {
 }
 
 /* ---------- iPhone / iPad ---------- */
-.is-ios .volume { display: none; }
+.is-ios .volume, .is-ios #btnSpatial { display: none; }
 .is-ios .cards > .card:first-child { order: 2; } /* watching first: sharing needs a computer */
 @media (hover: none) { .kbd-hints { display: none; } } /* touch screens have no keyboard shortcuts */
 

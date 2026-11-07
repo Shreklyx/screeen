@@ -1754,10 +1754,28 @@ function senderEncoderText(st) {
 
 /** Spatial sound for headphones (our C++ head model, native/common/spatial.cpp): on or off, kept. */
 function toggleSpatial() {
+  if (IS_IOS) return; // (not there: see sendSpatial)
   viewer.spatial = !viewer.spatial;
   store.set('ss-spatial', viewer.spatial);
-  viewer.direct?.audio?.node.port.postMessage({ spatial: viewer.spatial });
+  sendSpatial(viewer.direct?.audio);
   syncSpatialUi();
+}
+
+/** To the player: spatial on or off – and the first time it is on, our WebAssembly, from which it makes
+ *  its head model (only then: nothing extra in the sound's thread while it is off). Not on iPhone / iPad
+ *  (WebKit's sound thread is no place for it). */
+function sendSpatial(a) {
+  if (!a || IS_IOS) return;
+  try {
+    if (viewer.spatial && !a.spatialSent && a.wasm?.module) {
+      a.node.port.postMessage({ wasm: a.wasm.module, spatial: true });
+      a.spatialSent = true;
+    } else {
+      a.node.port.postMessage({ spatial: viewer.spatial });
+    }
+  } catch (err) {
+    console.warn('spatial', err); // (a browser that cannot send it there: the plain sound)
+  }
 }
 
 function syncSpatialUi() {
@@ -2032,8 +2050,20 @@ function drawDirectFrame(d, frame) {
     return;
   }
   const el = canvas();
-  const w = frame.displayWidth;
-  const h = frame.displayHeight;
+  // drawn at most at the screen's own pixels (a 4K picture on a phone's screen: a quarter of the memory
+  // and the work – a 4K canvas made iPhones' Safari give up); looked at again each second (a resize)
+  const now = performance.now();
+  if (frame.displayWidth !== d.srcW || frame.displayHeight !== d.srcH || !(now - (d.fitAt || 0) < 1000)) {
+    d.srcW = frame.displayWidth;
+    d.srcH = frame.displayHeight;
+    d.fitAt = now;
+    const dpr = window.devicePixelRatio || 1;
+    const fit = el.clientWidth > 0 && el.clientHeight > 0 ? Math.min(1, (el.clientWidth * dpr) / d.srcW, (el.clientHeight * dpr) / d.srcH) : 1;
+    d.drawW = Math.max(2, Math.round(d.srcW * fit));
+    d.drawH = Math.max(2, Math.round(d.srcH * fit));
+  }
+  const w = d.drawW;
+  const h = d.drawH;
   if (el.width !== w || el.height !== h) {
     el.width = w;
     el.height = h;
@@ -2084,9 +2114,8 @@ async function openDirectAudio(d, channels) {
   const node = new AudioWorkletNode(ctx, 'direct-audio', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [out], processorOptions: { channels } });
   const gain = ctx.createGain();
   node.connect(gain).connect(ctx.destination);
-  // spatial sound for headphones: the player makes its own head model from our WebAssembly
-  if (wasm?.module) node.port.postMessage({ wasm: wasm.module, spatial: viewer.spatial });
   d.audio = { ctx, node, gain, channels, out, decoders: [], wasm };
+  sendSpatial(d.audio);
   syncDirectVolume();
   ctx.resume().catch(() => {});
   // a browser opened from a link (no click yet) keeps the sound off: one click turns it on
