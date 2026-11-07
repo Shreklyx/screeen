@@ -151,6 +151,8 @@ struct App {
 
   Screen screen = Screen::Home, prev = Screen::Home;
   bool transitioning = false;
+  float paneDx = 0;     // the home pane slides in (a new tab) or shakes (a wrong password): fields and hits follow
+  double shakeAt = 0;   // when the pane shakes (once the screens have crossed over)
   double transitionStart = 0;
   int tab = 0; // home: 0 sharing, 1 watching
 
@@ -411,7 +413,7 @@ Anims& A() { return g.paintingAbout ? g.aboutAnim : g.anim; }
 
 void hit(int id, const Rect& r) {
   if (g.paintingAbout) g.aboutHits.push_back({r, id});
-  else if (!g.measuring && !g.transitioning) g.hits.push_back({r, id});
+  else if (!g.measuring && !g.transitioning) g.hits.push_back({r.offset(g.paneDx, 0), id});
 }
 
 std::string key(const char* what, int id) { return std::string(what) + std::to_string(id); }
@@ -476,8 +478,12 @@ void button(int id, const Rect& r, const std::wstring& label, Style style, bool 
   if (g.measuring) return;
   if (enabled) hit(id, r);
   float hov = A().to(key("h", id), enabled && g.hover == id ? 1.0f : 0.0f, 120);
-  float prs = A().to(key("p", id), enabled && g.pressed == id && g.hover == id ? 1.0f : 0.0f, 70);
+  // pressed in at once, back on a spring – a hair past, as the Mac's and the iPhone's buttons
+  bool down = enabled && g.pressed == id && g.hover == id;
+  float push = down ? A().spring(key("p", id), 1.0f, 110, 1.0f) : A().spring(key("p", id), 0.0f, 360, 0.5f);
+  float prs = std::clamp(push, 0.0f, 1.0f);
   Canvas& c = C();
+  c.pushScale(1.0f - 0.045f * push, r.cx(), r.cy());
   float radius = r.h / 2;
   Color text = cText;
   switch (style) {
@@ -508,6 +514,7 @@ void button(int id, const Rect& r, const std::wstring& label, Style style, bool 
   float x = r.cx() - (tw + iw + gap) / 2;
   if (hasIcon) c.icon(icon, x + iw / 2, r.cy(), 15, text, 1.7f);
   if (!label.empty()) c.text(label, {x + iw + gap, r.y, tw + 4, r.h}, 13, Semibold, text);
+  c.popScale();
 }
 
 /** An on/off switch (the Mac's) at the right of its row; the whole row toggles it. */
@@ -515,14 +522,18 @@ void toggleSwitch(int id, const Rect& row, bool on) {
   if (g.measuring) return;
   hit(id, row);
   Canvas& c = C();
-  float k = A().to(key("t", id), on ? 1.0f : 0.0f, 170);
+  // the knob on a spring (a hair past and back); held – and while it moves – it stretches, as the Mac's
+  float k = A().spring(key("t", id), on ? 1.0f : 0.0f, 360, 0.66f);
   float hov = A().to(key("h", id), g.hover == id ? 1.0f : 0.0f, 120);
+  float held = A().to(key("k", id), g.pressed == id ? 1.0f : 0.0f, 110);
+  float on01 = std::clamp(k, 0.0f, 1.0f);
   Rect track{row.right() - 12 - 42, row.cy() - 11, 42, 22};
-  c.fillRound(track, 11, mix(rgb(0xFFFFFF, 0.16f + 0.05f * hov), cAccent, k));
-  float kw = 25, kx = track.x + 2 + k * (track.w - 4 - kw);
+  c.fillRound(track, 11, mix(rgb(0xFFFFFF, 0.16f + 0.05f * hov), cAccent, on01));
+  float kw = 25 + 5 * held + std::min(5.0f, std::fabs(A().velocity(key("t", id))) * 0.8f);
+  float kx = std::clamp(track.x + 2 + k * (track.w - 4 - kw), track.x + 1, track.right() - 1 - kw);
   Rect knob{kx, track.y + 2, kw, track.h - 4};
   c.fillRound(knob.offset(0, 0.7f), knob.h / 2, rgb(0x000000, 0.25f));
-  c.fillRound(knob, knob.h / 2, mix(cWhite, rgb(0x2A2A2E), k)); // (on: a dark knob on the white track)
+  c.fillRound(knob, knob.h / 2, mix(cWhite, rgb(0x2A2A2E), on01)); // (on: a dark knob on the white track)
 }
 
 HWND editFor(int id) {
@@ -539,7 +550,7 @@ HWND editFor(int id) {
 
 /** A text box: drawn here, the Windows edit control sits inside it. */
 void field(int id, const Rect& r) {
-  g.fieldRects[id] = r;
+  g.fieldRects[id] = r.offset(g.paneDx, 0); // (the edit control goes where the pane is drawn)
   if (g.measuring) return;
   Canvas& c = C();
   float f = A().to(key("f", id), g.focus == id ? 1.0f : 0.0f, 150);
@@ -588,9 +599,12 @@ void segmented(const Rect& r, int selected) {
   Canvas& c = C();
   const wchar_t* labels[2] = {L"Megosztás", L"Nézés"};
   float sw = r.w / 2;
-  float pos = A().to("tabpos", float(selected), 190);
+  // the pill slides on a spring and stretches while it moves (liquid glass)
+  float pos = A().spring("tabpos", float(selected), 420, 0.72f);
+  float stretch = std::min(22.0f, std::fabs(A().velocity("tabpos")) * 7.0f);
   c.fillRound(r, r.h / 2, rgb(0xFFFFFF, 0.12f));
-  Rect pill{r.x + 2 + pos * sw, r.y + 2, sw - 4, r.h - 4};
+  Rect pill{r.x + 2 + pos * sw - stretch / 2, r.y + 2, sw - 4 + stretch, r.h - 4};
+  pill.x = std::clamp(pill.x, r.x + 2, r.right() - 2 - pill.w);
   c.fillRound(pill, pill.h / 2, cAccent);
   for (int i = 0; i < 2; i++) {
     Rect seg{r.x + float(i) * sw, r.y, sw, r.h};
@@ -631,9 +645,11 @@ float note(const std::wstring& s, float x, float y, float w, float size, const C
 float errorText(const std::wstring& s, const char* animKey, float x, float y, float w) {
   if (s.empty()) return y;
   y += 12;
-  float a = g.measuring ? 1.0f : A().to(animKey, 1, 220);
-  C().pushAlpha(a);
+  float a = g.measuring ? 1.0f : A().spring(animKey, 1, 380, 0.78f); // (down into place on a spring)
+  C().pushAlpha(std::clamp(a, 0.0f, 1.0f));
+  C().pushTranslate(0, (1 - a) * -8);
   y += note(s, x, y, w, 12, cErr, Center);
+  C().popTranslate();
   C().popAlpha();
   return y;
 }
@@ -701,10 +717,24 @@ float drawHome(float W, float) {
   y += 18 + 24;
   segmented({std::floor(W / 2 - 132), y, 264, 28}, g.tab);
   y += 28 + 22;
-  float pane = g.measuring ? 1.0f : A().to("pane", 1, 200); // a new tab fades in
-  c.pushAlpha(pane);
+  // a new tab comes in from its side on a spring; a wrong password shakes the pane (as the Mac's login)
+  if (!g.measuring && g.shakeAt > 0) {
+    if (A().now() >= g.shakeAt) {
+      A().kick("shake", 760);
+      g.shakeAt = 0;
+    } else {
+      A().keepGoing();
+    }
+  }
+  float pane = g.measuring ? 1.0f : A().spring("pane", 1, 440, 0.86f);
+  float shake = g.measuring ? 0.0f : A().spring("shake", 0, 120, 0.2f);
+  g.paneDx = std::round((1 - pane) * (g.tab == 1 ? 26.0f : -26.0f) + shake);
+  c.pushAlpha(std::clamp(pane, 0.0f, 1.0f));
+  c.pushTranslate(g.paneDx, 0);
   y = g.tab == 0 ? sharePane(x0, y, cw) : watchPane(x0, y, cw);
+  c.popTranslate();
   c.popAlpha();
+  g.paneDx = 0;
   if (!g.update.version.empty()) {
     y += 20;
     Rect r{std::floor(W / 2 - 110), y, 220, 26};
@@ -737,8 +767,9 @@ void viewerRow(const Json& v, const Rect& r) {
   if (g.measuring) return;
   Canvas& c = C();
   std::string id = v["id"].str(""), state = v["state"].str("");
-  float a = A().to("v" + id, 1, 260);
-  c.pushAlpha(a);
+  float a = A().spring("v" + id, 1, 420, 0.78f); // (a new one comes in on a spring)
+  c.pushAlpha(std::clamp(a, 0.0f, 1.0f));
+  c.pushScale(0.94f + 0.06f * a, r.cx(), r.cy());
   bool connected = state == "connected";
   dot(r.x + 16, r.cy(), connected ? cOk : state == "unsupported" ? cErr : state == "retrying" ? cWarn : cFaint);
   // the numbers, right to left; the latency in its colour
@@ -773,6 +804,7 @@ void viewerRow(const Json& v, const Rect& r) {
   std::string name = v["name"].str("");
   c.text(name.empty() ? L"Néző #" + std::to_wstring(int(v["n"].num())) : toW(name), {r.x + 30, r.cy() - 17, tw, 18}, 13, Medium, cText);
   c.text(sub, {r.x + 30, r.cy() + 1, tw, 15}, 11, Regular, cMuted);
+  c.popScale();
   c.popAlpha();
 }
 
@@ -1101,7 +1133,7 @@ void drawModal(float W, float H) {
   c.measure(g.modal.text, 13, Regular, w - 48, &th);
   float h = 24 + 22 + 8 + th + 22 + 30 + 22;
   Rect r{std::floor((W - w) / 2), std::floor((H - h) / 2), w, h};
-  c.pushScale(0.96f + 0.04f * k, r.cx(), r.cy());
+  c.pushScale(A().spring("modalScale", g.modal.open ? 1.0f : 0.94f, 380, 0.7f), r.cx(), r.cy()); // (up on a spring)
   c.shadow(r, 14, 1.4f);
   c.fillRound(r, 14, rgb(0x2E2E33));
   c.strokeRound(r, 14, rgb(0xFFFFFF, 0.12f), 1);
@@ -1122,7 +1154,10 @@ void drawModal(float W, float H) {
 }
 
 void ask(const std::wstring& title, const std::wstring& text, const std::wstring& ok, const std::wstring& cancel, bool danger, std::function<void()> action) {
-  if (!g.modal.open) A().set("modal", 0); // it comes up from nothing
+  if (!g.modal.open) { // it comes up from nothing
+    A().set("modal", 0);
+    A().set("modalScale", 0.88f);
+  }
   g.modal.open = true;
   g.modal.title = title;
   g.modal.text = text;
@@ -1307,14 +1342,18 @@ void paint() {
   if (g.transitioning) {
     // the screens cross-fade: the old one rises and fades, the new one comes up
     c.pushAlpha(1 - t);
+    c.pushScale(1 - 0.03f * t, W / 2, H / 2);
     c.pushTranslate(0, -10 * t);
     drawScreen(g.prev, W, H);
     c.popTranslate();
+    c.popScale();
     c.popAlpha();
     c.pushAlpha(t);
+    c.pushScale(1 + 0.025f * (1 - t), W / 2, H / 2);
     c.pushTranslate(0, 12 * (1 - t));
     g.contentHeight = drawScreen(g.screen, W, H);
     c.popTranslate();
+    c.popScale();
     c.popAlpha();
     A().keepGoing();
   } else {
@@ -1732,6 +1771,7 @@ void startWatching(const std::string& code) {
   if (code.size() < 4) {
     setError(g.joinErr, L"Érvénytelen szobakód – írd be a 6 jelű kódot, vagy illeszd be a teljes linket.", "joinErr");
     SetFocus(g.code);
+    g.shakeAt = nowMs();
     return;
   }
   g.joinErr.clear();
@@ -1846,6 +1886,7 @@ void onEngineEvent(const Json& e) {
     setTitle(L"");
     show(Screen::Home);
     setError(g.shareErr, text, "shareErr");
+    if (c == "auth" && !g.restoring) g.shakeAt = nowMs() + 260;
   } else if (type == "viewers") {
     for (const Json& v : e["list"].items()) {
       std::string id = "v" + v["id"].str("");
@@ -1908,6 +1949,7 @@ void onEngineEvent(const Json& e) {
     if (parseCode(getText(g.code)) != g.watchRoom) SetWindowTextW(g.code, room.c_str()); // (the link typed stays as it was)
     SetFocus(g.joinAccess);
     SendMessageW(g.joinAccess, EM_SETSEL, 0, -1);
+    if (wrong) g.shakeAt = nowMs() + 260; // (once the screens have crossed over)
   } else if (type == "join-error" && g.restoring && e["code"].str() == "notfound") {
     std::wstring code = toW(codeOnly(g.savedCode));
     stopToHome(L"A szoba (" + code + L"), amit néztél, közben bezárult.");

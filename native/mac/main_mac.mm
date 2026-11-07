@@ -394,6 +394,62 @@ static void animateAlpha(NSView* v, CGFloat to, double seconds = 0.22) {
   }];
 }
 
+/* ---- motion: springs, as the system's own (none with "Reduce motion") */
+
+static bool reduceMotion() { return NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion; }
+
+/** A spring as SwiftUI gives one: `response` seconds, `damping` 1 – no overshoot, less – a hair past. */
+static CASpringAnimation* springAnim(NSString* keyPath, double response, double damping) {
+  CASpringAnimation* a = [CASpringAnimation animationWithKeyPath:keyPath];
+  double w = 2 * M_PI / response;
+  a.mass = 1;
+  a.stiffness = w * w;
+  a.damping = 2 * damping * w;
+  a.duration = a.settlingDuration;
+  return a;
+}
+
+/** The view comes from `dx`, `dy` points away into place on a spring (on top of where its layout puts
+ *  it: the layout is not touched). */
+static void springIn(NSView* v, CGFloat dx, CGFloat dy, double response = 0.42, double damping = 0.78) {
+  if (!v.layer || reduceMotion()) return;
+  for (int axis = 0; axis < 2; axis++) {
+    CGFloat from = axis ? dy : dx;
+    if (from == 0) continue;
+    NSString* path = axis ? @"transform.translation.y" : @"transform.translation.x";
+    CASpringAnimation* a = springAnim(path, response, damping);
+    a.additive = YES;
+    a.fromValue = @(from);
+    a.toValue = @0;
+    [v.layer addAnimation:a forKey:path];
+  }
+}
+
+/** From `scale` times its size back to its own on a spring, around its middle (a button toggled, the
+ *  picture arriving). */
+static void springScale(NSView* v, CGFloat scale, double response = 0.4, double damping = 0.6) {
+  if (!v.layer || reduceMotion()) return;
+  CGRect b = v.layer.bounds;
+  CATransform3D t = CATransform3DMakeTranslation(-CGRectGetMidX(b), -CGRectGetMidY(b), 0);
+  t = CATransform3DConcat(t, CATransform3DMakeScale(scale, scale, 1));
+  t = CATransform3DConcat(t, CATransform3DMakeTranslation(CGRectGetMidX(b), CGRectGetMidY(b), 0));
+  CASpringAnimation* a = springAnim(@"transform", response, damping);
+  a.fromValue = [NSValue valueWithCATransform3D:t];
+  a.toValue = [NSValue valueWithCATransform3D:v.layer.transform];
+  [v.layer addAnimation:a forKey:@"springScale"];
+}
+
+/** What was wrong (a password, a code) shakes, as the Mac's login. */
+static void shake(NSView* v) {
+  if (!v.layer || reduceMotion()) return;
+  CAKeyframeAnimation* a = [CAKeyframeAnimation animationWithKeyPath:@"transform.translation.x"];
+  a.additive = YES;
+  a.values = @[ @0, @-10, @9, @-7, @5, @-3, @1, @0 ];
+  a.duration = 0.45;
+  a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+  [v.layer addAnimation:a forKey:@"shake"];
+}
+
 static void fade(NSView* v, double seconds = 0.22) {
   CATransition* t = [CATransition animation];
   t.type = kCATransitionFade;
@@ -1322,6 +1378,8 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
 - (void)tabChanged {
   fade(_home, 0.2);
   [self applyTab];
+  bool watch = _tabs.selectedSegment == 1;
+  springIn(watch ? _watchPane : _sharePane, watch ? 28 : -28, 0, 0.45, 0.86); // (in from its side)
   [NSUserDefaults.standardUserDefaults setInteger:_tabs.selectedSegment forKey:@"tab"];
   [self fitWindow:YES];
   if (_tabs.selectedSegment == 1) [_window makeFirstResponder:_code];
@@ -1340,6 +1398,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   if (show) {
     l.alphaValue = 0;
     animateAlpha(l, 1);
+    dispatch_async(dispatch_get_main_queue(), ^{ springIn(l, 0, 8, 0.38, 0.75); }); // (once it is laid out)
   }
   [self fitWindow:YES];
 }
@@ -1852,6 +1911,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
   if (code.size() < 4) {
     [self setError:_joinError text:@"Érvénytelen szobakód – írd be a 6 jelű kódot, vagy illeszd be a teljes linket."];
     [_window makeFirstResponder:_code];
+    shake(_watchPane);
     return;
   }
   _joinError.hidden = YES;
@@ -2020,6 +2080,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
  *  looks), and the button's look. */
 - (void)applySpatial {
   if (_audioOut) _audioOut->setSpatial(_spatial);
+  springScale(_spatialButton, 0.72, 0.36, 0.5);
   _spatialButton.contentTintColor = _spatial ? NSColor.controlAccentColor : nil;
   _spatialButton.image = symbol(_spatial ? @"headphones.circle.fill" : @"headphones", 15);
 }
@@ -2029,6 +2090,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
 }
 
 - (void)setMuted:(bool)m {
+  if (m != _muted) springScale(_muteButton, 0.72, 0.36, 0.5);
   _muted = m;
   if (_audioOut) _audioOut->setVolume(m ? 0.0f : float(_volume.doubleValue / 100));
   _muteButton.image = symbol(m ? @"speaker.slash.fill" : @"speaker.wave.2.fill", 15);
@@ -2065,6 +2127,8 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
       row = [SSViewerRow new];
       row.alphaValue = 0;
       animateAlpha(row, 1, 0.3);
+      SSViewerRow* fresh = row;
+      dispatch_async(dispatch_get_main_queue(), ^{ springIn(fresh, 0, -10, 0.45, 0.75); }); // (once it is in the list)
       _rows[id] = row;
     }
     [row update:v];
@@ -2116,6 +2180,10 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
     _window.title = @"Screen Share";
     [self show:_home];
     [self setError:_shareError text:text];
+    if (c == "auth" && !_restoring) {
+      NSView* pane = _sharePane;
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, int64_t(0.26 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ shake(pane); });
+    }
   } else if (type == "viewers") {
     [self updateViewers:e["list"]];
   } else if (type == "closed" && _current == _host) {
@@ -2138,6 +2206,10 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
     [self setError:_joinError text:wrong ? @"Hibás jelszó – próbáld újra." : @"Ebbe a szobába jelszóval lehet belépni – írd be a jelszót."];
     [_window makeFirstResponder:_joinAccess];
     [_joinAccess selectText:nil];
+    if (wrong) {
+      NSView* pane = _watchPane;
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, int64_t(0.26 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ shake(pane); });
+    }
   } else if (type == "join-error" && _restoring && e["code"].str() == "notfound") {
     std::string code = codeOnly(_savedCode);
     [self stopToHome];
@@ -2151,6 +2223,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
       setDotColor(_viewDot, picture ? NSColor.systemGreenColor : NSColor.systemOrangeColor);
       if (picture) {
         animateAlpha(_overlay, 0, 0.25);
+        springScale(_video, 1.025, 0.6, 0.9); // (the picture settles in)
         [_overlaySpinner stopAnimation:nil];
         _lastMove = nowMs();
       } else {

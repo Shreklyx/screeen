@@ -123,7 +123,14 @@ class Anims {
  public:
   /** Exponential approach: about `ms` to get (almost) there. */
   float to(const std::string& key, float target, float ms = 140);
-  /** Sets at once. */
+  /** A spring (as the Mac's own): `responseMs` how quick, `damping` 1 – no overshoot, less – a little
+   *  past and back. It has a speed of its own: a target that changes on the way keeps the motion going. */
+  float spring(const std::string& key, float target, float responseMs = 380, float damping = 0.8f);
+  /** A spring's speed now (units a second) – for a shape that stretches while it moves. */
+  float velocity(const std::string& key) const;
+  /** A push to a spring (units a second): a shake is a kick to one held at 0. */
+  void kick(const std::string& key, float velocity);
+  /** Sets at once (and stops it). */
   void set(const std::string& key, float value);
   float get(const std::string& key, float fallback = 0) const;
   /** Call at the start of each frame. */
@@ -135,6 +142,7 @@ class Anims {
 
  private:
   std::map<std::string, float> values_;
+  std::map<std::string, float> speeds_; // (the springs')
   double now_ = 0, dt_ = 16;
   bool moving_ = false;
 };

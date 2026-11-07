@@ -424,7 +424,19 @@ jobs:
         shell: bash
         run: |
           makensis=$(command -v makensis || echo "/c/Program Files (x86)/NSIS/makensis.exe")
-          [ -x "$makensis" ] || { choco install nsis -y --no-progress; makensis="/c/Program Files (x86)/NSIS/makensis.exe"; }
+          if [ ! -x "$makensis" ]; then
+            # Chocolatey (a few tries: its server is sometimes away – a 503 failed a build), else NSIS's own zip
+            for i in 1 2 3; do
+              choco install nsis -y --no-progress && break
+              sleep $((i * 10))
+            done
+            makensis="/c/Program Files (x86)/NSIS/makensis.exe"
+            if [ ! -x "$makensis" ]; then
+              curl -fsSL --retry 4 --retry-delay 5 -o nsis.zip "https://downloads.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10.zip"
+              unzip -q nsis.zip -d nsis-zip || powershell -NoProfile -Command "Expand-Archive nsis.zip nsis-zip"
+              makensis=$(ls -d "$PWD"/nsis-zip/nsis-*/makensis.exe | head -1)
+            fi
+          fi
           exe=$(cygpath -w "$PWD/build/windows/ScreenShare.exe")
           out=$(cygpath -w "$PWD/ScreenShare-Native-Setup.exe")
           ls -la build/windows/ScreenShare.exe

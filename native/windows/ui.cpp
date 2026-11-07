@@ -489,7 +489,48 @@ float Anims::to(const std::string& key, float target, float ms) {
   return v;
 }
 
-void Anims::set(const std::string& key, float value) { values_[key] = value; }
+float Anims::spring(const std::string& key, float target, float responseMs, float damping) {
+  auto it = values_.find(key);
+  if (it == values_.end()) {
+    values_[key] = target;
+    speeds_[key] = 0;
+    return target;
+  }
+  float& x = it->second;
+  float& v = speeds_[key];
+  if (std::fabs(target - x) < 0.0005f && std::fabs(v) < 0.005f) {
+    x = target;
+    v = 0;
+    return x;
+  }
+  // a damped spring, in steps of at most 4 ms (steady whatever the frame rate)
+  float w = 2.0f * 3.14159265f / std::max(0.02f, responseMs / 1000.0f);
+  float k = w * w, c = 2.0f * damping * w;
+  for (double left = dt_ / 1000.0; left > 1e-6;) {
+    float h = float(std::min(left, 0.004));
+    v += (k * (target - x) - c * v) * h;
+    x += v * h;
+    left -= h;
+  }
+  moving_ = true;
+  return x;
+}
+
+float Anims::velocity(const std::string& key) const {
+  auto it = speeds_.find(key);
+  return it == speeds_.end() ? 0.0f : it->second;
+}
+
+void Anims::kick(const std::string& key, float velocity) {
+  values_.try_emplace(key, 0.0f);
+  speeds_[key] += velocity;
+  moving_ = true;
+}
+
+void Anims::set(const std::string& key, float value) {
+  values_[key] = value;
+  speeds_[key] = 0;
+}
 
 float Anims::get(const std::string& key, float fallback) const {
   auto it = values_.find(key);
