@@ -1101,13 +1101,37 @@ typedef uint32_t Vec4 __attribute__((vector_size(16)));
 template <typename W>
 inline W rotl32(W x, int n) { return (x << n) | (x >> (32 - n)); }
 template <typename W>
+inline W rot16(W x) { return rotl32(x, 16); }
+template <typename W>
+inline W rot8(W x) { return rotl32(x, 8); }
+#if SS_VEC4 && (defined(__wasm_simd128__) || defined(__aarch64__) || defined(__SSSE3__))
+// where a byte shuffle is one instruction (WebAssembly's SIMD, ARM's NEON, x86 from SSSE3): the rotations by
+// whole bytes are one shuffle instead of two shifts and an OR
+typedef uint8_t Byte16 __attribute__((vector_size(16)));
+#if defined(__clang__)
+#define SS_SHUFFLE16(v, ...) __builtin_shufflevector(v, v, __VA_ARGS__)
+#else
+#define SS_SHUFFLE16(v, ...) __builtin_shuffle(v, Byte16{__VA_ARGS__})
+#endif
+template <>
+inline Vec4 rot16<Vec4>(Vec4 x) {
+  Byte16 b = (Byte16)x;
+  return (Vec4)SS_SHUFFLE16(b, 2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13);
+}
+template <>
+inline Vec4 rot8<Vec4>(Vec4 x) {
+  Byte16 b = (Byte16)x;
+  return (Vec4)SS_SHUFFLE16(b, 3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14);
+}
+#endif
+template <typename W>
 inline void quarter(W& a, W& b, W& c, W& d) {
   a += b;
-  d = rotl32(d ^ a, 16);
+  d = rot16(d ^ a);
   c += d;
   b = rotl32(b ^ c, 12);
   a += b;
-  d = rotl32(d ^ a, 8);
+  d = rot8(d ^ a);
   c += d;
   b = rotl32(b ^ c, 7);
 }
