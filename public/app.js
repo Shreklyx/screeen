@@ -1350,10 +1350,13 @@ function adaptDirectSize(pipe) {
 
 /* ---- the sharer's sound (Opus, 2.5 ms packets – its least delay) ---- */
 
-/** The track's sound as AudioData: MediaStreamTrackProcessor, else an AudioWorklet (Firefox,
- *  Safari). onData owns (closes) each. Returns a stop function (async: the worklet loads). */
-async function readAudio(track, onData) {
-  if (typeof MediaStreamTrackProcessor === 'function') {
+/** The track's sound as AudioData at 48 kHz (what the lossless sound and every player take):
+ *  MediaStreamTrackProcessor where the track is 48 kHz already, else an AudioWorklet in a 48 kHz context
+ *  (Firefox, Safari – and a 44.1 kHz sound card: the browser converts it, and it stays lossless FLAC
+ *  instead of falling back to Opus). onData owns (closes) each. Returns a stop function (async). */
+async function readAudio(track, onData, worklet = false) {
+  const rate = track.getSettings?.().sampleRate;
+  if (!worklet && typeof MediaStreamTrackProcessor === 'function' && (rate === 48000 || rate == null)) {
     const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
     let stopped = false;
     (async () => {
@@ -1406,9 +1409,9 @@ function startDirectAudio(track) {
   if (!track || track.readyState !== 'live') return;
   const pipe = { track, stop: null, encoders: [], channels: 0, rate: 0, stopped: false, wasm: null, flac: null };
   direct.audio = pipe;
-  // the lossless sound: our FLAC encoder (WebAssembly) – Opus until it is there, or when not 48 kHz
+  // the lossless sound: our FLAC encoder (WebAssembly) – Opus only until it is there
   globalThis.ScreenShareWasm?.load().then((w) => { pipe.wasm = w; }, () => {});
-  readAudio(track, (data) => {
+  const onData = (data) => {
     try {
       if (!pipe.stopped) encodeDirectAudio(pipe, data);
     } catch (err) {
@@ -1416,10 +1419,19 @@ function startDirectAudio(track) {
     } finally {
       data.close();
     }
-  }).then((stop) => {
+  };
+  const read = (worklet) => readAudio(track, onData, worklet).then((stop) => {
     pipe.stop = stop;
     if (pipe.stopped) stop();
   }, (err) => console.warn('direct audio', err));
+  // (a track that turns out not to be 48 kHz: read again through the 48 kHz worklet – encodeDirectAudio)
+  pipe.restart = () => {
+    const old = pipe.stop;
+    pipe.stop = null;
+    old?.();
+    read(true);
+  };
+  read(false);
 }
 
 function stopDirectAudio() {
@@ -1438,6 +1450,12 @@ function encodeDirectAudio(pipe, data) {
   if (pipe.wasm && data.sampleRate === 48000) {
     encodeLossless(pipe, data, channels);
     return;
+  }
+  if (pipe.wasm && !pipe.resampled && pipe.restart) {
+    // (the track said nothing of its rate and is not 48 kHz: read again through the 48 kHz worklet –
+    // lossless from there; until it runs, Opus)
+    pipe.resampled = true;
+    pipe.restart();
   }
   const pairs = Math.ceil(channels / 2);
   if (channels !== pipe.channels || data.sampleRate !== pipe.rate) {
