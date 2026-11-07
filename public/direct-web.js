@@ -237,7 +237,10 @@
           return;
         }
         const packet = new Uint8Array(e.data);
-        peer.recvChain = peer.recvChain.then(() => this.onPacket(peer, packet)).catch(() => {});
+        // opened at once (a 4K keyframe's decryption no longer holds up the sound packets behind it:
+        // the browser can open them side by side), handled in the order they came
+        const opened = this.open(peer, packet);
+        peer.recvChain = peer.recvChain.then(() => opened).then((body) => body && this.onPacket(peer, packet, body)).catch(() => {});
       };
       ws.onclose = () => {
         if (peer.ws !== ws) return;
@@ -309,19 +312,22 @@
 
     /* ---- receiving */
 
-    async onPacket(peer, packet) {
-      if (packet.length < HEADER + 16 || packet[0] !== PEER || !peer.recvKey) return;
+    /** A packet's body, decrypted – or null (not ours, or it does not open). */
+    async open(peer, packet) {
+      if (packet.length < HEADER + 16 || packet[0] !== PEER || !peer.recvKey) return null;
       const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
-      if (view.getUint32(2) !== peer.session) return;
+      if (view.getUint32(2) !== peer.session) return null;
       const iv = new Uint8Array(12);
       iv[0] = peer.recvDir;
       iv.set(packet.subarray(6, 14), 4);
-      let body;
       try {
-        body = new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv, additionalData: packet.subarray(0, HEADER) }, peer.recvKey, packet.subarray(HEADER)));
+        return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv, additionalData: packet.subarray(0, HEADER) }, peer.recvKey, packet.subarray(HEADER)));
       } catch {
-        return;
+        return null;
       }
+    }
+
+    onPacket(peer, packet, body) {
       if (this.peers.get(peer.id) !== peer) return;
       const t = now();
       peer.lastRecv = t;

@@ -318,25 +318,46 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active
 fi
 warn "Ha a szolgáltatód webes felületén is van tűzfal, ott is engedd: 80 és 443 TCP, 443 UDP, 3478 TCP+UDP, 3479 UDP, $TURN_MIN_PORT-$TURN_MAX_PORT UDP."
 
-# ---------------------------------------------------------------- hálózat: kisebb késés a böngészős nézőknek
+# ---------------------------------------------------------------- hálózat: kisebb késés, nincs elveszett csomag
 
-# A böngészős nézők felé TCP-n (a Caddy-n át) megy a kép: a BBR torlódásvezérlés veszteséges vonalon
-# (wifi, mobil) is tartja a sebességet, és nem tölti fel a hálózat puffereit – kisebb a késés. A Caddy
-# konténere létrehozáskor veszi át, ezért az első bekapcsoláskor újraindul.
+# - A relé UDP-pufferei: a program 8 MB-ot kér, de a rendszermag alapból ~200 KB-ra vágja – egy 4K
+#   kulcskocka (1–2 MB) egy része elveszett, ha a szerver egy pillanatra elfoglalt volt (akadás).
+# - A böngészős nézők felé TCP-n (a Caddy-n át) megy a kép: a BBR torlódásvezérlés veszteséges vonalon
+#   (wifi, mobil) is tartja a sebességet, és nem tölti fel a hálózat puffereit – a mérés szerint 1%
+#   csomagvesztésnél a szokásos TCP-vel ~0,5 s késés és harmadannyi kép, BBR-rel ~7 ms. A Caddy
+#   konténere létrehozáskor veszi át, ezért az első bekapcsoláskor újraindul.
+SYSCTL_FILE=/etc/sysctl.d/90-screenshare.conf
 RECREATE_CADDY=""
+RESTART_APP=""
+BBR=""
+# (a relé a puffereit induláskor kéri: ha most nőnek, a szerver újraindul, hogy megkapja – a szobák megmaradnak)
+if [ "$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)" -lt 16777216 ]; then RESTART_APP=1; fi
 if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
-  ok "TCP: BBR"
+  BBR=1
 elif modprobe tcp_bbr 2>/dev/null && grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-  printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > /etc/sysctl.d/90-screenshare.conf
+  BBR=1
+  RECREATE_CADDY=1
   echo tcp_bbr > /etc/modules-load.d/screenshare-bbr.conf
-  if sysctl -q -p /etc/sysctl.d/90-screenshare.conf; then
-    RECREATE_CADDY=1
-    ok "TCP: BBR bekapcsolva (kisebb késés a böngészős nézőknek)"
-  else
-    warn "A BBR-t nem sikerült bekapcsolni – a böngészős nézők a szokásos TCP-vel kapják a képet."
+fi
+{
+  echo "# Screen Share (deploy/install.sh)"
+  echo "net.core.rmem_max = 16777216"
+  echo "net.core.wmem_max = 16777216"
+  if [ -n "$BBR" ]; then
+    echo "net.core.default_qdisc = fq"
+    echo "net.ipv4.tcp_congestion_control = bbr"
   fi
+} > "$SYSCTL_FILE"
+if sysctl -q -p "$SYSCTL_FILE"; then
+  ok "UDP-pufferek: 16 MB (a relé nem veszít csomagot a 4K kulcskockáknál)"
+  if [ -n "$BBR" ]; then ok "TCP: BBR (kisebb késés a böngészős nézőknek, veszteséges vonalon is)"; fi
 else
-  warn "A rendszermag nem tud BBR-t – a böngészős nézők a szokásos TCP-vel kapják a képet."
+  warn "A hálózati beállításokat nem sikerült alkalmazni ($SYSCTL_FILE) – a szerver így is működik."
+  RECREATE_CADDY=""
+  RESTART_APP=""
+fi
+if [ -z "$BBR" ]; then
+  warn "A rendszermag nem tud BBR-t – a böngészős nézők a szokásos TCP-vel kapják a képet (csomagvesztésnél nagyobb késés)."
 fi
 
 # ---------------------------------------------------------------- indítás
@@ -344,6 +365,7 @@ fi
 say "Indítás"
 docker compose up -d --remove-orphans
 if [ -n "$RECREATE_CADDY" ]; then docker compose up -d --no-deps --force-recreate caddy; fi
+if [ -n "$RESTART_APP" ]; then docker compose restart app >/dev/null 2>&1 || true; fi
 # a Caddy a frissített beállítást kapcsolatbontás nélkül tölti újra (ha nem változott, nem csinál semmit)
 docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 ||
   docker compose restart caddy >/dev/null 2>&1 || true

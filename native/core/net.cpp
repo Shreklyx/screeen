@@ -124,10 +124,12 @@ bool UdpSocket::open(bool loopbackOnly) {
   socklen_t len = sizeof a;
   getsockname(s, reinterpret_cast<sockaddr*>(&a), &len);
   port_ = ntohs(a.sin_port);
-  // big frames arrive as bursts: room for a 4K keyframe or two
-  int rcv = 8 << 20, snd = 4 << 20;
-  setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcv), sizeof rcv);
-  setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&snd), sizeof snd);
+  // big frames arrive as bursts: room for a 4K keyframe or two – as much as the system gives (macOS
+  // refuses a size above its limit outright and keeps its small default: then a smaller one is asked for)
+  for (int rcv : {8 << 20, 6 << 20, 4 << 20, 2 << 20, 1 << 20})
+    if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcv), sizeof rcv) == 0) break;
+  for (int snd : {4 << 20, 2 << 20, 1 << 20})
+    if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&snd), sizeof snd) == 0) break;
 #ifdef _WIN32
   u_long nb = 1;
   ioctlsocket(SOCKET(s), FIONBIO, &nb);

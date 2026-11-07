@@ -203,6 +203,7 @@ static int view(int argc, char** argv) {
   std::string out = arg(argc, argv, "--out");
   std::mutex mu;
   uint64_t frames = 0, keys = 0, bytes = 0, audio = 0, lossless = 0, losslessBad = 0;
+  double skips = 0; // frames the transport could not complete (it went on from a keyframe)
   bool firstKey = false, sawFrame = false;
   double lastFrameAt = 0, maxGap = 0; // (a picture that stood still: the longest time without a frame)
   std::vector<double> lat;
@@ -215,7 +216,13 @@ static int view(int argc, char** argv) {
   cfg.noAcks = flag(argc, argv, "--no-acks");
   Chat chat(argc, argv);
   EngineCallbacks cb;
-  cb.event = [&chat](const Json& e) { if (!chat.on(e)) line("EVENT " + e.dump()); };
+  cb.event = [&](const Json& e) {
+    if (e["type"].str() == "view-stats") {
+      std::lock_guard<std::mutex> l(mu);
+      skips += e["skips"].num(0);
+    }
+    if (!chat.on(e)) line("EVENT " + e.dump());
+  };
   cb.media = [&](const MediaMeta& m, const uint8_t* d, size_t n) {
     std::lock_guard<std::mutex> l(mu);
     if (m.stream == 1) {
@@ -259,7 +266,7 @@ static int view(int argc, char** argv) {
   r.set("lossless", double(lossless)).set("losslessBad", double(losslessBad));
   r.set("latMedian", lat.empty() ? Json() : Json(std::round(lat[lat.size() / 2] * 10) / 10));
   r.set("latP90", lat.empty() ? Json() : Json(std::round(lat[lat.size() * 9 / 10] * 10) / 10));
-  r.set("maxGap", std::round(maxGap)).set("lastGap", lastFrameAt ? Json(std::round(nowMs() - lastFrameAt)) : Json());
+  r.set("maxGap", std::round(maxGap)).set("lastGap", lastFrameAt ? Json(std::round(nowMs() - lastFrameAt)) : Json()).set("skips", skips);
   line("RESULT " + r.dump());
   enginePtr = nullptr;
   chat.engine = nullptr;

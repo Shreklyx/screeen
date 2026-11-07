@@ -1037,7 +1037,7 @@ struct Engine::Impl {
       sendToHost(s);
     }
     Json e = Json::object();
-    e.set("type", "view-stats").set("fps", std::isnan(fps) ? Json() : Json(fps)).set("kbps", r["kbps"]).set("loss", r["loss"]);
+    e.set("type", "view-stats").set("fps", std::isnan(fps) ? Json() : Json(fps)).set("kbps", r["kbps"]).set("loss", r["loss"]).set("skips", r["skips"]);
     e.set("rtt", std::isnan(view->rtt) ? Json() : Json(view->rtt)).set("path", view->path).set("lat", std::isnan(lat) ? Json() : Json(lat));
     e.set("encoder", hostStats["encoder"]).set("hw", hostStats["hw"]).set("encodeMs", hostStats["encodeMs"]);
     emit(e);

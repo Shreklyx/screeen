@@ -207,11 +207,11 @@ jobs:
           node -e '
             const rows = require("fs").readFileSync("paths.txt", "utf8").trim().split("\n").map((l) => l.split("|"));
             const got = {};
-            console.log("path                     network  median  (+ ours)     p90   frames  keyframes");
+            console.log("path                     network  median  (+ ours)     p90   frames  keyframes  skipped");
             for (const [name, legs, json] of rows) {
               const r = (got[name] = JSON.parse(json || "{}")), net = 20 * Number(legs);
               const over = (v) => (v == null ? "  –" : (v - net >= 0 ? "+" : "") + (v - net).toFixed(1));
-              console.log(name.padEnd(24), String(net + " ms").padStart(8), String(r.latMedian).padStart(7), ("(" + over(r.latMedian) + ")").padStart(10), String(r.latP90).padStart(7), String(r.frames).padStart(8), String(r.keyframes).padStart(10));
+              console.log(name.padEnd(24), String(net + " ms").padStart(8), String(r.latMedian).padStart(7), ("(" + over(r.latMedian) + ")").padStart(10), String(r.latP90).padStart(7), String(r.frames).padStart(8), String(r.keyframes).padStart(10), String(r.skips ?? "–").padStart(8));
             }
             const problems = [];
             for (const [name, legs] of [["direct (UDP)", 1], ["relay (UDP)", 2], ["WebSocket (TCP)", 2]]) {
