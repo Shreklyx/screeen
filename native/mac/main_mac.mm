@@ -292,7 +292,8 @@ static NSImage* symbol(NSString* name, CGFloat size, NSFontWeight weight = NSFon
 /** A label; with `wrapWidth` it wraps at that width. */
 static NSTextField* label(NSString* text, CGFloat size, NSFontWeight weight, NSColor* color, CGFloat wrapWidth = 0) {
   NSTextField* l = wrapWidth > 0 ? [NSTextField wrappingLabelWithString:text] : [NSTextField labelWithString:text];
-  l.font = [NSFont systemFontOfSize:size weight:weight];
+  // every text semibold at least (the app's look)
+  l.font = [NSFont systemFontOfSize:size weight:weight < NSFontWeightSemibold ? NSFontWeightSemibold : weight];
   l.textColor = color;
   l.translatesAutoresizingMaskIntoConstraints = NO;
   if (wrapWidth > 0) {
@@ -452,14 +453,32 @@ static NSView* glassCapsule(NSView* content, CGFloat radius) {
 
 @implementation SSGroup {
   NSStackView* _stack;
+  BOOL _glass;
 }
 - (instancetype)init {
   if ((self = [super initWithFrame:NSZeroRect])) {
     self.translatesAutoresizingMaskIntoConstraints = NO;
     self.wantsLayer = YES;
-    self.layer.cornerRadius = 11;
+    self.layer.cornerRadius = 12;
     self.layer.borderWidth = 1;
     _stack = vstack(@[], 0);
+    // Liquid Glass under the rows on macOS 26 (before: the tinted layer below)
+    Class glass = NSClassFromString(@"NSGlassEffectView");
+    if (glass) {
+      NSView* g = [glass new];
+      @try {
+        [g setValue:@(12) forKey:@"cornerRadius"];
+        g.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:g];
+        pin(g, self);
+        [g setValue:_stack forKey:@"contentView"];
+        pin(_stack, g);
+        _glass = YES;
+        return self;
+      } @catch (NSException*) {
+        [g removeFromSuperview];
+      }
+    }
     [self addSubview:_stack];
     pin(_stack, self);
   }
@@ -471,8 +490,8 @@ static NSView* glassCapsule(NSView* content, CGFloat radius) {
 - (void)updateLayer {
   // the colours follow light and dark mode (updateLayer runs again when it changes)
   BOOL dark = [[self.effectiveAppearance bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]] isEqualToString:NSAppearanceNameDarkAqua];
-  self.layer.backgroundColor = [NSColor colorWithWhite:dark ? 1 : 0 alpha:dark ? 0.055 : 0.035].CGColor;
-  self.layer.borderColor = [NSColor colorWithWhite:dark ? 1 : 0 alpha:dark ? 0.07 : 0.06].CGColor;
+  self.layer.backgroundColor = _glass ? NSColor.clearColor.CGColor : [NSColor colorWithWhite:dark ? 1 : 0 alpha:dark ? 0.075 : 0.035].CGColor;
+  self.layer.borderColor = [NSColor colorWithWhite:dark ? 1 : 0 alpha:_glass ? 0.0 : dark ? 0.11 : 0.06].CGColor;
 }
 - (void)setRows:(NSArray<NSView*>*)rows {
   for (NSView* v in [_stack.arrangedSubviews copy]) [v removeFromSuperview];
@@ -2254,6 +2273,8 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
 
 - (void)applicationDidFinishLaunching:(NSNotification*)n {
   if ([self signLocallyFirst]) return;
+  // dark grey glass everywhere (as the website and the Windows app): the dark appearance, always
+  NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
   [self openWindows];
   [NSApp activateIgnoringOtherApps:YES];
   [self checkUpdatesLater];

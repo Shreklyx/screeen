@@ -941,6 +941,11 @@ input[type="text"]:focus, input[type="password"]:focus, select:focus {
 }
 .update-bar { border-color: rgba(255, 255, 255, 0.22); }
 
+/* semibold everywhere (the headings bolder) */
+body, input, select, textarea, button, .btn { font-weight: 600; }
+h1 { font-weight: 800; }
+h2, h3, .card-head h2 { font-weight: 700; }
+
 /* (the SVG that bends the light: in the page, not shown) */
 .lg-defs { position: absolute; width: 0; height: 0; overflow: hidden; }
 

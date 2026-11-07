@@ -89,11 +89,12 @@ const wchar_t* kBuild = WIDEN(SS_BUILD);
 const wchar_t* kCopyright = L"Copyright © 2026 mozizas.hu.\nMinden jog fenntartva.";
 const UINT kSysAbout = 0x1010, kSysNew = 0x1020; // "About" and "New window" in the window menu (Alt+Space)
 
-// the palette: the Mac app's (macOS in its dark appearance), with the app's pink
-const Color cWin1 = rgb(0x323237), cWin2 = rgb(0x29292E), cText = rgb(0xEDEDF0), cMuted = rgb(0xA3A3AB), cFaint = rgb(0x77777F),
-            cAccent = rgb(0xF74F9F), cField = rgb(0x1E1E21), cOk = rgb(0x32D74B), cWarn = rgb(0xFF9F0A), cErr = rgb(0xFF6961),
-            cWhite = rgb(0xFFFFFF);
-const COLORREF kFieldGdi = RGB(0x1E, 0x1E, 0x21), kTextGdi = RGB(0xED, 0xED, 0xF0), kBgGdi = RGB(0x32, 0x32, 0x37);
+// the palette: grey and white glass (as the website) – a dark grey ground, whitish glass on it, white
+// light on the edges; what is chosen or pressed is white with dark text on it
+const Color cWin1 = rgb(0x2E2E32), cWin2 = rgb(0x222225), cText = rgb(0xF2F2F5), cMuted = rgb(0xA6A6AD), cFaint = rgb(0x77777F),
+            cAccent = rgb(0xEDEDF2), cField = rgb(0x1B1B1E), cOk = rgb(0x32D74B), cWarn = rgb(0xFF9F0A), cErr = rgb(0xFF6961),
+            cWhite = rgb(0xFFFFFF), cOnAccent = rgb(0x18181B);
+const COLORREF kFieldGdi = RGB(0x1B, 0x1B, 0x1E), kTextGdi = RGB(0xF2, 0xF2, 0xF5), kBgGdi = RGB(0x2E, 0x2E, 0x32);
 
 // the compact screens (home, sharing): their content's width, and the space around it
 const float kHomeW = 420, kHostW = 440, kSide = 30, kTopPad = 24, kBottomPad = 26;
@@ -449,8 +450,10 @@ void drawTip(float W, float H) {
 void group(const Rect& r, std::initializer_list<float> lines = {}) {
   if (g.measuring) return;
   Canvas& c = C();
-  c.fillRound(r, 11, rgb(0xFFFFFF, 0.055f));
-  c.strokeRound(r, 11, rgb(0xFFFFFF, 0.085f), 1);
+  // glass: a whitish fill, its rim lit along the top and faint below
+  c.fillRound(r, 12, rgb(0xFFFFFF, 0.075f));
+  c.strokeRound(r, 12, rgb(0xFFFFFF, 0.11f), 1);
+  c.fillRound({r.x + 10, r.y + 0.5f, r.w - 20, 1}, 0.5f, rgb(0xFFFFFF, 0.22f));
   for (float y : lines) c.fillRect({r.x + 12, std::floor(y), r.w - 24, 1}, rgb(0xFFFFFF, 0.09f));
 }
 
@@ -478,9 +481,10 @@ void button(int id, const Rect& r, const std::wstring& label, Style style, bool 
   float radius = r.h / 2;
   Color text = cText;
   switch (style) {
-    case Style::Primary:
-      c.fillRound(r, radius, mix(mix(cAccent, cWhite, 0.10f * hov), rgb(0x000000), 0.14f * prs));
-      text = cWhite;
+    case Style::Primary: // white glass, dark text
+      c.fillRound(r, radius, mix(mix(cAccent, cWhite, 0.6f * hov), rgb(0x000000), 0.12f * prs));
+      c.fillRound({r.x + radius * 0.6f, r.y + 0.5f, r.w - radius * 1.2f, 1}, 0.5f, rgb(0xFFFFFF, 0.9f));
+      text = cOnAccent;
       break;
     case Style::Secondary:
       c.fillRound(r, radius, rgb(0xFFFFFF, 0.12f + 0.05f * hov + 0.05f * prs));
@@ -518,7 +522,7 @@ void toggleSwitch(int id, const Rect& row, bool on) {
   float kw = 25, kx = track.x + 2 + k * (track.w - 4 - kw);
   Rect knob{kx, track.y + 2, kw, track.h - 4};
   c.fillRound(knob.offset(0, 0.7f), knob.h / 2, rgb(0x000000, 0.25f));
-  c.fillRound(knob, knob.h / 2, cWhite);
+  c.fillRound(knob, knob.h / 2, mix(cWhite, rgb(0x2A2A2E), k)); // (on: a dark knob on the white track)
 }
 
 HWND editFor(int id) {
@@ -595,7 +599,7 @@ void segmented(const Rect& r, int selected) {
     float hov = A().to(key("h", id), g.hover == id ? 1.0f : 0.0f, 120);
     if (hov > 0.01f) c.fillRound(seg.inset(2, 2), (r.h - 4) / 2, rgb(0xFFFFFF, 0.07f * hov));
     float on = std::clamp(1 - std::fabs(pos - float(i)), 0.0f, 1.0f);
-    c.text(labels[i], seg, 13, Semibold, mix(cText, cWhite, on), Center);
+    c.text(labels[i], seg, 13, Semibold, mix(cText, cOnAccent, on), Center);
   }
 }
 
@@ -1021,7 +1025,7 @@ float drawViewing(float W, float H) {
       float bw = std::max(17.0f, c.measure(n, 10.5f, Bold) + 9);
       Rect badge{b.chat.right() - bw + 5, b.chat.y - 4, bw, 17};
       c.fillRound(badge, 8.5f, cAccent);
-      c.text(n, badge, 10.5f, Bold, cWhite, Center);
+      c.text(n, badge, 10.5f, Bold, cOnAccent, Center);
     }
     // volume: the icon mutes, the bar sets it
     hit(B_VOLUME, {b.volume.x - 8, 12, b.volume.w + 16, 28});

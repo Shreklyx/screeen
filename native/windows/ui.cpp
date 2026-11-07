@@ -227,6 +227,7 @@ void Canvas::shadow(const Rect& r, float radius, float strength) {
 }
 
 IDWriteTextFormat* Canvas::format(float size, int weight, bool mono) {
+  weight = weight < 600 ? 600 : weight; // every text semibold at least (the app's look)
   int key = (int(size * 10) * 1000 + weight) * 2 + (mono ? 1 : 0);
   auto it = formats_.find(key);
   if (it != formats_.end()) return it->second.Get();
