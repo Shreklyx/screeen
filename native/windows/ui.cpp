@@ -448,7 +448,9 @@ void Canvas::popAlpha() {
   if (alpha_.size() > 1) alpha_.pop_back();
 }
 
-void Canvas::applyTransform() { target_->SetTransform(transforms_.back()); }
+void Canvas::applyTransform() {
+  if (target_) target_->SetTransform(transforms_.back()); // (while measuring there may be none yet)
+}
 
 void Canvas::pushTranslate(float dx, float dy) {
   transforms_.push_back(D2D1::Matrix3x2F::Translation(dx, dy) * transforms_.back());

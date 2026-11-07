@@ -647,9 +647,9 @@ float errorText(const std::wstring& s, const char* animKey, float x, float y, fl
   y += 12;
   float a = g.measuring ? 1.0f : A().spring(animKey, 1, 380, 0.78f); // (down into place on a spring)
   C().pushAlpha(std::clamp(a, 0.0f, 1.0f));
-  C().pushTranslate(0, (1 - a) * -8);
+  if (!g.measuring) C().pushTranslate(0, (1 - a) * -8);
   y += note(s, x, y, w, 12, cErr, Center);
-  C().popTranslate();
+  if (!g.measuring) C().popTranslate();
   C().popAlpha();
   return y;
 }
@@ -730,9 +730,9 @@ float drawHome(float W, float) {
   float shake = g.measuring ? 0.0f : A().spring("shake", 0, 120, 0.2f);
   g.paneDx = std::round((1 - pane) * (g.tab == 1 ? 26.0f : -26.0f) + shake);
   c.pushAlpha(std::clamp(pane, 0.0f, 1.0f));
-  c.pushTranslate(g.paneDx, 0);
+  if (!g.measuring) c.pushTranslate(g.paneDx, 0); // (measuring: no drawing, no target to move)
   y = g.tab == 0 ? sharePane(x0, y, cw) : watchPane(x0, y, cw);
-  c.popTranslate();
+  if (!g.measuring) c.popTranslate();
   c.popAlpha();
   g.paneDx = 0;
   if (!g.update.version.empty()) {
