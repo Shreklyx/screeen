@@ -1,5 +1,6 @@
 #include "player_mac.h"
 
+#import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMotion/CoreMotion.h>
 #import <CoreMedia/CoreMedia.h>
@@ -457,9 +458,135 @@ struct MacAudioOut::Impl {
     }
   }
 
+  /* -- macOS's own spatial audio. Control Center (Sound → AirPods / Beats → Spatial Audio: Fixed, Head
+   *    Tracked) offers it only for sound that AVFoundation plays – for an output unit it says "Not
+   *    Available". With spatial on, the sound goes through an AVSampleBufferAudioRenderer that allows it
+   *    (stereo and 5.1 / 7.1 as they are: the system places the speakers and follows the head); off, the
+   *    output unit again (the least delay). The renderer is fed from the ring on a timer, kLead ahead of
+   *    its clock – it is given no more than that. */
+  static const int kStep = 240;       // 5 ms a sample buffer
+  static const int64_t kLead = 1920;  // 40 ms ahead of the renderer's clock
+  struct System {
+    AVSampleBufferAudioRenderer* renderer = nil;
+    AVSampleBufferRenderSynchronizer* sync = nil;
+    dispatch_queue_t queue = nil;
+    dispatch_source_t timer = nil;
+    CMAudioFormatDescriptionRef format = nullptr;
+    int channels = 0;
+    int64_t next = 0; // the next sample's time on the renderer's clock (48 kHz)
+    bool started = false;
+    std::atomic<bool> failed{false};
+    std::vector<float> buf;
+    ~System() {
+      if (format) CFRelease(format);
+    }
+  };
+  std::unique_ptr<System> sys;
+
+  /** The format for the sound's own channels (the order Windows sends them in: L R C LFE BL BR SL SR). */
+  static CMAudioFormatDescriptionRef formatFor(int channels) {
+    AudioStreamBasicDescription f = {};
+    f.mSampleRate = 48000;
+    f.mFormatID = kAudioFormatLinearPCM;
+    f.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    f.mChannelsPerFrame = UInt32(channels);
+    f.mBitsPerChannel = 32;
+    f.mBytesPerFrame = f.mBytesPerPacket = UInt32(4 * channels);
+    f.mFramesPerPacket = 1;
+    AudioChannelLayout layout = {};
+    layout.mChannelLayoutTag = channels == 1   ? kAudioChannelLayoutTag_Mono
+                               : channels == 6 ? kAudioChannelLayoutTag_WAVE_5_1_A
+                               : channels == 8 ? kAudioChannelLayoutTag_WAVE_7_1
+                                               : kAudioChannelLayoutTag_Stereo;
+    CMAudioFormatDescriptionRef fmt = nullptr;
+    CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &f, sizeof layout, &layout, 0, nullptr, nullptr, &fmt);
+    return fmt;
+  }
+
+  /** On the renderer's queue: the ring's sound up to kLead ahead of the clock. */
+  void feed(System* s) {
+    if (s->failed) return;
+    if (s->renderer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+      s->failed = true;
+      return;
+    }
+    int64_t now = 0;
+    if (s->started) {
+      CMTime t = s->sync.currentTime;
+      if (CMTIME_IS_NUMERIC(t)) now = CMTimeConvertScale(t, 48000, kCMTimeRoundingMethod_RoundTowardZero).value;
+    }
+    // behind (the timer was late, the output changed): from a little ahead of now again – the gap is silence
+    if (s->started && s->next < now + kStep) s->next = now + kStep;
+    // the sound's own channels (5.1 / 7.1 too: the system places them); others the ring mixes to stereo
+    int src = ring.sourceChannels();
+    int ch = src == 1 || src == 6 || src == 8 ? src : 2;
+    if (ch != s->channels || !s->format) {
+      if (s->format) CFRelease(s->format);
+      s->format = formatFor(ch);
+      s->channels = ch;
+    }
+    if (!s->format) return;
+    s->buf.resize(size_t(kStep) * size_t(ch));
+    const size_t bytes = s->buf.size() * sizeof(float);
+    while (s->next < now + kLead) {
+      ring.pull(s->buf.data(), ch, kStep);
+      CMBlockBufferRef block = nullptr;
+      if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, nullptr, bytes, kCFAllocatorDefault, nullptr, 0, bytes, kCMBlockBufferAssureMemoryNowFlag, &block) != noErr)
+        return;
+      CMBlockBufferReplaceDataBytes(s->buf.data(), block, 0, bytes);
+      CMSampleBufferRef sample = nullptr;
+      OSStatus st = CMAudioSampleBufferCreateReadyWithPacketDescriptions(kCFAllocatorDefault, block, s->format, kStep, CMTimeMake(s->next, 48000), nullptr, &sample);
+      CFRelease(block);
+      if (st != noErr || !sample) return;
+      [s->renderer enqueueSampleBuffer:sample];
+      CFRelease(sample);
+      s->next += kStep;
+    }
+    if (!s->started) { // (the first kLead is there: the clock starts from 0)
+      s->started = true;
+      [s->sync setRate:1.0 time:kCMTimeZero];
+    }
+  }
+
+  bool startSystem() {
+    if (sys) return true;
+    auto s = std::make_unique<System>();
+    s->renderer = [AVSampleBufferAudioRenderer new];
+    s->renderer.allowedAudioSpatializationFormats = AVAudioSpatializationFormatMonoStereoAndMultichannel;
+    s->sync = [AVSampleBufferRenderSynchronizer new];
+    if (!s->renderer || !s->sync) return false;
+    [s->sync addRenderer:s->renderer];
+    s->queue = dispatch_queue_create("hu.mozizas.screenshare.spatial", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    s->timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, s->queue);
+    if (!s->timer) return false; // (from here on it is resumed: a suspended one may not be let go)
+    if (unit) AudioOutputUnitStop(unit); // (one of the two plays)
+    System* raw = s.get();
+    sys = std::move(s);
+    dispatch_source_set_event_handler(raw->timer, ^{ this->feed(raw); });
+    dispatch_source_set_timer(raw->timer, dispatch_time(DISPATCH_TIME_NOW, 0), 2500 * NSEC_PER_USEC, 250 * NSEC_PER_USEC);
+    dispatch_resume(raw->timer);
+    return true;
+  }
+
+  void stopSystem() {
+    if (!sys) return;
+    std::unique_ptr<System> s = std::move(sys);
+    dispatch_source_cancel(s->timer);
+    dispatch_sync(s->queue, ^{}); // (a feed under way ends first)
+    [s->sync setRate:0];
+    [s->renderer stopRequestingMediaData];
+    [s->renderer flush];
+    [s->sync removeRenderer:s->renderer atTime:kCMTimeInvalid completionHandler:nil];
+    if (unit) AudioOutputUnitStart(unit);
+  }
+
+  /** The system's renderer gave up (it can, e.g. with no output at all): the output unit again. */
+  bool systemFailed() const { return sys && sys->failed; }
+
   ~Impl() {
     *alive = false;
     track(false);
+    stopSystem();
     if (unit) {
       AudioOutputUnitStop(unit);
       AudioUnitUninitialize(unit);
@@ -474,8 +601,24 @@ void MacAudioOut::push(int sub, const uint8_t* data, size_t n, double tsUs) { im
 void MacAudioOut::setVolume(float v) { impl_->ring.setVolume(v); }
 
 void MacAudioOut::setSpatial(bool on) {
-  impl_->ring.setSpatial(on);
+  // macOS's own spatial audio (see Impl::startSystem): the system renders it, our head model stays off
+  if (on && impl_->startSystem()) {
+    impl_->ring.setSpatial(false);
+    impl_->track(false);
+    return;
+  }
+  impl_->stopSystem();
+  impl_->ring.setSpatial(on); // (where the system's cannot start: our own head model)
   impl_->track(on);
+}
+
+bool MacAudioOut::systemSpatial() {
+  if (impl_->systemFailed()) { // (its renderer gave up: our own head model from here on)
+    impl_->stopSystem();
+    impl_->ring.setSpatial(true);
+    impl_->track(true);
+  }
+  return impl_->sys != nullptr;
 }
 
 }  // namespace ss

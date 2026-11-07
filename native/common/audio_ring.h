@@ -30,6 +30,11 @@ class AudioRing {
   /** Fills out (outs channels, n frames, interleaved float at 48 kHz) – the device's thread. */
   void pull(float* out, int outs, int n);
   void setVolume(float v);
+  /** How many channels the sound has (as sent; 0 before the first packet). */
+  int sourceChannels() {
+    std::lock_guard<std::mutex> l(mu_);
+    return channels_;
+  }
   /** Spatial sound for headphones (spatial.h): the channels as speakers around the listener, to the
    *  device's first two channels. */
   void setSpatial(bool on) { spatialOn_ = on; }

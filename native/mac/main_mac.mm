@@ -1500,7 +1500,8 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   _muteButton.toolTip = @"Némítás (M)";
   _spatial = [NSUserDefaults.standardUserDefaults boolForKey:@"spatial"];
   _spatialButton = iconButton(@"headphones", self, @selector(toggleSpatial));
-  _spatialButton.toolTip = @"Térhatású hang fejhallgatóhoz – AirPods-szal követi a fejed (H)";
+  _spatialButton.toolTip = @"Térhatású hang (H) – a macOS saját térhangja: AirPods / Beats fejhallgatón a Vezérlőközpont → Hang → "
+                           @"Térhatású hang menüjében válaszd a Fejkövetés vagy a Rögzített módot";
   NSButton* more = iconButton(@"plus.rectangle.on.rectangle", self, @selector(newWindow));
   more.toolTip = @"Új ablak – még egy szoba nézése (⌘N)";
   NSButton* leave = button(@"Kilépés", nil, self, @selector(stopToHome));
@@ -2190,6 +2191,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
 
 - (void)tick {
   if (!_savedCode.empty() && nowMs() - _savedAt > 20000) [self rememberRoom:_savedCode host:_savedHost token:_savedToken];
+  if (_audioOut && _spatial) _audioOut->systemSpatial(); // (macOS's spatial audio gave up: our own takes over)
   if (_current == _host && _hostPipe) {
     MacHost::Info i = _hostPipe->info();
     std::string s;

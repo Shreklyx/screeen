@@ -45,9 +45,12 @@ class MacAudioOut {
   ~MacAudioOut();
   void push(int sub, const uint8_t* data, size_t n, double tsUs);
   void setVolume(float v);
-  /** Spatial sound for headphones (common/spatial.h) – with AirPods (macOS 14+) it follows the head:
-   *  the speakers stay where they are while the head turns. */
+  /** Spatial sound for headphones: macOS's own (Control Center → Sound → Spatial Audio: Fixed / Head
+   *  Tracked – AirPods, Beats), or where that cannot start, our head model (common/spatial.h; with
+   *  AirPods on macOS 14+ it follows the head). */
   void setSpatial(bool on);
+  /** The system's spatial audio plays now (if its renderer gave up: our head model from here on). */
+  bool systemSpatial();
 
  private:
   struct Impl;
