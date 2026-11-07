@@ -1088,7 +1088,7 @@ void DirectEndpoint::onMedia(Peer& p, const uint8_t* body, size_t n, double t) {
   size_t len = n - kMediaHeader;
   p.stats.packets++;
   if (stream == 1) {
-    // audio: one packet per Opus frame, played as it comes (late audio is useless)
+    // audio: one packet per sound frame, played as it comes (late audio is useless)
     if (count == 1 && ev_.media) {
       MediaMeta m;
       m.stream = 1;

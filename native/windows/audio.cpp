@@ -219,7 +219,7 @@ void AudioCapture::stop() {
 
 std::string AudioCapture::layout() const { return impl_->layoutName; }
 
-/* ------------------------------------------------ the viewer: FLAC / Opus → ring (audio_ring.cpp) → speakers */
+/* ------------------------------------------------ the viewer: FLAC → ring (audio_ring.cpp) → speakers */
 
 struct AudioPlayer::Impl {
   AudioRing ring;

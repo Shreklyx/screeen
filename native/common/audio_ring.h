@@ -1,4 +1,4 @@
-// The viewers' sound, shared by the native apps: lossless (FLAC) or Opus packets are decoded and written into a ring by
+// The viewers' sound, shared by the native apps: lossless (FLAC) packets are decoded and written into a ring by
 // their timestamps (each channel pair arrives separately) and played with a small buffer that grows
 // only when the network makes it run dry (5–100 ms) and slowly shrinks again; what it holds beyond
 // that is played past, so no delay stays – the same as the browsers' worklet (public/direct-audio.js).
@@ -12,8 +12,6 @@
 
 #include "spatial.h"
 
-struct OpusDecoder;
-
 namespace ss {
 
 class AudioRing {
@@ -23,7 +21,7 @@ class AudioRing {
   static const int kLossless = 8;
   AudioRing();
   ~AudioRing();
-  /** One Opus packet: sub = pair | channels << 4 (as sent), ts in µs – any thread. */
+  /** One sound packet (FLAC, see kLossless): sub = pair | channels << 4 (as sent), ts in µs – any thread. */
   void push(int sub, const uint8_t* data, size_t n, double tsUs);
   /** Sound already decoded (interleaved, the pair's channels) – what push does next; tests. */
   void write(int sub, const float* pcm, int frames, double tsUs);
@@ -50,7 +48,6 @@ class AudioRing {
   std::mutex mu_;
   int channels_ = 0;
   std::vector<std::vector<float>> ring_;
-  std::vector<OpusDecoder*> decoders_;
   long long read_, end_;
   int target_ = 240;
   int lastPacket_ = 120; // frames a packet brings (the least wait: a device period and one of these)

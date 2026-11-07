@@ -4,10 +4,10 @@
  * Screen Share – the website: share a screen with its sound, or watch one, with the least delay.
  *
  * No WebRTC. The picture and the sound go with our own protocol – the one the Windows and Mac
- * apps speak (native/core): H.264 and Opus from WebCodecs, encrypted end to end (X25519, AES-GCM),
+ * apps speak (native/core): H.264 from WebCodecs and lossless sound (FLAC, the apps' own C++ code as
+ * WebAssembly – ss-web.js), encrypted end to end with the browser's own WebCrypto (X25519, AES-GCM),
  * every frame passed on the moment it is ready, through the server's WebSocket (direct-web.js).
- * What a browser lacks comes from our C/C++ code as WebAssembly (ss-web.js): the X25519 key
- * exchange, an Opus decoder. Signaling: a WebSocket to this site's server (/ws).
+ * Signaling: a WebSocket to this site's server (/ws).
  * ===================================================================== */
 
 const RES_TARGETS = { native: null, 2160: [3840, 2160], 1440: [2560, 1440], 1080: [1920, 1080], 720: [1280, 720] };
@@ -29,9 +29,6 @@ const IS_MAC = !IS_IOS && /Macintosh/.test(navigator.userAgent);
 const IS_SAFARI = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(navigator.userAgent);
 // started from the home-screen icon (iOS / Android web app)
 const STANDALONE = Boolean(window.matchMedia?.('(display-mode: standalone)').matches || navigator.standalone);
-// the website inside the iOS app (ios/App/WatchView.swift); sharing is its own tab there
-const IN_IOS_APP = /ScreenShareApp\//.test(navigator.userAgent);
-const IOS_APP_URL = 'https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-iOS.ipa';
 const SITE_URL = `${location.origin}${location.pathname}`;
 
 const ERROR_TEXT = {
@@ -715,7 +712,7 @@ function updateCaptureInfo() {
   if (!host.video) {
     el.textContent = '';
   } else if (host.audio && !direct.canEncodeAudio) {
-    el.textContent = 'Ez a böngésző nem tud hangot kódolni (Opus): a nézők hang nélkül kapják a képet. Hanghoz oszd meg Chrome-ból, Edge-ből vagy az asztali alkalmazásból.';
+    el.textContent = 'Ez a böngésző nem tud hangot küldeni: a nézők hang nélkül kapják a képet. Hanghoz oszd meg friss Chrome-ból, Edge-ből vagy az asztali alkalmazásból.';
     el.className = 'hint warn';
   } else if (host.audio) {
     el.textContent = 'Hang megosztva (sztereó). A csík mutatja, hogy jön-e hang.';
@@ -924,7 +921,7 @@ async function initHostUi() {
   navigator.mediaDevices?.addEventListener?.('devicechange', populateAudioSources);
 
   if (IS_IOS) {
-    $('#iosInstall').hidden = STANDALONE || IN_IOS_APP; // already installed
+    $('#iosInstall').hidden = STANDALONE; // already on the home screen
   } else {
     $('#downloads').hidden = false;
     $(IS_MAC ? '#dlMac' : '#dlWin').classList.add('btn-primary');
@@ -944,15 +941,9 @@ async function initHostUi() {
     $('#btnShare').disabled = true;
     const note = $('#shareUnsupported');
     note.hidden = false;
-    if (IN_IOS_APP) {
-      note.textContent = 'A képernyőd megosztása: lent a „Megosztás” fülön.';
-    } else if (IS_IOS) {
-      // Apple allows no screen capture in any iOS browser – the iOS app can (ReplayKit)
-      note.replaceChildren(
-        'iPhone-on és iPaden a böngésző nem oszthat meg képernyőt (Apple-korlát). Megosztani a ',
-        Object.assign(document.createElement('a'), { href: IOS_APP_URL, textContent: 'Screen Share iOS alkalmazással' }),
-        ' lehet (telepítés: lent).',
-      );
+    if (IS_IOS) {
+      // Apple allows no screen capture in any iOS browser
+      note.textContent = 'iPhone-on és iPaden a böngésző nem oszthat meg képernyőt (Apple-korlát) – nézni tudsz, megosztani számítógépről lehet.';
     } else if (problem === 'display') {
       note.textContent = 'Ez a böngésző nem tud képernyőt megosztani. Számítógépen használj friss Chrome-ot, Edge-et, Firefoxot vagy Safarit – vagy az asztali alkalmazást.';
     } else {
@@ -977,7 +968,7 @@ const direct = {
   kbps: 0,
   hw: null, // the encoder runs on the GPU (null: not known yet)
   failed: null, // why the picture cannot be encoded at all
-  canEncodeAudio: typeof AudioEncoder === 'function',
+  canEncodeAudio: typeof AudioData === 'function' && typeof WebAssembly === 'object', // (the lossless sound: our FLAC encoder)
 };
 
 /** The TURN server (from the room's ICE servers) – the apps' last-resort relay. */
@@ -1348,12 +1339,12 @@ function adaptDirectSize(pipe) {
   pipe.skipped = 0;
 }
 
-/* ---- the sharer's sound (Opus, 2.5 ms packets – its least delay) ---- */
+/* ---- the sharer's sound (lossless: FLAC, 2.5 ms packets) ---- */
 
 /** The track's sound as AudioData at 48 kHz (what the lossless sound and every player take):
  *  MediaStreamTrackProcessor where the track is 48 kHz already, else an AudioWorklet in a 48 kHz context
- *  (Firefox, Safari – and a 44.1 kHz sound card: the browser converts it, and it stays lossless FLAC
- *  instead of falling back to Opus). onData owns (closes) each. Returns a stop function (async). */
+ *  (Firefox, Safari – and a 44.1 kHz sound card: the browser converts it). onData owns (closes) each.
+ *  Returns a stop function (async). */
 async function readAudio(track, onData, worklet = false) {
   const rate = track.getSettings?.().sampleRate;
   if (!worklet && typeof MediaStreamTrackProcessor === 'function' && (rate === 48000 || rate == null)) {
@@ -1407,9 +1398,9 @@ async function readAudio(track, onData, worklet = false) {
 function startDirectAudio(track) {
   stopDirectAudio();
   if (!track || track.readyState !== 'live') return;
-  const pipe = { track, stop: null, encoders: [], channels: 0, rate: 0, stopped: false, wasm: null, flac: null };
+  const pipe = { track, stop: null, stopped: false, wasm: null, flac: null };
   direct.audio = pipe;
-  // the lossless sound: our FLAC encoder (WebAssembly) – Opus only until it is there
+  // the lossless sound: our FLAC encoder (WebAssembly – nothing is sent until it is there, a moment)
   globalThis.ScreenShareWasm?.load().then((w) => { pipe.wasm = w; }, () => {});
   const onData = (data) => {
     try {
@@ -1440,48 +1431,18 @@ function stopDirectAudio() {
   direct.audio = null;
   pipe.stopped = true;
   pipe.stop?.();
-  for (const e of pipe.encoders) {
-    try { e.close(); } catch { /* already closed */ }
-  }
 }
 
 function encodeDirectAudio(pipe, data) {
-  const channels = Math.min(8, data.numberOfChannels);
-  if (pipe.wasm && data.sampleRate === 48000) {
-    encodeLossless(pipe, data, channels);
+  if (!pipe.wasm) return; // (our FLAC encoder is still loading)
+  if (data.sampleRate === 48000) {
+    encodeLossless(pipe, data, Math.min(8, data.numberOfChannels));
     return;
   }
-  if (pipe.wasm && !pipe.resampled && pipe.restart) {
-    // (the track said nothing of its rate and is not 48 kHz: read again through the 48 kHz worklet –
-    // lossless from there; until it runs, Opus)
+  if (!pipe.resampled && pipe.restart) {
+    // (the track said nothing of its rate and is not 48 kHz: read again through the 48 kHz worklet)
     pipe.resampled = true;
     pipe.restart();
-  }
-  const pairs = Math.ceil(channels / 2);
-  if (channels !== pipe.channels || data.sampleRate !== pipe.rate) {
-    for (const e of pipe.encoders) {
-      try { e.close(); } catch { /* already closed */ }
-    }
-    pipe.encoders = Array.from({ length: pairs }, (_, pair) => {
-      const ch = Math.min(2, channels - pair * 2);
-      const enc = new AudioEncoder({
-        output: (chunk) => sendDirectAudio(pipe, pair, channels, chunk),
-        error: (err) => console.warn('direct audio encoder', err),
-      });
-      enc.configure({ codec: 'opus', sampleRate: data.sampleRate, numberOfChannels: ch, bitrate: ch * 128000, opus: { frameDuration: 2500, application: 'lowdelay' } });
-      return enc;
-    });
-    pipe.channels = channels;
-    pipe.rate = data.sampleRate;
-  }
-  const frames = data.numberOfFrames;
-  for (let pair = 0; pair < pairs; pair++) {
-    const ch = Math.min(2, channels - pair * 2);
-    const buf = new Float32Array(frames * ch);
-    for (let c = 0; c < ch; c++) data.copyTo(buf.subarray(c * frames, (c + 1) * frames), { planeIndex: pair * 2 + c, format: 'f32-planar' });
-    const part = new AudioData({ format: 'f32-planar', sampleRate: data.sampleRate, numberOfFrames: frames, numberOfChannels: ch, timestamp: data.timestamp, data: buf });
-    if (pipe.encoders[pair].state === 'configured') pipe.encoders[pair].encode(part);
-    part.close();
   }
 }
 
@@ -1789,13 +1750,13 @@ function askAccess() {
   if (wrong) shake(input);
 }
 
-// A sharer that sends nothing our way (an old iPhone app speaks only WebRTC): say so.
+// A sharer that sends nothing our way (an old version of the app): say so.
 function watchForOffer() {
   clearTimeout(viewer.offerTimer);
   if (!viewer.live || !viewer.hostPresent || viewer.direct) return;
   viewer.offerTimer = setTimeout(() => {
     if (viewer.direct || viewer.closed || !viewer.live || !viewer.hostPresent) return;
-    setOverlay('A megosztó nem küld képet ezen a módon – ha iPhone-ról oszt meg, frissítse a Screen Share alkalmazást. Várakozás…');
+    setOverlay('A megosztó nem küld képet ezen a módon – frissítse a Screen Share alkalmazást. Várakozás…');
   }, 15000);
 }
 
@@ -2303,7 +2264,7 @@ function drawDirectFrame(d, frame) {
   }
 }
 
-/* ---- the viewer's sound: Opus from WebCodecs, or our decoder (WebAssembly) ---- */
+/* ---- the viewer's sound: lossless (FLAC – our decoder, WebAssembly) ---- */
 
 async function openDirectAudio(d, channels) {
   closeDirectAudio(d);
@@ -2321,9 +2282,9 @@ async function openDirectAudio(d, channels) {
     ctx.close().catch(() => {});
     return null;
   }
-  // our WebAssembly: the lossless sound (FLAC) – and Opus where the browser has no decoder
+  // our WebAssembly: the lossless sound (FLAC)
   const wasm = await globalThis.ScreenShareWasm?.load().catch(() => null) ?? null;
-  if (viewer.direct !== d || (canDirect.audio === 'wasm' && !wasm)) {
+  if (viewer.direct !== d || !wasm) {
     ctx.close().catch(() => {});
     return null;
   }
@@ -2334,7 +2295,7 @@ async function openDirectAudio(d, channels) {
   const node = new AudioWorkletNode(ctx, 'direct-audio', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [out], processorOptions: { channels } });
   const gain = ctx.createGain();
   node.connect(gain).connect(ctx.destination);
-  d.audio = { ctx, node, gain, channels, out, decoders: [], wasm };
+  d.audio = { ctx, node, gain, channels, out, wasm };
   sendSpatial(d.audio);
   syncDirectVolume();
   ctx.resume().catch(() => {});
@@ -2347,9 +2308,6 @@ function closeDirectAudio(d) {
   const a = d.audio;
   if (!a) return;
   d.audio = null;
-  for (const dec of a.decoders) {
-    try { dec?.close(); } catch { /* already closed */ }
-  }
   a.ctx.close().catch(() => {});
 }
 
@@ -2379,53 +2337,10 @@ function playLossless(a, pair, meta, data) {
   play(data.subarray(2, 2 + len), () => meta.ts);
 }
 
-/** A decoder for one channel pair: { decode(meta, data), close() } – planes to the player. */
-function pairDecoder(a, pair, channels) {
-  const send = (ts, planes) => a.node.port.postMessage({ pair, ts, frames: planes[0].length, planes }, planes.map((p) => p.buffer));
-  if (a.wasm) {
-    const dec = a.wasm.opusDecoder(channels);
-    return {
-      state: 'configured',
-      decode(meta, data) {
-        const pcm = dec.decode(data);
-        if (!pcm) return;
-        const frames = pcm.length / channels;
-        const planes = Array.from({ length: channels }, (_, c) => {
-          const plane = new Float32Array(frames);
-          for (let i = 0; i < frames; i++) plane[i] = pcm[i * channels + c];
-          return plane;
-        });
-        send(meta.ts, planes);
-      },
-      close() { dec.close(); this.state = 'closed'; },
-    };
-  }
-  const dec = new AudioDecoder({
-    output: (ad) => {
-      const planes = Array.from({ length: ad.numberOfChannels }, (_, c) => {
-        const plane = new Float32Array(ad.numberOfFrames);
-        ad.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
-        return plane;
-      });
-      send(ad.timestamp, planes);
-      ad.close();
-    },
-    error: (err) => console.warn('direct audio decoder', err),
-  });
-  dec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: channels });
-  return {
-    get state() { return dec.state; },
-    decode(meta, data) {
-      if (dec.state === 'configured') dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: meta.ts, data }));
-    },
-    close() { dec.close(); },
-  };
-}
-
 async function playDirectAudio(d, meta, data) {
   if (!canDirect.audio) return; // this browser has no way to play it
   const channels = Math.max(1, Math.min(8, meta.sub >> 4));
-  const lossless = (meta.sub & LOSSLESS) !== 0;
+  if (!(meta.sub & LOSSLESS)) return; // (only lossless sound is sent: an older sharer's Opus is not played)
   const pair = meta.sub & 7;
   if (pair * 2 >= channels) return;
   let a = d.audio;
@@ -2439,16 +2354,7 @@ async function playDirectAudio(d, meta, data) {
     }
     if (!a) return;
   }
-  if (lossless) {
-    playLossless(a, pair, meta, data);
-    return;
-  }
-  let dec = a.decoders[pair];
-  if (!dec || dec.state === 'closed') {
-    dec = pairDecoder(a, pair, Math.min(2, channels - pair * 2));
-    a.decoders[pair] = dec;
-  }
-  dec.decode(meta, data);
+  playLossless(a, pair, meta, data);
 }
 
 function onDirectMedia(meta, data) {
@@ -2496,7 +2402,7 @@ function directStatsTick() {
   const own = 'saját C++ kód (WebAssembly)';
   renderStatsRows([
     ['Átvitel', 'saját protokoll, végig titkosítva (WebRTC nélkül)'],
-    ['Kulcscsere', `X25519 · ${canDirect.keys === 'wasm' ? own : 'WebCrypto'}`],
+    ['Kulcscsere', 'X25519 · a böngésző saját WebCryptója'],
     ['Felbontás', res],
     ['FPS', d.drawn ? String(Math.round(fps)) : '–'],
     ['Bitráta', fmtKbps(r?.kbps ?? null)],
@@ -2506,7 +2412,7 @@ function directStatsTick() {
     ['RTT', fmtMs(d.rtt)],
     ['Kihagyott képek', String(r?.skips ?? 0), (r?.skips ?? 0) > 0],
     ['Kapcsolat', PATH_LABEL[d.path] || '–'],
-    ['Hang', !canDirect.audio ? 'ez a böngésző nem tudja lejátszani' : a ? `Opus · ${a.wasm ? own : 'WebCodecs'} · ${a.channels > 2 ? `${a.channels} csatorna → ${a.out} hangszóró` : 'sztereó'}` : 'nincs', !canDirect.audio],
+    ['Hang', !canDirect.audio ? 'ez a böngésző nem tudja lejátszani' : a ? `FLAC, veszteségmentes · ${own} · ${a.channels > 2 ? `${a.channels} csatorna → ${a.out} hangszóró` : 'sztereó'}` : 'nincs', !canDirect.audio],
   ]);
 }
 

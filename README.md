@@ -9,9 +9,9 @@ Megosztást csak a **megosztási jelszóval** lehet indítani, nézni a linkkel 
   (`mozizas.hu/#abc123.<26 betű>`): a link `#` utáni része soha nem jut el szerverhez, a két fél egymásnak igazolja,
   hogy ismeri, és belekerül a kulcsokba – így a szerver sem tud „közbeállni”. Aki csak a 6 jelű kódot írja be,
   annak is működik, de ellenőrzés nélkül. Két asztali alkalmazás között közvetlenül, UDP-n; böngészőben
-  (WebCodecs H.264 + Opus) a szerver WebSocketjén át. Ahol a böngészőből hiányzik az X25519 kulcscsere vagy az
-  Opus-dekódoló (régebbi Safari / Firefox), az alkalmazások saját C/C++ kódja (BearSSL, libopus) fut az oldalon
-  WebAssemblyként (`native/web`).
+  (WebCodecs H.264, a hang veszteségmentes FLAC) a szerver WebSocketjén át – a kulcscsere és a titkosítás ott a
+  böngésző saját WebCryptója, a hang kódolója és dekódolója az alkalmazások saját C++ kódja WebAssemblyként
+  (`native/web`).
 - **Minőség: 4K és 1080p 60 / 120 FPS** (az alkalmazásban 4K·60, 4K·120, 1440p·60/120, 1080p·60/120, 720p, eredeti).
   **A kép minősége soha nem romlik:** a bitráta fix (0,16 bit képpontonként: 1080p60 20, 1080p120 40, 4K60 80,
   4K120 120 Mbit/s; helyi hálón akár 200) – egy lassú vonal miatt sem megy lejjebb, sem a bitráta, sem a felbontás.
@@ -142,51 +142,8 @@ sudo docker compose logs -f app      # napló (caddy, turn is)
 - **Nézni** Safariban lehet. Alkalmazásként: Safari → **Megosztás** gomb (négyzet felfelé nyíllal) →
   **Főképernyőhöz adás**. Utána ikonról indul, teljes képernyőn (App Store nem kell). A kapott link Safariban nyílik
   meg; a főképernyős alkalmazásban a kódot a **Nézek** mezőbe írd. Fekvő telefonon a kép kitölti a kijelzőt.
-- **Megosztani** a böngészőből nem lehet (az Apple egyik iOS-böngészőben sem engedi), ehhez a **Screen Share iOS
-  alkalmazás** kell – lásd lent.
-
-### Screen Share iOS alkalmazás (iPhone / iPad képernyő megosztása)
-
-Az `ios/` mappában van (SwiftUI + ReplayKit közvetítés-kiegészítő + WebRTC). **Még WebRTC-vel küld, amit az oldal
-már nem fogad** – amíg nem kapja meg a saját átvitelt, az iPhone-ról megosztott képet nem lehet nézni (a *Nézés*
-füle működik). Két füle van:
-**Megosztás** (szerver, jelszó, „Képernyő megosztása”, a szobakód és a link küldése) és **Nézés** (az oldal).
-Megosztáskor a telefon képernyője (H.264 hardveres kódolás, max. 1080p 60 FPS) és **az alkalmazások hangja**
-(pl. YouTube, játék – a mikrofon nem) megy, akkor is, ha közben más alkalmazásra váltasz.
-
-**Telepítés** – az IPA-t a saját Apple ID-ddal kell aláírni, App Store nélkül:
-
-1. Töltsd le: <https://github.com/Shreklyx/screeen/releases/download/desktop-latest/ScreenShare-iOS.ipa>
-2. Telepítsd a **Sideloadly**-t (<https://sideloadly.io>, Windows / Mac; Windowson az Apple weboldaláról letöltött
-   iTunes és iCloud is kell hozzá).
-3. Csatlakoztasd a telefont USB-vel, a Sideloadly-ben add meg az Apple ID-d, húzd be az IPA-t, **Start**.
-4. iPhone: *Beállítások → Általános → VPN és eszközkezelés* → a saját Apple ID-d → **Megbízom**; iOS 16-tól még
-   *Beállítások → Adatvédelem és biztonság → Fejlesztői mód* → be (újraindítás).
-5. Ingyenes Apple ID-vel az alkalmazás 7 napig fut, utána újra kell telepíteni (a Sideloadly ezt tudja magától is);
-   fizetős Apple fejlesztői fiókkal (99 USD/év) 1 évig.
-
-**Megosztás:** nyisd meg az alkalmazást → add meg a jelszót → **Képernyő megosztása** → **Közvetítés indítása**.
-Leállítás: a piros jelzés a képernyő tetején, vagy a Vezérlőközpont. Egyes alkalmazások (pl. Netflix) a
-képernyőfelvételnél fekete képet adnak – ez az Apple / az alkalmazás korlátja.
-
-**TestFlight (számítógép nélküli telepítés, 1 évig érvényes):** fizetős Apple fejlesztői fiókkal (99 USD/év)
-a GitHub minden változásnál magától feltölti az appot a TestFlightba, az iPhone-on pedig a TestFlight alkalmazásból
-egy koppintással telepíthető és frissül. Beállítás egyszer:
-
-1. <https://developer.apple.com/programs/> – csatlakozz az Apple Developer Programhoz.
-2. A *Team ID*: developer.apple.com → Account → **Membership details**.
-3. App Store Connect → **Users and Access → Integrations → App Store Connect API** → új kulcs **Admin**
-   szereppel; töltsd le a `.p8` fájlt, és jegyezd fel a *Key ID*-t és az *Issuer ID*-t.
-4. GitHub → a repó → **Settings → Secrets and variables → Actions → New repository secret**:
-   `APPLE_TEAM_ID`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (a `.p8` fájl teljes tartalma).
-5. Futtasd az *iOS app* workflow-t (Actions → iOS app → Run workflow): ez regisztrálja az azonosítókat. Utána
-   App Store Connect → **Apps → + → New App**: iOS, a `hu.mozizas.screenshare` csomagazonosítóval (a név legyen
-   egyedi, pl. „Screen Share HU”), majd futtasd újra a workflow-t.
-6. App Store Connect → az app → **TestFlight** → add hozzá magad (és akit szeretnél) belső tesztelőnek; az iPhone-on
-   a **TestFlight** alkalmazásból telepíthető.
-
-Fordítás: a GitHub Actions (`.github/workflows/ios.yml`) macOS gépen építi minden változásnál; kézzel Macen:
-`brew install xcodegen`, `cd ios && xcodegen generate`, majd Xcode-ban megnyitható.
+- **Megosztani** a böngészőből nem lehet (az Apple egyik iOS-böngészőben sem engedi): megosztani számítógépről
+  lehet (az asztali alkalmazással vagy a böngészőből).
 
 ### Tippek, hogy ne akadjon
 
@@ -228,7 +185,7 @@ sötét menüivel): kompakt ablak, Megosztás / Nézés kapcsoló, csoportosíto
   macOS 13-tól, semmit nem kell mellé telepíteni.
 - **Nézés:** kód vagy link; a képkockákat a videókártya dekódolja (Windowson Media Foundation alacsony késleltetésű
   módban + flip-model swap chain, ami minden képet azonnal kirak; Macen VideoToolbox → IOSurface közvetlenül a
-  rétegre), a hang Opus → 5–100 ms-os, magától igazodó puffer. **F** / dupla kattintás: teljes képernyő, **S**:
+  rétegre), a hang veszteségmentes FLAC → magától igazodó, a lehető legkisebb puffer. **F** / dupla kattintás: teljes képernyő, **S**:
   statisztika, **M**: némítás. Ha a gép lemarad (elfoglalt processzor), mindig a legfrissebb kép kerül ki, nem gyűlik
   késés; ha a videókártyás dekódolás egy gépen nem ad képet, a lejátszó magától a processzorra vált.
 - **Több ablak – több szoba egyszerre** (akár hat vagy több): Windowson a **＋** gomb (a kezdőképernyőn és a nézés
@@ -266,7 +223,7 @@ lehető legrövidebb úton:
   5) csomaghoz egy paritáscsomagot is küld – a csoportból bármelyik elveszett csomagot a néző azonnal visszaállítja,
   nem kell egy oda-vissza utat várnia rá (helyi hálózaton nem kell, ott az újrakérés ~1 ms); a régebbi nézők nem
   kapnak ilyet;
-- a hang Opus, 2,5 ms-os csomagokban (az Opus legkisebb késése), 5.1/7.1 is (csatornapáronként); a néző csak 5–100 ms hangpuffert tart, amennyit a
+- a hang veszteségmentes FLAC (saját C++ kódoló és dekódoló), 2,5 ms-os csomagokban, 5.1/7.1 is (csatornapáronként); a néző csak annyi hangpuffert tart, amennyit a
   hálózat éppen kíván, és ami ezen felül felgyűlt, azt átugorja; Windowson a hangkártya 2,7–3 ms-os periódusával
   szól, ahol az eszköz tudja (Windows 10+, 48 kHz – 10 ms helyett), Macen 128 mintás (2,7 ms) pufferrel;
 - kapcsolat: a két alkalmazás a szerver UDP-portján (**3479**) megtudja a saját nyilvános címét, és közvetlenül
@@ -285,8 +242,8 @@ WebSocketben, a szerver HTTPS-portján (`wss://…/direct`) mennek, és a szerve
 Ezen az úton egy képkocka egy csomag (a TCP nem veszít el semmit, nincs újrakérés); ha a néző vonala nem bírja, a
 megosztó eldobja a képkockákat a következő kulcskockáig ahelyett, hogy sorba állítaná őket (és amint van hely, újra
 kér kulcskockát – a kép nem marad állva). A néző itt is puffer nélkül, minden képet azonnal kirajzol. Így megy alkalmazás → böngésző, böngésző →
-böngésző és böngésző → alkalmazás. A kulcscsere a böngésző WebCrypto X25519-e, ha van, különben az alkalmazások
-BearSSL-kódja WebAssemblyként; a hang a böngésző Opus-dekódolója (WebCodecs), ha van, különben a libopus
+böngésző és böngésző → alkalmazás. A kulcscsere és a titkosítás a böngésző saját WebCryptója (X25519, AES-GCM –
+Chrome / Edge 133+, Firefox 130+, Safari 17+); a hang veszteségmentes FLAC az alkalmazások saját C++ kódjával,
 WebAssemblyként (`public/ss-web.wasm`, forrás: `native/web`). A megosztó a képet és a hangot a
 `MediaStreamTrackProcessor`-ral olvassa (Chrome, Edge), ahol ez nincs (Firefox, Safari), egy videóelemből
 (`requestVideoFrameCallback`) és egy AudioWorkletből. **WebRTC sehol nincs** az oldalon; ahol a böngésző ezt sem
@@ -323,7 +280,7 @@ build/sscore_test                                                            # a
 
 Macen: `-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_CXX_FLAGS=-mcpu=apple-m1 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.3` (csak Apple Silicon).
 A `build/ss-cli` parancssoros megosztó / néző (teszteléshez: `ss-cli host --server … --password … --h264 fájl`,
-`ss-cli view --server … --code …`). A korábbi Electron alkalmazás (`desktop/`) már nem készül.
+`ss-cli view --server … --code …`).
 
 ## Fejlesztés
 
@@ -345,16 +302,16 @@ szerver 3479/udp reléjét vagy a WebSocketet használják. A `ss-web.wasm` repr
   megosztó és a nézők között, a `/direct` WebSocketen a böngészők (titkosított) csomagjait adja tovább, és az
   alkalmazásoknak 24 órás TURN jelszavakat ad (TURN REST API). Jelszó- és csatlakozási próbálkozások IP-nként korlátozva.
 - `public/` – a böngészős oldal, WebRTC nélkül: a megosztó a képernyőt `getDisplayMedia()`-val rögzíti, WebCodecs-szel
-  egyszer kódolja (H.264 + Opus), és a közvetlen mód protokolljával küldi minden nézőnek (lásd lent).
+  egyszer kódolja (H.264, a hang veszteségmentes FLAC), és a közvetlen mód protokolljával küldi minden nézőnek (lásd lent).
 - Közvetlen mód: `native/core` (a natív alkalmazások közös C++ magja: X25519 + AES-GCM titkosítás – BearSSL –,
   darabolás, NACK, kulcskocka-kérés, óra-egyeztetés, lyukasztás a NAT-on, szerveres / TURN relé, WebSocket-tartalék,
   a megosztó és a néző logikája), `server/direct-relay.js` (a szerver 3479/udp portja: címfelderítés és relé, csak a
   munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része (WebCodecs kódolás/dekódolás,
   kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet), `public/direct-web.js` (ugyanez a
-  böngészőben: WebCrypto / WebAssembly + WebSocket a szerveren át), `public/capture-audio.js` (a megosztó hangja
-  ott, ahol nincs `MediaStreamTrackProcessor`), `public/ss-web.js` + `native/web` (X25519 és Opus-dekódoló a
-  BearSSL-ből és a libopusból, WebAssemblyként), `desktop/direct.js` (ugyanez Node-ban – a korábbi Electron
-  alkalmazásé, a tesztek használják).
+  böngészőben: WebCrypto + WebSocket a szerveren át), `public/capture-audio.js` (a megosztó hangja
+  ott, ahol nincs `MediaStreamTrackProcessor`), `public/ss-web.js` + `native/web` (a FLAC kódoló / dekódoló és a
+  térhatás fejmodellje, az alkalmazások C++ kódja WebAssemblyként), `test/direct-reference.cjs` (a protokoll
+  JavaScriptben, a tesztek használják).
 - `native/windows` (Win32 + Direct3D 11: DXGI képrögzítés, NVENC – az NVIDIA Video Codec SDK API-fejléce a
   `native/third_party/nvenc` mappában, MIT licenc –, Media Foundation kódolás / dekódolás, WASAPI hang, NSIS
   telepítő), `native/mac` (AppKit, ScreenCaptureKit, VideoToolbox, Core Audio), `native/common` (a nézők hangpuffere).

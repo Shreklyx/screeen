@@ -1,4 +1,4 @@
-// Screen Share native core – direct mode's transport, the C++ form of desktop/direct.js (the same
+// Screen Share native core – direct mode's transport, the C++ form of test/direct-reference.cjs (the same
 // packets, so the native apps, the Electron app and the browsers understand each other).
 //
 // One UDP socket. Every packet is encrypted (AES-128-GCM, keys from an X25519 exchange over the
@@ -113,7 +113,7 @@ class DirectEndpoint {
   /** Viewer: ask the sharer for a keyframe (the decoder could not go on). */
   void keyframe(const std::string& id);
   void setBitrate(double bps);
-  /** Host: one encoded frame (video) or Opus packet (audio) to every connected viewer. */
+  /** Host: one encoded frame (video) or sound packet (FLAC) to every connected viewer. */
   void sendMedia(const MediaMeta& meta, const uint8_t* data, size_t n);
 
   // tests / troubleshooting: only the server's relay, only TURN, only the WebSocket

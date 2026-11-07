@@ -1,5 +1,5 @@
-// Sound on Windows. Sharer: everything the computer plays (WASAPI loopback, 5.1 / 7.1 too), as
-// Opus in 2.5 ms packets, one encoder per channel pair (what the viewers' decoders expect). Viewer:
+// Sound on Windows. Sharer: everything the computer plays (WASAPI loopback, 5.1 / 7.1 too), lossless
+// (FLAC, common/flac_sender.h) in 2.5 ms packets, a channel pair at a time. Viewer:
 // the packets are decoded and placed by their timestamps; a small buffer that grows only when the
 // network makes it run dry (5–100 ms), played through WASAPI (downmixed for fewer speakers).
 #pragma once
@@ -13,7 +13,7 @@ namespace ss {
 
 class AudioCapture {
  public:
-  /** pair, channels (all of them), Opus packet, timestamp (µs) – from the capture thread. */
+  /** pair, channels (all of them), FLAC packet, timestamp (µs) – from the capture thread. */
   using Packet = std::function<void(int pair, int channels, const uint8_t* data, size_t n, double tsUs)>;
   explicit AudioCapture(Packet packet);
   ~AudioCapture();
@@ -32,7 +32,7 @@ class AudioPlayer {
  public:
   AudioPlayer();
   ~AudioPlayer();
-  /** One Opus packet: sub = pair | channels << 4 (as sent), ts in µs – any thread. */
+  /** One sound packet (FLAC): sub = pair | channels << 4 (as sent), ts in µs – any thread. */
   void push(int sub, const uint8_t* data, size_t n, double tsUs);
   void setVolume(float volume); // 0..1
   /** Spatial sound for headphones (common/spatial.h). */

@@ -16,12 +16,12 @@ target_include_directories(ScreenShareMac PRIVATE . ../common)
 target_compile_definitions(ScreenShareMac PRIVATE SS_VERSION="${SS_VERSION}" SS_BUILD="${SS_BUILD}")
 set_source_files_properties(main_mac.mm host_mac.mm player_mac.mm ws_mac.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
 target_compile_options(ScreenShareMac PRIVATE -Wall -Wno-missing-field-initializers)
-target_link_libraries(ScreenShareMac PRIVATE sscore opus
+target_link_libraries(ScreenShareMac PRIVATE sscore
   "-framework AppKit" "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
   "-framework VideoToolbox" "-framework ScreenCaptureKit" "-framework AudioToolbox" "-framework CoreAudio"
   "-framework QuartzCore" "-framework IOSurface" "-framework Metal" "-framework Security" "-framework CoreMotion")
 
-# the icon (app.icns) when one was made beside the sources (CI: sips + iconutil from desktop/build/icon.png)
+# the icon (app.icns) when one was made beside the sources (CI: sips + iconutil from native/mac/icon.png)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/app.icns)
   target_sources(ScreenShareMac PRIVATE app.icns)
   set_source_files_properties(app.icns PROPERTIES MACOSX_PACKAGE_LOCATION Resources)

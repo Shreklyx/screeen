@@ -1,13 +1,12 @@
 'use strict';
 
-// Direct mode in the browser: the desktop app's own protocol (desktop/direct.js) instead of
+// Direct mode in the browser: the apps' own protocol (native/core/direct.cpp) instead of
 // WebRTC, so a browser can watch an app – or share to apps and browsers – the same way.
 //
 // A browser cannot send UDP, so its packets travel in a WebSocket to the server
 // (wss://…/direct), which passes them to the other side (the app's "tcp" path). The packets
-// are encrypted end to end like the app's (X25519 + HKDF → AES-128-GCM, WebCrypto – X25519 from
-// our WebAssembly, ss-web.js, where WebCrypto has none): the server pairs the two ends by session
-// and HMAC, but cannot read the picture.
+// are encrypted end to end like the app's (X25519 + HKDF → AES-128-GCM, the browser's own WebCrypto):
+// the server pairs the two ends by session and HMAC, but cannot read the picture.
 // Over the WebSocket a frame goes as one packet (TCP loses nothing, so no NACK); a frame that
 // cannot be sent in time is dropped instead of waiting in a queue, and the viewer asks for a
 // keyframe. The viewer confirms each frame (ACK): a queue anywhere on the way – the server, its
@@ -39,9 +38,9 @@
   const randomBytes = (n) => crypto.getRandomValues(new Uint8Array(n));
   const hex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 
-  /* ------------------------------------------------ the key exchange: WebCrypto, or our WebAssembly */
+  /* ------------------------------------------------ the key exchange: the browser's own (WebCrypto) */
 
-  // generate() → { pub, shared(theirPub) → Promise<32 bytes>, wipe?() }
+  // generate() → { pub, shared(theirPub) → Promise<32 bytes> }
   const webCryptoKeys = {
     async generate() {
       const kp = await subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
@@ -54,21 +53,7 @@
       };
     },
   };
-  const wasmKeys = (wasm) => ({
-    async generate() {
-      const secret = randomBytes(32);
-      return {
-        pub: wasm.x25519(secret),
-        async shared(theirs) {
-          return wasm.x25519(secret, theirs);
-        },
-        wipe() {
-          secret.fill(0);
-        },
-      };
-    },
-  });
-  // our WebAssembly (ss-web.js), loaded when needed; null when it cannot be
+  // our WebAssembly (ss-web.js – the lossless sound), loaded when needed; null when it cannot be
   let wasm;
   const loadWasm = async () => {
     if (wasm === undefined) wasm = await (globalThis.ScreenShareWasm?.load() ?? Promise.reject(new Error('no ss-web.js'))).catch(() => null);
@@ -76,22 +61,17 @@
   };
 
   let keys = null;
-  /** The key exchange: WebCrypto's X25519 where the browser has it, else ours. */
+  /** The key exchange: WebCrypto's X25519 (Chrome / Edge 133+, Firefox 130+, Safari 17+). */
   async function keyExchange() {
     if (keys) return keys;
-    try {
-      await subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
-      keys = webCryptoKeys;
-    } catch {
-      if (!(await loadWasm())) throw new Error('no key exchange');
-      keys = wasmKeys(wasm);
-    }
+    await subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
+    keys = webCryptoKeys;
     return keys;
   }
 
   let support = null;
-  /** What this browser can do: { ok } – a WebSocket, WebCrypto and an H.264 decoder, at least; keys:
-   *  'webcrypto' | 'wasm' (X25519); audio: 'webcodecs' | 'wasm' (an Opus decoder) | null. */
+  /** What this browser can do: { ok } – a WebSocket, WebCrypto (X25519 too) and an H.264 decoder, at
+   *  least; audio: 'wasm' (the lossless sound: our FLAC decoder and an AudioWorklet) | null. */
   function supported() {
     support ||= (async () => {
       const no = { ok: false };
@@ -106,14 +86,8 @@
       } catch {
         return no;
       }
-      let audio = null;
-      try {
-        if (typeof AudioDecoder === 'function' && (await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 })).supported === true) audio = 'webcodecs';
-      } catch {
-        // our decoder then
-      }
-      if (!audio && typeof AudioWorkletNode === 'function' && (await loadWasm())) audio = 'wasm';
-      return { ok: true, keys: keys === webCryptoKeys ? 'webcrypto' : 'wasm', audio };
+      const audio = typeof AudioWorkletNode === 'function' && (await loadWasm()) ? 'wasm' : null;
+      return { ok: true, keys: 'webcrypto', audio };
     })();
     return support;
   }
@@ -297,7 +271,6 @@
       if (!peer) return;
       if (peer.path) peer.send(T.BYE, new Uint8Array(1));
       clearTimeout(peer.failTimer);
-      peer.kx?.wipe?.(); // (our key pair: the private half does not stay in memory)
       this.peers.delete(id);
       const ws = peer.ws;
       peer.ws = null;
@@ -493,7 +466,7 @@
 
     /* ---- sending (host) */
 
-    /** One encoded frame or Opus packet to every connected viewer – whole, at once. */
+    /** One encoded frame or sound packet (FLAC) to every connected viewer – whole, at once. */
     sendMedia(meta, data) {
       if (this.role !== 'host') return;
       const video = meta.stream === 0;

@@ -1,4 +1,4 @@
-// Screen Share native core – the cryptography of direct mode (same as desktop/direct.js and
+// Screen Share native core – the cryptography of direct mode (same as test/direct-reference.cjs and
 // public/direct-web.js): X25519 key agreement, HKDF-SHA256, AES-128-GCM, HMAC-SHA256; for the
 // TURN client MD5, HMAC-SHA1 and CRC-32. BearSSL underneath (third_party/bearssl, MIT).
 #pragma once

@@ -141,10 +141,10 @@ test('relay only forwards the expected message types – no WebRTC ones', async 
   v.close();
 });
 
-test('rejects WebSocket connections from other sites, accepts the desktop app', async () => {
+test('rejects WebSocket connections from other sites, accepts the apps (they send no Origin)', async () => {
   await assert.rejects(client({ Origin: 'https://evil.example' }));
-  await assert.rejects(client({ Origin: 'app://screenshare.evil' }));
-  const app = await client({ Origin: 'app://screenshare' });
+  await assert.rejects(client({ Origin: 'app://screenshare' })); // (the old Electron app's – gone)
+  const app = await client();
   app.close();
 });
 

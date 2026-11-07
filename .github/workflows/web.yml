@@ -6,7 +6,7 @@ name: Server and website
 on:
   push:
     branches: [claude/elegant-gauss-mi4rl5, main]
-    paths: ['server/**', 'public/**', 'desktop/direct.js', 'test/**', 'native/web/**', 'native/third_party/bearssl/**', 'package.json', 'package-lock.json', '.github/workflows/web.yml']
+    paths: ['server/**', 'public/**', 'test/**', 'native/web/**', 'native/third_party/bearssl/**', 'package.json', 'package-lock.json', '.github/workflows/web.yml']
   workflow_dispatch:
 
 jobs:

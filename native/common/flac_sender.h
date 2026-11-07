@@ -1,4 +1,4 @@
-// The sharer's lossless sound (FLAC, see lossless.h), a channel pair at a time as Opus went: each pair's
+// The sharer's lossless sound (FLAC, see lossless.h), a channel pair at a time: each pair's
 // frame with the pair's frame before it again – a lost packet's sound comes in the next one – while both
 // fit in one packet of the direct transport. What goes out: [this frame's length (2 bytes)][this frame]
 // [the one before]; its pair is marked lossless (AudioRing::kLossless).

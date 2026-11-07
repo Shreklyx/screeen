@@ -53,7 +53,7 @@ struct EngineCallbacks {
   std::function<void()> keyframe;           // the encoder's next frame must be a keyframe
   std::function<void(double bps)> bitrate;  // new encoder bitrate
   // viewer
-  std::function<void(const MediaMeta& meta, const uint8_t* data, size_t n)> media; // H.264 Annex B / Opus
+  std::function<void(const MediaMeta& meta, const uint8_t* data, size_t n)> media; // H.264 Annex B / FLAC
 };
 
 class Engine {
@@ -81,7 +81,7 @@ class Engine {
   void setTargetKbps(double kbps);
   /** Sharer: an encoded H.264 frame (Annex B) – any thread. */
   void sendVideo(const uint8_t* data, size_t n, bool key, double captureMs, double tsUs);
-  /** Sharer: one Opus packet of channel pair `pair` (of `channels`) – any thread. */
+  /** Sharer: one sound packet (FLAC) of channel pair `pair` (of `channels`) – any thread. */
   void sendAudio(int pair, int channels, const uint8_t* data, size_t n, double tsUs);
   /** Sharer: what the encoder measured, for the viewers' statistics – and the picture's size and frame
    *  rate, which set its bitrate (0: 60 FPS). */

@@ -35,7 +35,6 @@ const STATIC_FILES = {
   '/icon-maskable-512.png': ['icon-maskable-512.png', 'image/png'],
 };
 
-const APP_ORIGIN = 'app://screenshare'; // the desktop app (desktop/main.js)
 const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 const CODE_RE = /^[a-z0-9]{4,12}$/;
 // what the two ends may tell each other (no WebRTC offers / answers / ICE candidates any more)
@@ -385,7 +384,7 @@ export function createApp(config = loadConfig()) {
     verifyClient: ({ origin, req }) => {
       // Browsers always send Origin: only accept pages served from this host – and the desktop
       // app's built-in pages (a scheme no website can have).
-      if (!origin || origin === APP_ORIGIN) return true;
+      if (!origin) return true; // (the apps send none)
       try {
         return new URL(origin).host === req.headers.host;
       } catch {

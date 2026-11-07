@@ -1,6 +1,6 @@
 // The sharer's pipeline on macOS: ScreenCaptureKit hands over each new image of the display (scaled
 // and converted to YUV on the GPU), VideoToolbox encodes that surface on the media engine (low-latency
-// rate control, no B-frames, keyframes on request); the system sound (macOS 13+) as Opus beside.
+// rate control, no B-frames, keyframes on request); the system sound (macOS 13+) beside, lossless (FLAC).
 #pragma once
 
 #include <cstdint>

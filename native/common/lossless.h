@@ -1,5 +1,5 @@
 // Lossless sound: FLAC – our own encoder and decoder (no library). The sharer's sound bit for bit (24-bit),
-// not Opus's approximation. Each packet is one standard FLAC frame (RFC 9639): a few milliseconds of one
+// not a lossy codec's approximation. Each packet is one standard FLAC frame (RFC 9639): a few milliseconds of one
 // or two channels at 48 kHz, 24-bit; per channel the shortest of FLAC's fixed predictors (order 0–4), its
 // residual Rice-coded in partitions; stereo as mid/side, left/side or right/side when that is shorter;
 // silence a constant. Frames stand alone (a lost one takes nothing else with it) and any FLAC decoder

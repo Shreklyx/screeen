@@ -1,4 +1,4 @@
-// Direct mode transport (desktop/direct.js) against the server's UDP relay (server/direct-relay.js).
+// Direct mode transport (test/direct-reference.cjs – the protocol in JavaScript, as the apps' C++ has it) against the server's UDP relay (server/direct-relay.js).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { createRelay } from '../server/direct-relay.js';
 
 const require = createRequire(import.meta.url);
-const { DirectEndpoint, MAX_DATA, _test: t } = require('../desktop/direct.js');
+const { DirectEndpoint, MAX_DATA, _test: t } = require('./direct-reference.cjs');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (cond, ms = 5000) => {
@@ -129,9 +129,9 @@ test('direct path: frames arrive whole and in order', async () => {
     // audio goes as it is
     const audio = [];
     viewer.on('media', (meta, data) => { if (meta.stream === 1) audio.push([meta.sub, data.toString()]); });
-    host.sendMedia({ stream: 1, sub: 2, ts: 5, capture: 1 }, Buffer.from('opus'));
+    host.sendMedia({ stream: 1, sub: 2, ts: 5, capture: 1 }, Buffer.from('flac'));
     await until(() => audio.length === 1);
-    assert.deepEqual(audio[0], [2, 'opus']);
+    assert.deepEqual(audio[0], [2, 'flac']);
   } finally {
     close();
   }
@@ -417,7 +417,7 @@ test('browser transport: an app shares to a browser over the server WebSocket (w
       p.native.sendMedia({ stream: 0, key: n === 0, ts: n, capture: n }, frame(n, 6 * MAX_DATA + n));
       await sleep(5);
     }
-    p.native.sendMedia({ stream: 1, sub: 0x21, ts: 1, capture: 1 }, Buffer.from('opus'));
+    p.native.sendMedia({ stream: 1, sub: 0x21, ts: 1, capture: 1 }, Buffer.from('flac'));
     await until(() => p.media.filter((m) => m.meta.stream === 0).length === 15 && p.media.some((m) => m.meta.stream === 1));
     const video = p.media.filter((m) => m.meta.stream === 0);
     assert.deepEqual(video.map((m) => m.data.readUInt32BE(0)), [...Array(15).keys()]);
@@ -465,40 +465,6 @@ test('browser transport: a browser shares to an app', async () => {
     await until(() => p.events.some(([n]) => n === 'keyframe'), 3000);
   } finally {
     await p.close();
-  }
-});
-
-test('browser transport: without WebCrypto X25519 the key exchange is our WebAssembly – the app still connects', async () => {
-  const fs = await import('node:fs');
-  const vm = await import('node:vm');
-  vm.runInThisContext(fs.readFileSync(new URL('../public/ss-web.js', import.meta.url), 'utf8'));
-  const instance = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(new URL('../public/ss-web.wasm', import.meta.url))), {});
-  const ours = globalThis.ScreenShareWasm.wrap(instance.exports);
-  let used = 0;
-  const load = globalThis.ScreenShareWasm.load;
-  globalThis.ScreenShareWasm.load = async () => {
-    used++;
-    return ours;
-  };
-  const subtle = globalThis.crypto.subtle;
-  const generateKey = subtle.generateKey;
-  subtle.generateKey = function (alg, ...rest) {
-    if (alg?.name === 'X25519') return Promise.reject(new DOMException('not supported', 'NotSupportedError')); // an older browser
-    return generateKey.call(this, alg, ...rest);
-  };
-  try {
-    const p = await webPair('viewer');
-    try {
-      assert.ok(used > 0, 'the WebAssembly was used');
-      p.native.sendMedia({ stream: 0, key: true, ts: 1, capture: 1 }, frame(1, 5000));
-      await until(() => p.media.some((m) => m.meta.stream === 0));
-      assert.ok(p.media[0].data.equals(frame(1, 5000)));
-    } finally {
-      await p.close();
-    }
-  } finally {
-    subtle.generateKey = generateKey;
-    globalThis.ScreenShareWasm.load = load;
   }
 });
 

@@ -1116,7 +1116,7 @@ void drawAboutWindow(float W, float H) {
   y += 24;
   button(B_SITE, {std::floor(W / 2 - 70), y, 140, 28}, L"mozizas.hu", Style::Ghost, true, Icon::Link);
   y += 40;
-  const wchar_t* credits = L"BearSSL (MIT) · Opus (BSD) · NVIDIA Video Codec SDK (MIT)";
+  const wchar_t* credits = L"BearSSL (MIT) · NVIDIA Video Codec SDK (MIT)";
   c.measure(credits, 10.5f, Regular, W - 40, &th);
   c.text(credits, {20, y, W - 40, th + 4}, 10.5f, Regular, cFaint, Center, false, true);
 }

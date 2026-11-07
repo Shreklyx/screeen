@@ -1,7 +1,5 @@
 #include "audio_ring.h"
 
-#include <opus.h>
-
 #include "lossless.h"
 
 #include <algorithm>
@@ -23,13 +21,9 @@ float soft(float x) { return x > 0.9f ? 0.9f + 0.1f * std::tanh((x - 0.9f) / 0.1
 
 AudioRing::AudioRing() : read_(LLONG_MIN), end_(LLONG_MIN) {}
 
-AudioRing::~AudioRing() {
-  for (OpusDecoder* d : decoders_) if (d) opus_decoder_destroy(d);
-}
+AudioRing::~AudioRing() = default;
 
 void AudioRing::configure(int ch) {
-  for (OpusDecoder* d : decoders_) if (d) opus_decoder_destroy(d);
-  decoders_.assign(size_t((ch + 1) / 2), nullptr);
   channels_ = ch;
   ring_.assign(size_t(ch), std::vector<float>(kRing, 0.0f));
   read_ = end_ = LLONG_MIN;
@@ -54,38 +48,25 @@ void AudioRing::restart(long long at) {
 void AudioRing::push(int sub, const uint8_t* data, size_t n, double tsUs) {
   int ch = std::max(1, std::min(8, sub >> 4));
   int pair = sub & 15;
-  bool flac = (pair & kLossless) != 0;
+  if (!(pair & kLossless)) return; // (only lossless sound is sent: an older sharer's Opus is not played)
   pair &= 7;
   if (pair * 2 >= ch) return;
   std::lock_guard<std::mutex> l(mu_);
   if (ch != channels_) configure(ch);
   int pc = std::min(2, ch - pair * 2);
-  if (flac) {
-    // lossless (FLAC): [this frame's length][this frame][the one before it, again] – a lost packet's sound
-    // comes with the next one (its time is one frame earlier; the older one first, as it was played)
-    if (n < 2) return;
-    size_t len = size_t(data[0] | data[1] << 8);
-    if (len > n - 2) return;
-    float pcm[lossless::kMaxFrames * 2];
-    int got = 0;
-    if (n - 2 - len > 0) {
-      int frames = lossless::decode(data + 2 + len, n - 2 - len, pcm, lossless::kMaxFrames, &got);
-      if (frames > 0 && got == pc) place(pair, pc, pcm, frames, tsUs - frames * 1e6 / kRate);
-    }
-    int frames = lossless::decode(data + 2, len, pcm, lossless::kMaxFrames, &got);
-    if (frames > 0 && got == pc) place(pair, pc, pcm, frames, tsUs);
-    return;
+  // lossless (FLAC): [this frame's length][this frame][the one before it, again] – a lost packet's sound
+  // comes with the next one (its time is one frame earlier; the older one first, as it was played)
+  if (n < 2) return;
+  size_t len = size_t(data[0] | data[1] << 8);
+  if (len > n - 2) return;
+  float pcm[lossless::kMaxFrames * 2];
+  int got = 0;
+  if (n - 2 - len > 0) {
+    int frames = lossless::decode(data + 2 + len, n - 2 - len, pcm, lossless::kMaxFrames, &got);
+    if (frames > 0 && got == pc) place(pair, pc, pcm, frames, tsUs - frames * 1e6 / kRate);
   }
-  OpusDecoder*& dec = decoders_[size_t(pair)];
-  if (!dec) {
-    int err = 0;
-    dec = opus_decoder_create(kRate, pc, &err);
-    if (!dec) return;
-  }
-  static thread_local std::vector<float> pcm(5760 * 2);
-  int frames = opus_decode_float(dec, data, opus_int32(n), pcm.data(), 5760, 0);
-  if (frames <= 0) return;
-  place(pair, pc, pcm.data(), frames, tsUs);
+  int frames = lossless::decode(data + 2, len, pcm, lossless::kMaxFrames, &got);
+  if (frames > 0 && got == pc) place(pair, pc, pcm, frames, tsUs);
 }
 
 void AudioRing::write(int sub, const float* pcm, int frames, double tsUs) {
