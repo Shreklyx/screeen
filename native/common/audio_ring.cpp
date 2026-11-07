@@ -170,6 +170,14 @@ void AudioRing::pull(float* out, int outs, int n) {
   }
   float v = volume_;
   int ch = channels_;
+  // spatial: every channel to the renderer, its two ears to the device's first two channels
+  bool spatial = spatialOn_ && outs >= 2;
+  if (spatial) {
+    spatialIn_.resize(size_t(n) * size_t(ch));
+    spatialOut_.resize(size_t(n) * 2);
+    if (spatial_.channels() != ch) spatial_.configure(ch);
+    spatial_.setYaw(yaw_);
+  }
   for (int i = 0; i < n; i++) {
     size_t idx = wrap(read_ + skip + i), from = wrap(read_ + i);
     // (from where it was to where it goes, without a click)
@@ -180,6 +188,10 @@ void AudioRing::pull(float* out, int outs, int n) {
       return w < 1 ? r[from] * (1 - w) + r[idx] * w : r[idx];
     };
     float* o = out + size_t(i) * size_t(outs);
+    if (spatial) {
+      for (int c = 0; c < ch; c++) spatialIn_[size_t(i) * size_t(ch) + size_t(c)] = s(c);
+      continue;
+    }
     if (ch == 1) {
       for (int k = 0; k < std::min(outs, 2); k++) o[k] = s(0);
     } else if (ch <= 2 || outs >= ch) {
@@ -197,6 +209,13 @@ void AudioRing::pull(float* out, int outs, int n) {
       if (outs > 1) o[1] = soft(s(1) + K * s(2) + K * s(5) + K * s(7));
     }
     for (int k = 0; k < outs; k++) o[k] *= v;
+  }
+  if (spatial) {
+    spatial_.process(spatialIn_.data(), n, spatialOut_.data());
+    for (int i = 0; i < n; i++) {
+      out[size_t(i) * size_t(outs)] = spatialOut_[size_t(i) * 2] * v;
+      out[size_t(i) * size_t(outs) + 1] = spatialOut_[size_t(i) * 2 + 1] * v;
+    }
   }
   // never play a sample twice (nor one played past)
   for (long long a = read_; a < read_ + skip + n; a++) {

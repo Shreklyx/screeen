@@ -84,8 +84,9 @@
   async function instantiate(url) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`ss-web.wasm: HTTP ${res.status}`);
-    const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
-    return wrap(instance.exports);
+    const module = await WebAssembly.compile(await res.arrayBuffer());
+    const instance = await WebAssembly.instantiate(module, {});
+    return Object.assign(wrap(instance.exports), { module }); // (the module: the sound's worklet makes its own)
   }
 
   globalThis.ScreenShareWasm = {

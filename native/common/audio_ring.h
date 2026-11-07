@@ -10,6 +10,8 @@
 #include <mutex>
 #include <vector>
 
+#include "spatial.h"
+
 struct OpusDecoder;
 
 namespace ss {
@@ -28,6 +30,12 @@ class AudioRing {
   /** Fills out (outs channels, n frames, interleaved float at 48 kHz) – the device's thread. */
   void pull(float* out, int outs, int n);
   void setVolume(float v);
+  /** Spatial sound for headphones (spatial.h): the channels as speakers around the listener, to the
+   *  device's first two channels. */
+  void setSpatial(bool on) { spatialOn_ = on; }
+  bool spatial() const { return spatialOn_; }
+  /** Where the head looks (head tracking; radians, right positive): the speakers stay put. */
+  void setYaw(float radians) { yaw_ = radians; }
   void reset();
 
  private:
@@ -48,6 +56,10 @@ class AudioRing {
   int behind_ = 0;       // packets far too late in a row
   long long low_ = 0, lowFor_ = 0; // the lowest the buffer got in this window
   std::atomic<float> volume_{1.0f};
+  std::atomic<bool> spatialOn_{false};
+  std::atomic<float> yaw_{0.0f};
+  spatial::Renderer spatial_;
+  std::vector<float> spatialIn_, spatialOut_;
 };
 
 }  // namespace ss

@@ -12,6 +12,7 @@ function load() {
     Math,
     Float32Array,
     Array,
+    WebAssembly,
   };
   vm.runInNewContext(fs.readFileSync(new URL('../public/direct-audio.js', import.meta.url), 'utf8'), context);
   return registered['direct-audio'];
@@ -159,4 +160,27 @@ test('playing past is crossfaded: no sample jumps', () => {
   let worst = 0;
   for (let i = 1; i < got.length; i++) if (got[i - 1] !== 0 && got[i] !== 0) worst = Math.max(worst, Math.abs(got[i] - got[i - 1]));
   assert.ok(worst < 0.05, `largest step ${worst.toFixed(3)}`);
+});
+
+test('spatial sound (our C++ head model from ss-web.wasm): the left channel is heard by both ears, the left one louder', () => {
+  const p = new Processor({ processorOptions: { channels: 2 } });
+  p.port.onmessage({ data: { wasm: new WebAssembly.Module(fs.readFileSync(new URL('../public/ss-web.wasm', import.meta.url))), spatial: true } });
+  let left = 0;
+  let right = 0;
+  for (let k = 0; k < 40; k++) {
+    const planes = [new Float32Array(240), new Float32Array(240)];
+    for (let i = 0; i < 240; i++) planes[0][i] = 0.4 * Math.sin(((k * 240 + i) * 2 * Math.PI * 3000) / 48000);
+    p.write({ pair: 0, ts: k * 5000, frames: 240, planes });
+  }
+  for (let q = 0; q < 40; q++) {
+    const out = quantum(2);
+    p.process([], out);
+    for (let i = 0; i < 128; i++) {
+      left += out[0][0][i] ** 2;
+      right += out[0][1][i] ** 2;
+    }
+  }
+  assert.ok(left > 0 && right > 0 && left > right * 2, `left ${left}, right ${right}`);
+  // off again: the plain sound (nothing in the right ear)
+  p.port.onmessage({ data: { spatial: false } });
 });

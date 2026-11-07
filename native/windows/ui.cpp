@@ -434,6 +434,11 @@ void Canvas::icon(Icon i, float cx, float cy, float size, const Color& c, float 
       poly({{3.5f, 11}, {20.5f, 4}, {14, 20.5f}, {11, 13}}, false, true);
       L(11, 13, 20.5f, 4);
       break;
+    case Icon::Headphones: // a band over the head, two ear cups
+      poly({{4.5f, 15}, {4.6f, 11.3f}, {5.6f, 8.4f}, {7.6f, 6.1f}, {9.6f, 5}, {12, 4.5f}, {14.4f, 5}, {16.4f, 6.1f}, {18.4f, 8.4f}, {19.4f, 11.3f}, {19.5f, 15}}, false, false);
+      poly({{3.5f, 13.5f}, {7.5f, 13.5f}, {7.5f, 20}, {3.5f, 20}}, true, true);
+      poly({{16.5f, 13.5f}, {20.5f, 13.5f}, {20.5f, 20}, {16.5f, 20}}, true, true);
+      break;
   }
 }
 

@@ -4,7 +4,7 @@ set(SS_BUILD "0" CACHE STRING "build number (CI run), shown in the About window"
 string(REPLACE "." "," SS_VERSION_NUMBERS "${SS_VERSION},0")
 
 add_executable(ScreenShare WIN32
-  main.cpp ui.cpp host.cpp capture.cpp nvenc.cpp mfenc.cpp player.cpp audio.cpp update.cpp ws_winhttp.cpp tls_schannel.cpp ../common/audio_ring.cpp ../common/lossless.cpp app.rc)
+  main.cpp ui.cpp host.cpp capture.cpp nvenc.cpp mfenc.cpp player.cpp audio.cpp update.cpp ws_winhttp.cpp tls_schannel.cpp ../common/audio_ring.cpp ../common/lossless.cpp ../common/spatial.cpp app.rc)
 target_include_directories(ScreenShare PRIVATE . ../common ../third_party/nvenc)
 target_compile_definitions(ScreenShare PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00 SS_VERSION="${SS_VERSION}" SS_BUILD="${SS_BUILD}")
 configure_file(version.h.in ${CMAKE_CURRENT_BINARY_DIR}/version.h)

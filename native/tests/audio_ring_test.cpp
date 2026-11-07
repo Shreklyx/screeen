@@ -193,9 +193,33 @@ void losslessWithLostPackets() {
   CHECK(sound > 70000 && runs <= 1, "lossless with every fifth packet lost: %zu gaps of silence", runs);
 }
 
+void spatialEars() {
+  // spatial on: sound only in the left channel is heard by both ears – the left one louder (the right
+  // one hears it around the head)
+  AudioRing r;
+  r.setSpatial(true);
+  std::vector<float> got;
+  for (double ms = 0; ms < 200; ms += 5) {
+    std::vector<float> pcm(240 * 2, 0.0f);
+    for (int i = 0; i < 240; i++) pcm[size_t(i) * 2] = float(0.4 * std::sin((ms * 48 + i) * 2 * kPi * 3000 / 48000));
+    r.write(kStereo, pcm.data(), 240, ms * 1000);
+  }
+  std::vector<float> out(480 * 2);
+  double left = 0, right = 0;
+  for (int k = 0; k < 10; k++) {
+    r.pull(out.data(), 2, 480);
+    for (int i = 0; i < 480; i++) {
+      left += out[size_t(i) * 2] * out[size_t(i) * 2];
+      right += out[size_t(i) * 2 + 1] * out[size_t(i) * 2 + 1];
+    }
+  }
+  CHECK(left > 0 && right > 0 && left > right * 2, "spatial: left %.3f, right %.3f", left, right);
+}
+
 }  // namespace
 
 int main() {
+  spatialEars();
   losslessWithLostPackets();
   pauseKeepsTheWait();
   timeGoingBack();

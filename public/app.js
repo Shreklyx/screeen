@@ -1512,6 +1512,7 @@ const viewer = {
   statsTimer: null,
   volume: Math.min(1, Math.max(0, Number(store.get('ss-volume', 1)) || 0)),
   muted: false,
+  spatial: store.get('ss-spatial', false) === true, // spatial sound for headphones
   wakeLock: null,
   idleTimer: null,
   hostStats: null, // the sender's encoder info (hardware, encode time)
@@ -1751,6 +1752,20 @@ function senderEncoderText(st) {
 
 /* ---- sound level, full screen, statistics ---- */
 
+/** Spatial sound for headphones (our C++ head model, native/common/spatial.cpp): on or off, kept. */
+function toggleSpatial() {
+  viewer.spatial = !viewer.spatial;
+  store.set('ss-spatial', viewer.spatial);
+  viewer.direct?.audio?.node.port.postMessage({ spatial: viewer.spatial });
+  syncSpatialUi();
+}
+
+function syncSpatialUi() {
+  const b = $('#btnSpatial');
+  b.classList.toggle('active', viewer.spatial);
+  b.setAttribute('aria-pressed', String(viewer.spatial));
+}
+
 function syncMuteUi() {
   $('#btnMute').classList.toggle('muted', viewer.muted || viewer.volume === 0);
   $('#volume').value = String(viewer.muted ? 0 : viewer.volume);
@@ -1816,6 +1831,8 @@ function initViewerUi() {
   });
 
   $('#btnMute').addEventListener('click', toggleMute);
+  $('#btnSpatial').addEventListener('click', toggleSpatial);
+  syncSpatialUi();
   $('#btnFullscreen').addEventListener('click', toggleFullscreen);
   $('#btnStats').addEventListener('click', toggleStats);
   $('#btnChat').addEventListener('click', () => toggleChat());
@@ -1837,6 +1854,7 @@ function initViewerUi() {
     const k = e.key.toLowerCase();
     if (k === 'f') toggleFullscreen();
     else if (k === 'm') toggleMute();
+    else if (k === 'h') toggleSpatial();
     else if (k === 's') toggleStats();
     else if (k === 'c') toggleChat();
     else if (k === 'escape' && $('#watch').classList.contains('pseudo-full')) $('#watch').classList.remove('pseudo-full');
@@ -2066,6 +2084,8 @@ async function openDirectAudio(d, channels) {
   const node = new AudioWorkletNode(ctx, 'direct-audio', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [out], processorOptions: { channels } });
   const gain = ctx.createGain();
   node.connect(gain).connect(ctx.destination);
+  // spatial sound for headphones: the player makes its own head model from our WebAssembly
+  if (wasm?.module) node.port.postMessage({ wasm: wasm.module, spatial: viewer.spatial });
   d.audio = { ctx, node, gain, channels, out, decoders: [], wasm };
   syncDirectVolume();
   ctx.resume().catch(() => {});

@@ -105,7 +105,7 @@ enum Id {
   ID_NONE = 0,
   ID_PASSWORD = 100, ID_CODE, ID_CHAT, ID_NAME, ID_ACCESS, ID_JOIN_ACCESS,
   B_SHARE = 200, B_JOIN, B_REMEMBER, B_AUDIO, B_UPDATE, B_ABOUT, B_COPY, B_PAUSE, B_STOP, B_FULL, B_LEAVE, B_VOLUME, B_MUTE,
-  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL, B_TAB0, B_TAB1, B_MONITOR, B_QUALITY, B_NEW, B_CHAT, B_CHAT_SEND, B_CHAT_CLOSE, B_PERMANENT,
+  B_CHECK, B_SITE, B_MODAL_OK, B_MODAL_CANCEL, B_TAB0, B_TAB1, B_MONITOR, B_QUALITY, B_NEW, B_CHAT, B_CHAT_SEND, B_CHAT_CLOSE, B_PERMANENT, B_SPATIAL,
 };
 const UINT kMenuMonitor0 = 1000, kMenuQuality0 = 2000; // the pop-up menus' items
 
@@ -178,6 +178,7 @@ struct App {
   int monitor = 0, quality = 0;
   bool remember = false, audio = true;
   bool permanent = false; // a permanent room: always the same code (the server keeps it, also after it starts again)
+  bool spatial = false;   // spatial sound for headphones (common/spatial.h)
 
   std::unique_ptr<Engine> engine;
   std::unique_ptr<HostPipeline> host;
@@ -973,7 +974,7 @@ const float kBarH = 52;
 
 /** The viewer's bar: where its parts are (the drawing and the volume drag use the same numbers). */
 struct BarLayout {
-  Rect leave, full, volume, mute, more, chat;
+  Rect leave, full, volume, mute, spatial, more, chat;
   float textRight;
 };
 
@@ -987,6 +988,8 @@ BarLayout barLayout(float W) {
   b.volume = {right - 96, kBarH / 2 - 2, 96, 4};
   right -= 96 + 6;
   b.mute = {right - 34, 11, 34, 30};
+  right -= 34 + 8;
+  b.spatial = {right - 34, 11, 34, 30};
   right -= 34 + 8;
   b.more = {right - 34, 11, 34, 30};
   right -= 34 + 8;
@@ -1029,6 +1032,8 @@ float drawViewing(float W, float H) {
     c.fillCircle(b.volume.x + b.volume.w * vol, b.volume.cy(), 6 + 1.2f * vh, cWhite);
     button(B_MUTE, b.mute, L"", Style::Ghost, true, g.muted ? Icon::Mute : Icon::Volume);
     tip(B_MUTE, g.muted ? L"Hang vissza (M)" : L"Némítás (M)");
+    button(B_SPATIAL, b.spatial, L"", g.spatial ? Style::Secondary : Style::Ghost, true, Icon::Headphones);
+    tip(B_SPATIAL, g.spatial ? L"Térhatású hang kikapcsolása (H)" : L"Térhatású hang fejhallgatóhoz (H)");
     std::wstring head = L"Szoba: " + g.roomCode;
     c.text(head, {38, 0, 220, barH}, 13, Semibold, cText);
     float hw = c.measure(head, 13, Semibold);
@@ -1734,6 +1739,7 @@ void startWatching(const std::string& code) {
   g.player.reset(new VideoPlayer(g.video));
   g.audioOut.reset(new AudioPlayer());
   g.audioOut->setVolume(g.muted ? 0.0f : g.volume);
+  g.audioOut->setSpatial(g.spatial);
   EngineCallbacks cb = callbacks(session);
   VideoPlayer* player = g.player.get();
   AudioPlayer* audio = g.audioOut.get();
@@ -1996,6 +2002,14 @@ void setMuted(bool muted) {
   animate();
 }
 
+/** Spatial sound for headphones: the shared sound's channels as speakers around the head (kept). */
+void setSpatial(bool on) {
+  g.spatial = on;
+  saveDword(L"Spatial", on);
+  if (g.audioOut) g.audioOut->setSpatial(on);
+  animate();
+}
+
 void setVolumeAt(float x) {
   RECT rc;
   GetClientRect(g.wnd, &rc);
@@ -2246,6 +2260,7 @@ void onClick(int id) {
     case B_FULL: toggleFullscreen(); break;
     case B_LEAVE: stopToHome(); break;
     case B_MUTE: setMuted(!g.muted); break;
+    case B_SPATIAL: setSpatial(!g.spatial); break;
     case B_UPDATE: installUpdate(); break;
     case B_CHECK: checkUpdatesNow(); break;
     case B_SITE: ShellExecuteW(g.wnd, L"open", kSite, nullptr, nullptr, SW_SHOWNORMAL); break;
@@ -2333,6 +2348,7 @@ void createControls() {
   g.remember = loadDword(L"Remember", 1) != 0; // (on unless turned off, as on the Mac)
   g.audio = loadDword(L"Audio", 1) != 0;
   g.permanent = loadDword(L"Permanent", 0) != 0;
+  g.spatial = loadDword(L"Spatial", 0) != 0;
   DWORD old = std::min<DWORD>(loadDword(L"Quality", 0), DWORD(std::size(kOldQuality) - 1));
   g.quality = int(std::min<DWORD>(loadDword(L"Quality2", DWORD(kOldQuality[old])), DWORD(std::size(kQualities) - 1)));
   g.monitors = listMonitors();
@@ -2500,6 +2516,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           g.stats = !g.stats;
           tick();
         } else if (wp == 'M') setMuted(!g.muted);
+        else if (wp == 'H') setSpatial(!g.spatial);
         else if (wp == 'C') setChatOpen(!g.chatOpen);
       }
       return 0;

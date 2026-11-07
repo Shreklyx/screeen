@@ -1,6 +1,7 @@
 #include "player_mac.h"
 
 #import <AudioToolbox/AudioToolbox.h>
+#import <CoreMotion/CoreMotion.h>
 #import <CoreMedia/CoreMedia.h>
 #import <AppKit/AppKit.h>
 #import <CoreVideo/CoreVideo.h>
@@ -423,7 +424,42 @@ struct MacAudioOut::Impl {
     return AudioUnitInitialize(unit) == noErr && AudioOutputUnitStart(unit) == noErr;
   }
 
+  // head tracking (AirPods Pro / Max / 3rd generation, macOS 14+): where the head looks turns the speakers
+  // the other way, so they stay put. Re-centred slowly: where the head rests is ahead again, as AirPods do.
+  id motion = nil; // CMHeadphoneMotionManager
+  std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>>(true);
+
+  void track(bool on) {
+    if (@available(macOS 14.0, *)) {
+      CMHeadphoneMotionManager* m = motion;
+      if (!on) {
+        if (m.deviceMotionActive) [m stopDeviceMotionUpdates];
+        ring.setYaw(0);
+        return;
+      }
+      if (!m) {
+        m = [CMHeadphoneMotionManager new];
+        motion = m;
+      }
+      if (!m.deviceMotionAvailable || m.deviceMotionActive) return;
+      AudioRing* r = &ring;
+      auto still = alive;
+      __block double ref = NAN;
+      [m startDeviceMotionUpdatesToQueue:NSOperationQueue.mainQueue
+                             withHandler:^(CMDeviceMotion* dm, NSError*) {
+                               if (!dm || !*still) return;
+                               double yaw = dm.attitude.yaw; // (to the left is positive)
+                               if (std::isnan(ref)) ref = yaw;
+                               double turned = std::remainder(yaw - ref, 2 * M_PI);
+                               ref += turned * 0.002; // (~8 s at its rate)
+                               r->setYaw(float(-turned));
+                             }];
+    }
+  }
+
   ~Impl() {
+    *alive = false;
+    track(false);
     if (unit) {
       AudioOutputUnitStop(unit);
       AudioUnitUninitialize(unit);
@@ -436,5 +472,10 @@ MacAudioOut::MacAudioOut() : impl_(new Impl) { impl_->open(); }
 MacAudioOut::~MacAudioOut() = default;
 void MacAudioOut::push(int sub, const uint8_t* data, size_t n, double tsUs) { impl_->ring.push(sub, data, n, tsUs); }
 void MacAudioOut::setVolume(float v) { impl_->ring.setVolume(v); }
+
+void MacAudioOut::setSpatial(bool on) {
+  impl_->ring.setSpatial(on);
+  impl_->track(on);
+}
 
 }  // namespace ss

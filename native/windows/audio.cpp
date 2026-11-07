@@ -333,6 +333,8 @@ void AudioPlayer::push(int sub, const uint8_t* data, size_t n, double tsUs) { im
 
 void AudioPlayer::setVolume(float volume) { impl_->ring.setVolume(volume); }
 
+void AudioPlayer::setSpatial(bool on) { impl_->ring.setSpatial(on); }
+
 void AudioPlayer::reset() { impl_->ring.reset(); }
 
 }  // namespace ss

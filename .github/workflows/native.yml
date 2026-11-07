@@ -28,6 +28,7 @@ jobs:
         run: |
           build/sscore_test
           build/lossless_test
+          build/spatial_test
       # Lossless sound: what our FLAC encoder makes, ffmpeg's FLAC decoder plays back bit for bit
       - name: "Lossless sound: standard FLAC"
         run: |

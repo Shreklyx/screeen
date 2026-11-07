@@ -34,7 +34,30 @@ class DirectAudio extends AudioWorkletProcessor {
     this.behind = 0; // packets far too late in a row
     this.low = Infinity; // the lowest the buffer got in this window
     this.lowFor = 0;
-    this.port.onmessage = (e) => this.write(e.data);
+    this.spatial = null; // spatial sound for headphones: our C++ head model (ss-web.wasm) – see setSpatial
+    this.spatialOn = false;
+    this.port.onmessage = (e) => {
+      if (e.data.wasm || 'spatial' in e.data) this.setSpatial(e.data);
+      else this.write(e.data);
+    };
+  }
+
+  /** { wasm: the website's WebAssembly module (once), spatial: on or off } – the renderer is made here,
+   *  in the sound's own thread, from the same C++ as the apps' (native/common/spatial.cpp). */
+  setSpatial({ wasm, spatial }) {
+    if (wasm && !this.spatial) {
+      try {
+        const x = new WebAssembly.Instance(wasm, {}).exports;
+        x._initialize?.();
+        const r = x.ss_spatial_create(this.channels);
+        const input = x.ss_malloc(128 * 8 * 4);
+        const output = x.ss_malloc(128 * 2 * 4);
+        if (r && input && output) this.spatial = { x, r, input, output, frames: 128 };
+      } catch {
+        this.spatial = null; // (then the plain sound)
+      }
+    }
+    if (typeof spatial === 'boolean') this.spatialOn = spatial;
   }
 
   write({ pair, ts, frames, planes }) {
@@ -121,6 +144,9 @@ class DirectAudio extends AudioWorkletProcessor {
     const outs = out.length;
     const ring = this.ring;
     const wrap = (a) => ((a % SIZE) + SIZE) % SIZE;
+    // spatial: every channel to the head model, its two ears to the first two outputs
+    const sp = this.spatialOn && outs >= 2 && n <= 128 ? this.spatial : null;
+    const spIn = sp ? new Float32Array(sp.x.memory.buffer, sp.input, n * ch) : null;
     for (let i = 0; i < n; i++) {
       const idx = wrap(this.read + skip + i);
       let s = (c) => (c < ch ? ring[c][idx] : 0);
@@ -129,6 +155,10 @@ class DirectAudio extends AudioWorkletProcessor {
         const from = wrap(this.read + i);
         const w = (i + 0.5) / FADE;
         s = (c) => (c < ch ? ring[c][from] * (1 - w) + ring[c][idx] * w : 0);
+      }
+      if (sp) {
+        for (let c = 0; c < ch; c++) spIn[i * ch + c] = s(c);
+        continue;
       }
       if (ch === 1) {
         for (let o = 0; o < outs; o++) out[o][i] = o < 2 ? s(0) : 0;
@@ -146,6 +176,15 @@ class DirectAudio extends AudioWorkletProcessor {
         out[0][i] = soft(s(0) + K * s(2) + K * s(4) + K * s(6));
         out[1][i] = soft(s(1) + K * s(2) + K * s(5) + K * s(7));
       }
+    }
+    if (sp) {
+      sp.x.ss_spatial_process(sp.r, sp.input, n, sp.output);
+      const ears = new Float32Array(sp.x.memory.buffer, sp.output, n * 2);
+      for (let i = 0; i < n; i++) {
+        out[0][i] = ears[i * 2];
+        out[1][i] = ears[i * 2 + 1];
+      }
+      for (let o = 2; o < outs; o++) out[o].fill(0);
     }
     // never play a sample twice (nor one played past)
     for (let a = this.read; a < this.read + skip + n; a++) {

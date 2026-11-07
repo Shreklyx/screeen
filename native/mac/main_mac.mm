@@ -889,6 +889,8 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   NSProgressIndicator* _overlaySpinner;
   NSSlider* _volume;
   NSButton* _muteButton;
+  NSButton* _spatialButton; // spatial sound for headphones (with AirPods: it follows the head)
+  bool _spatial;
   double _lastMove;
   // the room's chat: the sharer's box, the viewer's panel at the right of the picture (in full screen
   // too); closed, a count on its button and the newest message over the picture for a few seconds
@@ -990,6 +992,7 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
     _stats = !_stats;
     [self tick];
   } else if ([k isEqualToString:@"m"]) [self setMuted:!_muted];
+  else if ([k isEqualToString:@"h"]) [self toggleSpatial];
   else return e;
   [self moved];
   return nil;
@@ -1435,6 +1438,9 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
   NSButton* full = iconButton(@"arrow.up.left.and.arrow.down.right", self, @selector(fullScreen));
   full.toolTip = @"Teljes képernyő (F)";
   _muteButton.toolTip = @"Némítás (M)";
+  _spatial = [NSUserDefaults.standardUserDefaults boolForKey:@"spatial"];
+  _spatialButton = iconButton(@"headphones", self, @selector(toggleSpatial));
+  _spatialButton.toolTip = @"Térhatású hang fejhallgatóhoz – AirPods-szal követi a fejed (H)";
   NSButton* more = iconButton(@"plus.rectangle.on.rectangle", self, @selector(newWindow));
   more.toolTip = @"Új ablak – még egy szoba nézése (⌘N)";
   NSButton* leave = button(@"Kilépés", nil, self, @selector(stopToHome));
@@ -1462,17 +1468,19 @@ static NSColor* chatAccent() { return [NSColor colorWithSRGBRed:0xF7 / 255.0 gre
     [_chatBadge.centerXAnchor constraintEqualToAnchor:chat.trailingAnchor constant:-2], [_chatBadge.centerYAnchor constraintEqualToAnchor:chat.topAnchor constant:3],
     [_chatBadgeText.centerXAnchor constraintEqualToAnchor:_chatBadge.centerXAnchor], [_chatBadgeText.centerYAnchor constraintEqualToAnchor:_chatBadge.centerYAnchor]
   ]];
-  NSStackView* row = hstack(@[ _viewDot, _viewTitle, _viewInfo, chatBox, more, _muteButton, _volume, full, leave ], 10);
+  NSStackView* row = hstack(@[ _viewDot, _viewTitle, _viewInfo, chatBox, more, _spatialButton, _muteButton, _volume, full, leave ], 10);
   // a narrow picture (the chat beside it): the less needed ones step aside first
   [row setVisibilityPriority:600 forView:_viewInfo];
   [row setVisibilityPriority:700 forView:_volume];
   [row setVisibilityPriority:800 forView:more];
+  [row setVisibilityPriority:750 forView:_spatialButton];
   [row setVisibilityPriority:900 forView:_viewTitle];
   [row setCustomSpacing:14 afterView:_viewInfo];
   [row setCustomSpacing:4 afterView:_muteButton];
   [row setCustomSpacing:14 afterView:full];
   row.edgeInsets = NSEdgeInsetsMake(0, 20, 0, 9);
   _bar = glassCapsule(row, 25);
+  [self applySpatial];
   [_viewer addSubview:_bar];
   [NSLayoutConstraint activateConstraints:@[
     [_bar.heightAnchor constraintEqualToConstant:50], [_bar.centerXAnchor constraintEqualToAnchor:_video.centerXAnchor],
@@ -1794,6 +1802,7 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
   _player.reset(new MacPlayer(_video.layer));
   _audioOut.reset(new MacAudioOut());
   _audioOut->setVolume(_muted ? 0.0f : float(_volume.doubleValue / 100));
+  _audioOut->setSpatial(_spatial);
   EngineCallbacks cb = [self callbacks:session];
   MacPlayer* player = _player.get();
   MacAudioOut* audio = _audioOut.get();
@@ -1938,6 +1947,20 @@ static std::string codeOnly(const std::string& room) { return room.substr(0, roo
 
 - (void)volumeChanged {
   [self setMuted:false];
+}
+
+- (void)toggleSpatial {
+  _spatial = !_spatial;
+  [NSUserDefaults.standardUserDefaults setBool:_spatial forKey:@"spatial"];
+  [self applySpatial];
+}
+
+/** Spatial sound on or off: the player (the speakers around the head – with AirPods, where the head
+ *  looks), and the button's look. */
+- (void)applySpatial {
+  if (_audioOut) _audioOut->setSpatial(_spatial);
+  _spatialButton.contentTintColor = _spatial ? NSColor.controlAccentColor : nil;
+  _spatialButton.image = symbol(_spatial ? @"headphones.circle.fill" : @"headphones", 15);
 }
 
 - (void)toggleMute {

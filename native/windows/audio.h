@@ -35,6 +35,8 @@ class AudioPlayer {
   /** One Opus packet: sub = pair | channels << 4 (as sent), ts in µs – any thread. */
   void push(int sub, const uint8_t* data, size_t n, double tsUs);
   void setVolume(float volume); // 0..1
+  /** Spatial sound for headphones (common/spatial.h). */
+  void setSpatial(bool on);
   void reset();
 
  private:

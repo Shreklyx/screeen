@@ -13,6 +13,10 @@ extern "C" {
 }
 
 #include "lossless.h"
+#include "spatial.h"
+
+// (no C++ library here: placement new by hand, for the renderer in memory from malloc)
+inline void* operator new(size_t, void* p) noexcept { return p; }
 
 #define EXPORT(name) extern "C" __attribute__((export_name(#name)))
 
@@ -53,6 +57,19 @@ EXPORT(ss_opus_destroy) void ss_opus_destroy(OpusDecoder* d) { opus_decoder_dest
 EXPORT(ss_flac_decode) int ss_flac_decode(const uint8_t* data, int len, float* pcm, int maxFrames, int* channels) {
   return len > 0 ? ss::lossless::decode(data, size_t(len), pcm, maxFrames, channels) : 0;
 }
+
+/** Spatial sound for headphones (native/common/spatial.h – the apps' own): a renderer for `channels`. */
+EXPORT(ss_spatial_create) ss::spatial::Renderer* ss_spatial_create(int channels) {
+  void* m = malloc(sizeof(ss::spatial::Renderer));
+  if (!m) return nullptr;
+  ss::spatial::Renderer* r = new (m) ss::spatial::Renderer();
+  r->configure(channels);
+  return r;
+}
+EXPORT(ss_spatial_yaw) void ss_spatial_yaw(ss::spatial::Renderer* r, float radians) { r->setYaw(radians); }
+/** frames of its channels (interleaved) → stereo (interleaved). */
+EXPORT(ss_spatial_process) void ss_spatial_process(ss::spatial::Renderer* r, const float* in, int frames, float* out) { r->process(in, frames, out); }
+EXPORT(ss_spatial_destroy) void ss_spatial_destroy(ss::spatial::Renderer* r) { free(r); }
 
 /** Interleaved float samples (48 kHz) → one FLAC frame: its bytes, 0 when it does not fit. */
 EXPORT(ss_flac_encode) int ss_flac_encode(const float* pcm, int channels, int frames, uint8_t* out, int max, uint32_t number) {

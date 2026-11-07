@@ -4,7 +4,7 @@ set(SS_VERSION "2.0.0" CACHE STRING "version shown and compared for updates")
 set(SS_BUILD "0" CACHE STRING "build number (CI run), shown in the About panel")
 
 add_executable(ScreenShareMac MACOSX_BUNDLE
-  main_mac.mm host_mac.mm player_mac.mm ws_mac.mm ../common/audio_ring.cpp ../common/lossless.cpp sign_local.sh)
+  main_mac.mm host_mac.mm player_mac.mm ws_mac.mm ../common/audio_ring.cpp ../common/lossless.cpp ../common/spatial.cpp sign_local.sh)
 # signs the app (and its updates) with this Mac's own identity, so that macOS remembers the permissions
 set_source_files_properties(sign_local.sh PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 set_target_properties(ScreenShareMac PROPERTIES
@@ -19,7 +19,7 @@ target_compile_options(ScreenShareMac PRIVATE -Wall -Wno-missing-field-initializ
 target_link_libraries(ScreenShareMac PRIVATE sscore opus
   "-framework AppKit" "-framework AVFoundation" "-framework CoreMedia" "-framework CoreVideo"
   "-framework VideoToolbox" "-framework ScreenCaptureKit" "-framework AudioToolbox" "-framework CoreAudio"
-  "-framework QuartzCore" "-framework IOSurface" "-framework Metal" "-framework Security")
+  "-framework QuartzCore" "-framework IOSurface" "-framework Metal" "-framework Security" "-framework CoreMotion")
 
 # the icon (app.icns) when one was made beside the sources (CI: sips + iconutil from desktop/build/icon.png)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/app.icns)

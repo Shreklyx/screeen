@@ -48,6 +48,8 @@
   <string>Helyi hálózaton a nézők közvetlenül kapják a képet – így a legkisebb a késés.</string>
   <key>NSAudioCaptureUsageDescription</key>
   <string>A gép hangjának megosztásához kell.</string>
+  <key>NSMotionUsageDescription</key>
+  <string>A térhatású hang az AirPods-szal követi a fejed mozgását: a hang a képernyőnél marad.</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsLocalNetworking</key>

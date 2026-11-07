@@ -41,6 +41,8 @@ done
 $cc $flags -I$root/native/common -std=c++17 -fno-exceptions -fno-rtti -c "$here/ss_web.cpp" -o "$tmp/ss_web.o"
 # the lossless sound: the apps' own FLAC code
 $cc $flags -std=c++17 -fno-exceptions -fno-rtti -c "$root/native/common/lossless.cpp" -o "$tmp/lossless.o"
+# spatial sound: the apps' own head model
+$cc $flags -std=c++17 -fno-exceptions -fno-rtti -c "$root/native/common/spatial.cpp" -o "$tmp/spatial.o"
 $cc --target=wasm32-wasi -mexec-model=reactor -nostdlib++ -Wl,--gc-sections -Wl,--strip-all -Wl,-z,stack-size=1048576 \
-  -o "$out" "$tmp/ss_web.o" "$tmp/lossless.o" $objs
+  -o "$out" "$tmp/ss_web.o" "$tmp/lossless.o" "$tmp/spatial.o" $objs
 echo "$out: $(wc -c <"$out") bytes"
