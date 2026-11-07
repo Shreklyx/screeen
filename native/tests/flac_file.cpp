@@ -11,6 +11,8 @@
 
 using namespace ss;
 
+static const double kPi = 3.14159265358979323846;
+
 int main(int argc, char** argv) {
   if (argc < 4) return 2;
   int ch = std::atoi(argv[1]);
@@ -27,7 +29,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < F; i++)
       for (int c = 0; c < ch; c++) {
         double t = (p * F + i) / 48000.0;
-        double v = 0.5 * std::sin(2 * M_PI * (220 + 110 * c) * t) * (0.6 + 0.4 * std::sin(t * 3)) + (p % 50 == 7 ? (i % 2 ? 0.99 : -0.99) : 0);
+        double v = 0.5 * std::sin(2 * kPi * (220 + 110 * c) * t) * (0.6 + 0.4 * std::sin(t * 3)) + (p % 50 == 7 ? (i % 2 ? 0.99 : -0.99) : 0);
         rng = rng * 1664525u + 1013904223u;
         int32_t s = int32_t(std::lround(v * 8388000)) + int32_t(rng >> 28) - 8;
         s = s > 8388607 ? 8388607 : s < -8388608 ? -8388608 : s;

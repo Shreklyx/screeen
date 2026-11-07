@@ -10,6 +10,8 @@
 
 using namespace ss;
 
+static const double kPi = 3.14159265358979323846;
+
 static int failures = 0;
 #define CHECK(cond, what)                     \
   do {                                        \
@@ -50,8 +52,8 @@ int main() {
       for (int i = 0; i < F; i++) {
         double t = (p * F + i) / 48000.0;
         double env = 0.5 + 0.4 * std::sin(t * 2.1);
-        double l = env * (0.4 * std::sin(2 * M_PI * 220 * t) + 0.2 * std::sin(2 * M_PI * 660 * t + 0.3) + 0.1 * std::sin(2 * M_PI * 1870 * t));
-        double r = env * (0.4 * std::sin(2 * M_PI * 220 * t + 0.2) + 0.2 * std::sin(2 * M_PI * 660 * t) + 0.08 * std::sin(2 * M_PI * 2450 * t));
+        double l = env * (0.4 * std::sin(2 * kPi * 220 * t) + 0.2 * std::sin(2 * kPi * 660 * t + 0.3) + 0.1 * std::sin(2 * kPi * 1870 * t));
+        double r = env * (0.4 * std::sin(2 * kPi * 220 * t + 0.2) + 0.2 * std::sin(2 * kPi * 660 * t) + 0.08 * std::sin(2 * kPi * 2450 * t));
         pcm[size_t(i * 2)] = int32_t(std::lround(l * 8388607)) + rnd(4);
         pcm[size_t(i * 2 + 1)] = int32_t(std::lround(r * 8388607)) + rnd(4);
       }

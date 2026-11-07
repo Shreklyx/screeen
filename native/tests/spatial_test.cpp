@@ -9,6 +9,8 @@
 
 using ss::spatial::Renderer;
 
+static const double kPi = 3.14159265358979323846;
+
 static int failures = 0;
 #define CHECK(cond, ...)               \
   do {                                 \
@@ -28,7 +30,7 @@ static void ears(int channels, int channel, double hz, float yaw, double& left, 
   r.setYaw(yaw);
   const int n = 48000;
   std::vector<float> in(size_t(n * channels), 0.0f), out(size_t(n * 2));
-  for (int i = 0; i < n; i++) in[size_t(i * channels + channel)] = float(0.3 * std::sin(2 * M_PI * hz * i / 48000));
+  for (int i = 0; i < n; i++) in[size_t(i * channels + channel)] = float(0.3 * std::sin(2 * kPi * hz * i / 48000));
   r.process(in.data(), n, out.data());
   left = right = 0;
   for (int i = n / 2; i < n; i++) {
@@ -61,7 +63,7 @@ int main() {
   CHECK(std::fabs(10 * std::log10(l / r)) < 0.5, "mono in front: both ears the same (%.2f dB)", 10 * std::log10(l / r));
   ears(8, 7, 4000, 0, l, r);
   CHECK(r > l * 4, "7.1 right side speaker: the right ear %.1f dB louder", 10 * std::log10(r / l));
-  ears(1, 0, 4000, float(M_PI / 2), l, r);
+  ears(1, 0, 4000, float(kPi / 2), l, r);
   CHECK(l > r * 4, "the head turned right: the front speaker is on the left (%.1f dB)", 10 * std::log10(l / r));
   int al, ar;
   arrival(2, 1, al, ar);

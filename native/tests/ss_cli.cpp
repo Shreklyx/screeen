@@ -31,6 +31,8 @@
 #include "clock.h"
 #include "engine.h"
 #include "flac_sender.h"
+
+static const double kPi = 3.14159265358979323846;
 #include "ws_bench.h"
 
 using namespace ss;
@@ -155,8 +157,8 @@ static int host(int argc, char** argv) {
         double wait = at - nowMs();
         if (wait > 0) std::this_thread::sleep_for(std::chrono::microseconds(long(wait * 1000)));
         for (int i = 0; i < 120; i++, sample++) {
-          pcm[size_t(i) * 2] = float(std::round(0.5 * std::sin(sample * 2 * M_PI * 440 / 48000) * 8388608) / 8388608);
-          pcm[size_t(i) * 2 + 1] = float(std::round(0.3 * std::sin(sample * 2 * M_PI * 660 / 48000) * 8388608) / 8388608);
+          pcm[size_t(i) * 2] = float(std::round(0.5 * std::sin(sample * 2 * kPi * 440 / 48000) * 8388608) / 8388608);
+          pcm[size_t(i) * 2 + 1] = float(std::round(0.3 * std::sin(sample * 2 * kPi * 660 / 48000) * 8388608) / 8388608);
         }
         if (streaming) flac.send(pcm.data(), 120, [&](int pair, const uint8_t* d, size_t n) { engine.sendAudio(pair, 2, d, n, ts); });
         ts += 2500;
