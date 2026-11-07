@@ -1919,10 +1919,29 @@ function toggleSpatial() {
  *  (WebKit's sound thread is no place for it). */
 function sendSpatial(a) {
   if (!a || IS_IOS) return;
+  // the sound's thread says whether the head model plays (direct-audio.js): where the compiled module
+  // could not go there (a browser that cannot send one), its bytes go once more; not even then – said
+  a.node.port.onmessage ||= ({ data }) => {
+    if (!('spatialReady' in data) || !viewer.spatial || data.spatialReady || a.spatialFailed) return;
+    if (!a.spatialBytes && a.wasm?.bytes) {
+      a.spatialBytes = true;
+      try {
+        a.node.port.postMessage({ wasm: a.wasm.bytes.slice(0), spatial: true });
+        return;
+      } catch { /* below */ }
+    }
+    a.spatialFailed = true;
+    toast('A térhatás ebben a böngészőben nem indult el – friss Chrome-ban, Edge-ben, Firefoxban vagy az alkalmazásban megy.', 'warn', 6000);
+  };
   try {
     if (viewer.spatial && !a.spatialSent && a.wasm?.module) {
-      a.node.port.postMessage({ wasm: a.wasm.module, spatial: true });
       a.spatialSent = true;
+      try {
+        a.node.port.postMessage({ wasm: a.wasm.module, spatial: true });
+      } catch {
+        a.spatialBytes = true;
+        a.node.port.postMessage({ wasm: a.wasm.bytes.slice(0), spatial: true }); // (the bytes instead)
+      }
     } else {
       a.node.port.postMessage({ spatial: viewer.spatial });
     }

@@ -7,7 +7,7 @@ import vm from 'node:vm';
 function load() {
   const registered = {};
   const context = {
-    AudioWorkletProcessor: class { constructor() { this.port = {}; } },
+    AudioWorkletProcessor: class { constructor() { this.port = { sent: [], postMessage(m) { this.sent.push(m); } }; } },
     registerProcessor: (name, cls) => { registered[name] = cls; },
     Math,
     Float32Array,
@@ -181,6 +181,18 @@ test('spatial sound (our C++ head model from ss-web.wasm): the left channel is h
     }
   }
   assert.ok(left > 0 && right > 0 && left > right * 2, `left ${left}, right ${right}`);
+  assert.equal(p.port.sent.at(-1)?.spatialReady, true); // (the page is told it plays)
   // off again: the plain sound (nothing in the right ear)
   p.port.onmessage({ data: { spatial: false } });
+});
+
+test('spatial sound from the module\'s bytes (a browser that cannot send a compiled module to the sound\'s thread)', () => {
+  const p = new Processor({ processorOptions: { channels: 2 } });
+  const bytes = fs.readFileSync(new URL('../public/ss-web.wasm', import.meta.url));
+  p.port.onmessage({ data: { wasm: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), spatial: true } });
+  assert.equal(p.port.sent.at(-1)?.spatialReady, true);
+  // and what cannot become one: said (the page tells the viewer), the plain sound plays on
+  const q = new Processor({ processorOptions: { channels: 2 } });
+  q.port.onmessage({ data: { wasm: new ArrayBuffer(8), spatial: true } });
+  assert.equal(q.port.sent.at(-1)?.spatialReady, false);
 });

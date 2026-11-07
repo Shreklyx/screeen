@@ -47,7 +47,9 @@ class DirectAudio extends AudioWorkletProcessor {
   setSpatial({ wasm, spatial }) {
     if (wasm && !this.spatial) {
       try {
-        const x = new WebAssembly.Instance(wasm, {}).exports;
+        // (a compiled module – or its bytes, where the browser could not send a module here)
+        const module = wasm instanceof WebAssembly.Module ? wasm : new WebAssembly.Module(wasm);
+        const x = new WebAssembly.Instance(module, {}).exports;
         x._initialize?.();
         const r = x.ss_spatial_create(this.channels);
         const input = x.ss_malloc(128 * 8 * 4);
@@ -58,6 +60,7 @@ class DirectAudio extends AudioWorkletProcessor {
       }
     }
     if (typeof spatial === 'boolean') this.spatialOn = spatial;
+    this.port.postMessage({ spatialReady: Boolean(this.spatial) }); // (the page knows whether it plays)
   }
 
   write({ pair, ts, frames, planes }) {
