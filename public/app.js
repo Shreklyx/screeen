@@ -93,9 +93,47 @@ const { base32, unbase32, parseRoomKey, e2eProof, e2eProofOk } = window.RoomKey;
 
 const randomId = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
 
+const reducedMotion = () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+
 function showView(id) {
-  for (const el of document.querySelectorAll('[data-view]')) el.hidden = el.id !== id;
-  document.body.classList.toggle('viewing', id === 'view-viewer');
+  const apply = () => {
+    for (const el of document.querySelectorAll('[data-view]')) el.hidden = el.id !== id;
+    document.body.classList.toggle('viewing', id === 'view-viewer');
+  };
+  // from one view to another: the browser crosses them over where it can (style.css: view-transition)
+  const shown = document.querySelector('[data-view]:not([hidden])');
+  if (!shown || shown.id === id || !document.startViewTransition || reducedMotion()) apply();
+  else document.startViewTransition(apply);
+}
+
+/** A field that was wrong: it shakes (as the Mac's login). */
+function shake(el) {
+  if (!el?.animate || reducedMotion()) return;
+  el.animate([{ transform: 'none' }, { transform: 'translateX(-10px)' }, { transform: 'translateX(9px)' }, { transform: 'translateX(-7px)' },
+    { transform: 'translateX(5px)' }, { transform: 'translateX(-2px)' }, { transform: 'none' }], { duration: 480, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' });
+}
+
+/** Plays a CSS animation (a class) again. */
+function replay(el, cls) {
+  el.classList.remove(cls);
+  void el.offsetWidth; // (so the browser sees it gone first)
+  el.classList.add(cls);
+}
+
+/** The glass cards catch the pointer's light (style.css: --mx, --my – it glides after the pointer). */
+function glassLight() {
+  if (!window.matchMedia?.('(hover: hover)').matches || reducedMotion()) return;
+  for (const card of document.querySelectorAll('.card')) {
+    card.addEventListener('pointermove', (e) => {
+      const r = card.getBoundingClientRect();
+      card.style.setProperty('--mx', `${(((e.clientX - r.left) / r.width) * 100).toFixed(1)}%`);
+      card.style.setProperty('--my', `${(((e.clientY - r.top) / r.height) * 100).toFixed(1)}%`);
+    });
+    card.addEventListener('pointerleave', () => {
+      card.style.removeProperty('--mx');
+      card.style.removeProperty('--my');
+    });
+  }
 }
 
 let toastTimer;
@@ -460,7 +498,7 @@ async function startHosting(e) {
     tracks.video.stop();
     tracks.audio?.stop();
     showShareError(errorText(err));
-    if (err.code === 'auth') { $('#hostPassword').select(); store.remove('ss-host-password'); }
+    if (err.code === 'auth') { $('#hostPassword').select(); shake($('#hostPassword')); store.remove('ss-host-password'); }
     return;
   }
 
@@ -791,8 +829,10 @@ function renderEncoderStatus() {
 
 function renderViewers() {
   const rows = [];
-  for (const v of host.viewers.values()) {
+  const seen = host.seenViewers || new Set();
+  for (const [id, v] of host.viewers) {
     const li = document.createElement('li');
+    if (!seen.has(id)) li.className = 'new'; // (comes in: style.css – the others stay still)
     const head = document.createElement('div');
     head.className = 'viewer-head';
     const name = document.createElement('span');
@@ -832,6 +872,7 @@ function renderViewers() {
     rows.push(li);
   }
   $('#viewerList').replaceChildren(...rows);
+  host.seenViewers = new Set(host.viewers.keys());
   $('#viewerCount').textContent = String(host.viewers.size);
   $('#noViewers').hidden = host.viewers.size > 0;
 }
@@ -1524,6 +1565,88 @@ const viewer = {
 };
 
 const canvas = () => $('#directCanvas');
+
+// WebKit: Safari, and every browser on an iPhone or iPad
+const WEBKIT = IS_IOS || IS_SAFARI;
+
+/** The picture drawn with WebGL: the frame from the decoder is taken as a texture on the graphics chip
+ *  (WebKit's 2D canvas first turned each one into a full-size RGB picture – 33 MB at 4K, 60 times a
+ *  second: what an iPhone ran out of memory with – it flickered, then Safari gave up). A downscaled
+ *  picture is sampled four times a quarter of a screen pixel apart (no shimmer on fine text). */
+function glRenderer(el) {
+  const opts = { alpha: false, antialias: false, depth: false, stencil: false, powerPreference: 'high-performance' };
+  const gl = el.getContext('webgl2', opts) || el.getContext('webgl', opts);
+  if (!gl) return null;
+  const shader = (type, src) => {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) || 'shader');
+    return sh;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, shader(gl.VERTEX_SHADER, 'attribute vec2 p; varying vec2 uv; void main() { uv = vec2(p.x + 1.0, 1.0 - p.y) * 0.5; gl_Position = vec4(p, 0.0, 1.0); }'));
+  gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, `precision mediump float;
+    varying vec2 uv; uniform sampler2D t; uniform vec2 d;
+    void main() {
+      vec3 c = texture2D(t, uv + vec2(-d.x, -d.y)).rgb + texture2D(t, uv + vec2(d.x, -d.y)).rgb + texture2D(t, uv + vec2(-d.x, d.y)).rgb + texture2D(t, uv + vec2(d.x, d.y)).rgb;
+      gl_FragColor = vec4(c * 0.25, 1.0);
+    }`));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog) || 'program');
+  gl.useProgram(prog);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  const at = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(at);
+  gl.vertexAttribPointer(at, 2, gl.FLOAT, false, 0, 0);
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.uniform1i(gl.getUniformLocation(prog, 't'), 0);
+  const spread = gl.getUniformLocation(prog, 'd');
+  return {
+    kind: 'gl',
+    draw(frame, w, h) {
+      if (gl.isContextLost()) throw new Error('webgl context lost');
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+      gl.viewport(0, 0, w, h);
+      const down = frame.displayWidth / w > 1.25; // (1:1 or bigger: one sharp sample)
+      gl.uniform2f(spread, down ? 0.25 / w : 0, down ? 0.25 / h : 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    },
+  };
+}
+
+/** How the picture is drawn on this canvas – WebGL on WebKit (glRenderer), else the 2D canvas; kept with
+ *  the canvas (a canvas has one kind of drawing for good). */
+function pictureRenderer(el, frame) {
+  if (el.ssRenderer) return el.ssRenderer;
+  let r = null;
+  // (above 1080p: where WebKit's 2D canvas ran out of memory – below it the 2D canvas is as before)
+  if (WEBKIT && !el.ssNoGl && frame.displayWidth * frame.displayHeight > 1920 * 1080) {
+    try { r = glRenderer(el); } catch (err) { console.warn('webgl picture', err); r = null; }
+  }
+  if (!r) {
+    const ctx = el.getContext('2d', { desynchronized: true, alpha: false });
+    if (!ctx) return null;
+    r = { kind: '2d', draw: (frame, w, h) => ctx.drawImage(frame, 0, 0, w, h) };
+  }
+  el.ssRenderer = r;
+  return r;
+}
+
+/** A canvas that cannot draw with WebGL (an older Safari, a lost context): a new one in its place, drawn in 2D. */
+function freshCanvas(el) {
+  const fresh = el.cloneNode(false);
+  fresh.ssNoGl = true;
+  el.replaceWith(fresh);
+  return fresh;
+}
 const hasPicture = () => Boolean(viewer.direct?.drawn);
 
 // 5.1/7.1 speakers in a Chromium browser: the sharer's surround sound plays there on every speaker.
@@ -1645,6 +1768,7 @@ function askAccess() {
   $('#overlayActions').replaceChildren(form);
   input.focus();
   input.select();
+  if (wrong) shake(input);
 }
 
 // A sharer that sends nothing our way (an old iPhone app speaks only WebRTC): say so.
@@ -1730,9 +1854,15 @@ function setLive(on) {
 }
 
 function setOverlay(text, { spinner = true, actions = [] } = {}) {
-  $('#overlay').hidden = false;
+  const overlay = $('#overlay');
+  overlay.classList.remove('leaving');
+  overlay.hidden = false;
   $('#spinner').hidden = !spinner;
-  $('#overlayText').textContent = text;
+  const line = $('#overlayText');
+  if (line.textContent !== text) {
+    line.textContent = text;
+    replay(line, 'swap'); // (the new words come up)
+  }
   $('#overlayActions').replaceChildren(...actions.map((a) => {
     const b = document.createElement('button');
     b.type = 'button';
@@ -1744,7 +1874,18 @@ function setOverlay(text, { spinner = true, actions = [] } = {}) {
   showControls();
 }
 
-function hideOverlay() { $('#overlay').hidden = true; }
+/** The waiting glass melts away (style.css: .overlay.leaving), then it is gone. */
+function hideOverlay() {
+  const overlay = $('#overlay');
+  if (overlay.hidden || overlay.classList.contains('leaving')) return;
+  if (reducedMotion()) { overlay.hidden = true; return; }
+  overlay.classList.add('leaving');
+  setTimeout(() => {
+    if (!overlay.classList.contains('leaving')) return; // (shown again meanwhile)
+    overlay.classList.remove('leaving');
+    overlay.hidden = true;
+  }, 400);
+}
 function goHome() { location.href = location.pathname; }
 
 async function requestWakeLock() {
@@ -2015,14 +2156,20 @@ function decodeDirectVideo(d, meta, data) {
     d.needKey = true;
   }
   if (d.needKey && !meta.key) {
-    DIRECT.keyframe();
+    if (!(performance.now() - (d.lagKeyAt || 0) < 1000)) DIRECT.keyframe(); // (asked already: wait for it)
     return;
   }
   // the decoder falls behind (a slow computer, a picture too big for it): the frames up to the next
-  // keyframe are left out – the picture stays live instead of the delay growing
-  if (d.decoder.decodeQueueSize > 6 && !meta.key) {
+  // keyframe are left out – the picture stays live instead of the delay growing. (More than ~150 ms of
+  // frames waiting; a keyframe asked for at most once a second for this – at 4K each is big, and a
+  // phone asking again and again only fell further behind: the picture flickered.)
+  if (d.decoder.decodeQueueSize > 10 && !meta.key) {
     d.needKey = true;
-    DIRECT.keyframe();
+    const t = performance.now();
+    if (!(t - (d.lagKeyAt || 0) < 1000)) {
+      d.lagKeyAt = t;
+      DIRECT.keyframe();
+    }
     return;
   }
   d.needKey = false;
@@ -2070,21 +2217,37 @@ function drawDirectFrame(d, frame) {
     d.srcH = frame.displayHeight;
     d.fitAt = now;
     const dpr = window.devicePixelRatio || 1;
-    const fit = el.clientWidth > 0 && el.clientHeight > 0 ? Math.min(1, (el.clientWidth * dpr) / d.srcW, (el.clientHeight * dpr) / d.srcH) : 1;
+    const box = el.clientWidth > 0 ? el : el.parentElement; // (the first frame: the canvas is still hidden – the player's size)
+    const fit = box.clientWidth > 0 && box.clientHeight > 0 ? Math.min(1, (box.clientWidth * dpr) / d.srcW, (box.clientHeight * dpr) / d.srcH) : 1;
     d.drawW = Math.max(2, Math.round(d.srcW * fit));
     d.drawH = Math.max(2, Math.round(d.srcH * fit));
   }
   const w = d.drawW;
   const h = d.drawH;
-  if (el.width !== w || el.height !== h) {
-    el.width = w;
-    el.height = h;
-  }
-  d.ctx ||= el.getContext('2d', { desynchronized: true, alpha: false });
-  d.ctx.drawImage(frame, 0, 0, w, h);
   const capture = d.pending.get(frame.timestamp);
   d.pending.delete(frame.timestamp);
-  frame.close();
+  try {
+    let target = el;
+    for (let tries = 0; tries < 2; tries++) {
+      if (target.width !== w || target.height !== h) {
+        target.width = w;
+        target.height = h;
+      }
+      const r = pictureRenderer(target, frame);
+      try {
+        r?.draw(frame, w, h);
+        break;
+      } catch (err) {
+        if (r?.kind !== 'gl') throw err;
+        console.warn('webgl picture', err);
+        target = freshCanvas(target); // (and drawn again, in 2D)
+      }
+    }
+  } catch (err) {
+    console.warn('picture', err); // (this frame is not shown; the next one is)
+  } finally {
+    frame.close(); // always: a frame not given back holds the decoder's memory (4K: 12 MB each)
+  }
   d.frames++;
   if (capture && d.offset != null) {
     d.lat.push(clockNow() + d.offset - capture);
@@ -2092,7 +2255,9 @@ function drawDirectFrame(d, frame) {
   }
   if (!d.drawn) {
     d.drawn = true;
-    el.hidden = false;
+    const shown = canvas(); // (a new one, if WebGL could not draw)
+    shown.hidden = false;
+    replay(shown, 'arrive'); // (the picture settles in)
     if (viewer.live) {
       hideOverlay();
       setLive(true);
@@ -2286,8 +2451,7 @@ function directStatsTick() {
   d.fpsAt = now;
   const lat = median(d.lat);
   const r = d.report;
-  const el = canvas();
-  const res = d.drawn ? `${el.width}×${el.height}` : '–';
+  const res = d.drawn ? `${d.srcW}×${d.srcH}` : '–'; // (the picture's own size – drawn at most at the screen's)
   if (viewer.tick++ % 2 === 0 && lat != null) sendToHost({ type: 'stats', lat: Math.round(lat), fps: Math.round(fps), loss: r?.loss ?? 0, measured: true });
   $('#viewerInfo').textContent = d.drawn ? `${res} · ${Math.round(fps)} FPS${lat != null ? ` · ${Math.round(lat)} ms` : ''}` : '';
   if ($('#stats').hidden) return;
@@ -2471,6 +2635,7 @@ function init() {
   }
   initHostUi();
   initViewerUi();
+  glassLight();
 
   // the Nézés card keeps what was typed in it (in this browser: after a reload, a restart too)
   for (const [id, key] of [['#joinCode', 'ss-join-code'], ['#joinAccess', 'ss-join-access']]) {
@@ -2481,7 +2646,7 @@ function init() {
   $('#joinForm').addEventListener('submit', (e) => {
     e.preventDefault();
     const code = parseCode($('#joinCode').value);
-    if (code.length < 4) { toast('Érvénytelen szobakód.', 'warn'); return; }
+    if (code.length < 4) { toast('Érvénytelen szobakód.', 'warn'); shake($('#joinCode')); return; }
     startViewing(code, parseRoomKey($('#joinCode').value), $('#joinAccess').value);
   });
 

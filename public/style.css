@@ -735,7 +735,6 @@ body.viewing::before, body.viewing::after { opacity: 0.45; }
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  animation: rise 0.45s var(--ease) both;
 }
 .hero h1 em {
   background: linear-gradient(90deg, #ff4d6a, #c08bff);
@@ -971,4 +970,144 @@ h2, h3, .card-head h2 { font-weight: 700; }
 /* without backdrop blur (old browsers): a solid enough tint instead */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .card, .box, .downloads, .howto, .features li, .stats, .toast, .topbar, .chat-panel { background: rgba(20, 20, 30, 0.92); }
+}
+
+/* ---------- Motion ----------
+ * Springs, as the Mac's and the iPhone's own: what moves overshoots a hair and settles (a curve sampled
+ * from a damped spring – older browsers: a back-out curve). Views cross over, the picture settles in
+ * when it arrives, a wrong password shakes its field, the glass catches the pointer's light. Nothing
+ * keeps moving while the picture plays; with "reduce motion" nothing moves at all. */
+:root {
+  --spring: cubic-bezier(0.34, 1.32, 0.64, 1);
+  --spring-bouncy: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@supports (transition-timing-function: linear(0, 1)) {
+  :root {
+    /* response 0.42 s, damping 0.72 (in 0.6 s) */
+    --spring: linear(0, 0.006 1.25%, 0.0226 2.5%, 0.0582 4.17%, 0.1059 5.83%, 0.2087 8.75%, 0.4745 15.42%, 0.5843 18.33%, 0.6833 21.25%, 0.7691 24.17%, 0.8411 27.08%, 0.8995 30%, 0.9453 32.92%, 0.9798 35.83%, 1.0046 38.75%, 1.0232 42.08%, 1.0336 45.42%, 1.0383 49.58%, 1.0349 55.83%, 1.0048 79.17%, 0.9995 90.42%, 1);
+    /* response 0.4 s, damping 0.56 (in 0.75 s) */
+    --spring-bouncy: linear(0, 0.0103 1.25%, 0.0387 2.5%, 0.082 3.75%, 0.137 5%, 0.2009 6.25%, 0.2711 7.5%, 0.5466 12.08%, 0.6658 14.17%, 0.7939 16.67%, 0.8848 18.75%, 0.9599 20.83%, 1.019 22.92%, 1.063 25%, 1.0976 27.5%, 1.111 29.17%, 1.118 30.83%, 1.1195 32.5%, 1.1153 34.58%, 1.0989 37.92%, 1.0407 46.25%, 1.0184 50%, 0.9993 54.58%, 0.989 59.17%, 0.9859 65.83%, 0.9999 86.25%, 1);
+  }
+}
+
+/* coming in: up and into place on a spring (the opacity on its own, gentle curve) */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(16px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes fade-in { from { opacity: 0; } }
+.hero, .cards > .card, .features li, .downloads, .howto, .host > *, .viewer, .app-hero {
+  animation: rise 0.75s var(--spring) both, fade-in 0.45s var(--ease) both;
+}
+.cards > .card:nth-child(2) { animation-delay: 0.06s, 0.06s; }
+.features li:nth-child(1) { animation-delay: 0.1s, 0.1s; }
+.features li:nth-child(2) { animation-delay: 0.14s, 0.14s; }
+.features li:nth-child(3) { animation-delay: 0.18s, 0.18s; }
+.features li:nth-child(4) { animation-delay: 0.22s, 0.22s; }
+.downloads { animation-delay: 0.26s, 0.26s; }
+.howto { animation-delay: 0.3s, 0.3s; }
+.host > :nth-child(2) { animation-delay: 0.07s, 0.07s; }
+.hero h1 { animation: focus-in 0.9s var(--ease) both; }
+@keyframes focus-in { from { opacity: 0; filter: blur(10px); letter-spacing: 0.02em; } }
+
+/* one view to the other (where the browser can: the old one sinks and fades, the new one comes up) */
+.topbar { view-transition-name: topbar; }
+::view-transition-old(root) { animation: view-out 0.26s var(--ease) both; }
+::view-transition-new(root) { animation: fade-in 0.3s var(--ease) both; }
+@keyframes view-out { to { opacity: 0; transform: scale(0.975); filter: blur(4px); } }
+
+/* the glass: the cards lift on a spring and catch the pointer's light (it glides after it) */
+@property --mx { syntax: "<percentage>"; inherits: true; initial-value: 18%; }
+@property --my { syntax: "<percentage>"; inherits: true; initial-value: -8%; }
+.card {
+  transition: transform 0.6s var(--spring), box-shadow 0.4s var(--ease), border-color 0.35s, --mx 0.7s var(--ease), --my 0.7s var(--ease);
+}
+.card::before {
+  background:
+    radial-gradient(260px circle at var(--mx) var(--my), rgba(255, 255, 255, 0.16), transparent 62%),
+    radial-gradient(120% 70% at 18% -8%, rgba(255, 255, 255, 0.12), transparent 56%),
+    radial-gradient(90% 60% at 100% 110%, rgba(255, 255, 255, 0.05), transparent 60%);
+}
+
+/* buttons: pressed in at once, back on a spring; the main ones' glass catches a light that sweeps over */
+.btn, .icon-btn {
+  transition: background 0.2s var(--ease), border-color 0.2s, box-shadow 0.25s var(--ease), transform 0.55s var(--spring-bouncy), filter 0.2s, color 0.2s;
+}
+.btn:active, .icon-btn:active { transform: scale(0.95); transition-duration: 0.2s, 0.2s, 0.25s, 0.09s, 0.2s, 0.2s; transition-timing-function: var(--ease); }
+.btn-primary, a.btn-primary { position: relative; overflow: hidden; isolation: isolate; }
+.btn-primary::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(105deg, transparent 30%, rgba(255, 255, 255, 0.9) 48%, transparent 66%);
+  transform: translateX(-130%);
+  pointer-events: none;
+}
+.btn-primary:hover::after { transform: translateX(130%); transition: transform 1s var(--ease); }
+
+/* the on/off choices: switches (as the apps'), the knob on a spring – it stretches while held */
+.check { gap: 11px; }
+.check input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: none;
+  position: relative;
+  width: 40px;
+  height: 24px;
+  margin: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  transition: background 0.3s var(--ease), box-shadow 0.3s var(--ease);
+}
+.check input[type="checkbox"]::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  transition: transform 0.6s var(--spring-bouncy), width 0.3s var(--spring), background 0.25s;
+}
+.check input[type="checkbox"]:active::before { width: 26px; }
+.check input[type="checkbox"]:checked { background: #f2f2f5; box-shadow: inset 0 1px 0 #fff; }
+.check input[type="checkbox"]:checked::before { transform: translateX(16px); background: #2a2a2e; box-shadow: 0 2px 5px rgba(0, 0, 0, 0.25); }
+.check input[type="checkbox"]:checked:active::before { transform: translateX(10px); }
+.check input[type="checkbox"]:focus-visible { outline: 2px solid rgba(255, 255, 255, 0.8); outline-offset: 2px; }
+
+/* fields: the focus ring springs out */
+input[type="text"], input[type="password"], select { transition: border-color 0.2s, box-shadow 0.45s var(--spring), background 0.2s; }
+
+/* errors come in from above; the toast on a spring */
+.hint.error:not([hidden]) { animation: drop-in 0.55s var(--spring) both, fade-in 0.3s var(--ease) both; }
+@keyframes drop-in { from { transform: translateY(-6px); } }
+.toast { transform: translate(-50%, 18px) scale(0.96); transition: opacity 0.25s var(--ease), transform 0.6s var(--spring); }
+.toast.show { transform: translate(-50%, 0) scale(1); }
+
+/* the picture: the waiting glass melts away when it arrives, the picture settles in */
+.overlay:not([hidden]) .overlay-box { animation: rise 0.6s var(--spring) both, fade-in 0.35s var(--ease) both; }
+.overlay.leaving { animation: overlay-out 0.4s var(--ease) both; pointer-events: none; }
+.overlay.leaving .overlay-box { animation: box-out 0.3s var(--ease) both; }
+@keyframes overlay-out { to { opacity: 0; backdrop-filter: blur(0); -webkit-backdrop-filter: blur(0); } }
+@keyframes box-out { to { opacity: 0; transform: translateY(-8px) scale(0.96); } }
+#overlayText.swap { animation: text-swap 0.4s var(--ease); }
+@keyframes text-swap { from { opacity: 0; transform: translateY(6px); } }
+#directCanvas.arrive { animation: arrive 0.8s var(--ease) both; }
+@keyframes arrive { from { opacity: 0; transform: scale(1.02); } }
+.access-form { animation: rise 0.6s var(--spring) both, fade-in 0.3s var(--ease) both; }
+.controls { transition: opacity 0.3s var(--ease), transform 0.55s var(--spring); }
+
+/* who watches, the chat: in on a spring */
+.viewer-list li.new { animation: rise 0.6s var(--spring) both, fade-in 0.3s var(--ease) both; } /* (only a new one: the list is drawn again every second) */
+.chat-msg { animation: chat-in 0.55s var(--spring) both; }
+.chat-pop div { animation: chat-in 0.55s var(--spring), chat-out 0.6s ease-in 6.4s forwards; }
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }
+  .hero h1 { filter: none; }
 }
