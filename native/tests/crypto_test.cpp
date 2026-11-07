@@ -1,7 +1,7 @@
 // Our own cryptography (core/crypto.cpp) against the standards' own test vectors, and long sweeps against
 // values computed apart from our code (Python's hashlib / hmac and OpenSSL, through the cryptography package):
 //   SHA-256, SHA-1 (FIPS 180-4) · MD5 (RFC 1321) · HMAC (RFC 4231, RFC 2202) · HKDF (RFC 5869)
-//   X25519 (RFC 7748) · AES-128-GCM (the GCM specification's test cases, McGrew & Viega)
+//   X25519 (RFC 7748) · AES-128-GCM (the GCM specification's test cases, McGrew & Viega) · scrypt (RFC 7914)
 // Built twice: crypto_test runs on this CPU's AES and carry-less multiply instructions, crypto_portable_test
 // on the portable code – the same answers from both. "--expect hardware" / "--expect portable" also checks
 // which one ran (CI: the fast one must be the one in use).
@@ -11,6 +11,7 @@
 #include <string>
 
 #include "crypto.h"
+#include "crypto_core.h"
 
 using namespace ss;
 
@@ -278,6 +279,31 @@ static void gcm() {
   CHECK(roundTrip, "AES-128-GCM: all of them open again");
 }
 
+/** scrypt (the server's password hashes): RFC 7914's vectors, and more as OpenSSL makes them. */
+static void scryptTests() {
+  auto run = [](const char* pass, const char* salt, uint64_t N, uint32_t r, uint32_t p) {
+    uint8_t out[64];
+    bool ok = crypto::scrypt(reinterpret_cast<const uint8_t*>(pass), std::strlen(pass), reinterpret_cast<const uint8_t*>(salt), std::strlen(salt), N, r, p, out, 64);
+    return ok ? hexOf(out, 64) : std::string("failed");
+  };
+  CHECK(run("", "", 16, 1, 1) == "77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906",
+        "scrypt RFC 7914, first");
+  CHECK(run("password", "NaCl", 1024, 8, 16) == "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b3731622eaf30d92e22a3886ff109279d9830dac727afb94a83ee6d8360cbdfa2cc0640",
+        "scrypt RFC 7914, second");
+  CHECK(run("pleaseletmein", "SodiumChloride", 16384, 8, 1) ==
+            "7023bdcb3afd7348461c06cd81fd38ebfda8fbba904f8e3ea9b543f6545da1f2d5432955613f0fcf62d49705242a9af9e61e85dc0d651e40dfcf017b45575887",
+        "scrypt RFC 7914, third (the server's own parameters)");
+  Bytes all;
+  for (unsigned i = 0; i < 12; i++) {
+    Bytes pass = pattern(i * 5, 7, i), salt = pattern(16, 3, i * 11), out(32 + i);
+    crypto::scrypt(pass.data(), pass.size(), salt.data(), salt.size(), uint64_t(1) << (1 + i % 7), 1 + i % 3, 1 + i % 2, out.data(), out.size());
+    all.insert(all.end(), out.begin(), out.end());
+  }
+  CHECK(sha256Hex(all) == "13a400bbdba7eabfdbd185ad85ac21bee0815708c06aeaa36567847ac38574b5", "scrypt: 12 more (as OpenSSL)");
+  uint8_t out[32];
+  CHECK(!crypto::scrypt(nullptr, 0, nullptr, 0, 1000, 8, 1, out, 32), "scrypt refuses an N that is no power of two");
+}
+
 /** How fast: sealing 1200-byte packets (what direct mode sends) for a third of a second. */
 static void speed() {
   uint8_t key[16] = {7}, iv[12] = {0}, aad[16] = {0}, tag[16];
@@ -308,6 +334,7 @@ int main(int argc, char** argv) {
   macs();
   x25519();
   gcm();
+  scryptTests();
   speed();
   std::printf(failures ? "%d FAILED\n" : "ALL PASS\n", failures);
   return failures ? 1 : 0;

@@ -11,7 +11,8 @@
 //    (wss://…/direct) and this passes them on.
 
 import dgram from 'node:dgram';
-import crypto from 'node:crypto';
+import crypto from 'node:crypto'; // (the system's random numbers – the HMAC is ours: own-crypto.js)
+import * as own from './own-crypto.js';
 
 const REG = 0x52;
 const REG_ACK = 0x41;
@@ -20,7 +21,7 @@ const ROLES = [1, 2]; // sharer, viewer
 const MAX_SESSIONS = 500;
 const END_TTL_MS = 90 * 1000; // a registration (or relayed packet) keeps an end alive this long
 
-const hmac16 = (secret, data) => crypto.createHmac('sha256', secret).update(data).digest().subarray(0, 16);
+const hmac16 = (secret, data) => own.hmacSha256(secret, data).subarray(0, 16);
 
 // The WebSocket path: the longest a packet may wait in the server's queue towards a peer.
 export const TCP_MAX_WAIT_MS = 150;
@@ -83,7 +84,7 @@ export function createRelay({ port = 0, host } = {}) {
       const role = m && Number(m.role);
       const mac = s && ROLES.includes(role) && typeof m.nonce === 'string' && typeof m.mac === 'string'
         ? Buffer.from(m.mac, 'base64') : null;
-      if (!mac || mac.length !== 16 || !crypto.timingSafeEqual(hmac16(s.secret, Buffer.from(`tcp:${Number(m.session)}:${role}:${m.nonce}`)), mac)) {
+      if (!mac || mac.length !== 16 || !own.equal(hmac16(s.secret, Buffer.from(`tcp:${Number(m.session)}:${role}:${m.nonce}`)), mac)) {
         ws.close(1008, 'auth');
         return;
       }
@@ -109,7 +110,7 @@ export function createRelay({ port = 0, host } = {}) {
   function onRegister(msg, rinfo) {
     if (msg.length < 30 || !ROLES.includes(msg[1])) return;
     const s = sessions.get(msg.readUInt32BE(2));
-    if (!s || !crypto.timingSafeEqual(hmac16(s.secret, msg.subarray(0, 14)), msg.subarray(14, 30))) return;
+    if (!s || !own.equal(hmac16(s.secret, msg.subarray(0, 14)), msg.subarray(14, 30))) return;
     s.ends[msg[1]] = { address: rinfo.address, port: rinfo.port, seen: Date.now() };
     const ip = rinfo.address.split('.').map(Number);
     if (ip.length !== 4) return;

@@ -364,7 +364,14 @@ test('WebSocket path: the server does not queue more than ~150 ms towards a view
 async function loadWebDirect() {
   const fs = await import('node:fs');
   const vm = await import('node:vm');
-  globalThis.window ||= globalThis; // what the script hangs its API on
+  globalThis.window ||= globalThis; // what the scripts hang their API on
+  if (!globalThis.ScreenShareWasm) {
+    // ss-web.js, as the page has it: our WebAssembly (the cryptography too), here from the file
+    vm.runInThisContext(fs.readFileSync(new URL('../public/ss-web.js', import.meta.url), 'utf8'));
+    const instance = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(new URL('../public/ss-web.wasm', import.meta.url))), {});
+    const wasm = globalThis.ScreenShareWasm.wrap(instance.exports);
+    globalThis.ScreenShareWasm.load = async () => wasm;
+  }
   vm.runInThisContext(fs.readFileSync(new URL('../public/direct-web.js', import.meta.url), 'utf8'));
   return globalThis.ScreenShareWebDirect;
 }
@@ -476,6 +483,15 @@ test('browser transport: frames not confirmed in time (a queue on the way) are d
   const tcpUrl = `ws://127.0.0.1:${app.server.address().port}/direct`;
   const { session, secret } = app.relay.create({ room: 'r', viewer: 'v1' });
   const api = await loadWebDirect();
+  // (the sockets, in the order they are made: the sharer's, then the viewer's)
+  const sockets = [];
+  const RealWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = class extends RealWebSocket {
+    constructor(...args) {
+      super(...args);
+      sockets.push(this);
+    }
+  };
   const host = api.create({ tcpUrl });
   const viewer = api.create({ tcpUrl });
   const hostEvents = [];
@@ -499,13 +515,16 @@ test('browser transport: frames not confirmed in time (a queue on the way) are d
     await until(() => got.length === 10);
     await sleep(50);
     assert.ok(!hostEvents.some(([n]) => n === 'keyframe'), 'nothing dropped while the frames are confirmed');
-    // the viewer's line stalls: no confirmations come, the next frame would only wait behind the last
+    // the viewer's line stalls: nothing it sends gets through any more – no confirmations, and no goodbye
+    // either (a viewer that leaves says goodbye: then the sharer stops sending to it at once)
+    sockets[1].send = () => {};
     viewer.stop();
     host.send({ stream: 0, key: false, ts: 10, capture: 10 }, new Uint8Array(frame(10, 20000)));
     await sleep(300);
     host.send({ stream: 0, key: false, ts: 11, capture: 11 }, new Uint8Array(frame(11, 20000)));
     assert.ok(hostEvents.some(([n]) => n === 'keyframe'), 'the late frame is dropped and a keyframe asked for');
   } finally {
+    globalThis.WebSocket = RealWebSocket;
     host.stop();
     viewer.stop();
     await app.close();

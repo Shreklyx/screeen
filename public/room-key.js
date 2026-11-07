@@ -55,9 +55,8 @@
   }
 
   async function e2eProof(key, role, session, pub) {
-    const subtle = root.crypto.subtle;
-    const k = await subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    const mac = new Uint8Array(await subtle.sign('HMAC', k, new TextEncoder().encode(`ss-e2e-v2|${role}|${session}|${pub}`)));
+    const { crypto } = await root.ScreenShareWasm.load(); // our own HMAC-SHA256 (ss-web.wasm: the apps' code)
+    const mac = crypto.hmacSha256(key, `ss-e2e-v2|${role}|${session}|${pub}`);
     return btoa(String.fromCharCode(...mac.subarray(0, 16)));
   }
 

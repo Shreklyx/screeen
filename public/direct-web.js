@@ -5,8 +5,8 @@
 //
 // A browser cannot send UDP, so its packets travel in a WebSocket to the server
 // (wss://…/direct), which passes them to the other side (the app's "tcp" path). The packets
-// are encrypted end to end like the app's (X25519 + HKDF → AES-128-GCM, the browser's own WebCrypto):
-// the server pairs the two ends by session and HMAC, but cannot read the picture.
+// are encrypted end to end like the app's (X25519 + HKDF → AES-128-GCM – our own code: the apps' C++ as
+// WebAssembly, ss-web.js): the server pairs the two ends by session and HMAC, but cannot read the picture.
 // Over the WebSocket a frame goes as one packet (TCP loses nothing, so no NACK); a frame that
 // cannot be sent in time is dropped instead of waiting in a queue, and the viewer asks for a
 // keyframe. The viewer confirms each frame (ACK): a queue anywhere on the way – the server, its
@@ -30,7 +30,6 @@
   const KEY_QUEUE_MS = 1000;
   const INFO = new TextEncoder().encode('screenshare-direct-v1');
   const INFO2 = new TextEncoder().encode('screenshare-direct-v2'); // (the room's own key mixed in)
-  const subtle = globalThis.crypto?.subtle;
   const now = () => performance.timeOrigin + performance.now();
 
   const b64 = (bytes) => btoa(String.fromCharCode(...bytes));
@@ -38,56 +37,48 @@
   const randomBytes = (n) => crypto.getRandomValues(new Uint8Array(n));
   const hex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
 
-  /* ------------------------------------------------ the key exchange: the browser's own (WebCrypto) */
+  /* ------------------------------------------------ our own cryptography (ss-web.wasm: the apps' C++) */
 
-  // generate() → { pub, shared(theirPub) → Promise<32 bytes> }
-  const webCryptoKeys = {
-    async generate() {
-      const kp = await subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']);
-      return {
-        pub: new Uint8Array(await subtle.exportKey('raw', kp.publicKey)),
-        async shared(theirs) {
-          const other = await subtle.importKey('raw', theirs, { name: 'X25519' }, false, []);
-          return new Uint8Array(await subtle.deriveBits({ name: 'X25519', public: other }, kp.privateKey, 256));
-        },
-      };
-    },
-  };
-  // our WebAssembly (ss-web.js – the lossless sound), loaded when needed; null when it cannot be
+  // our WebAssembly (ss-web.js): the cryptography and the lossless sound – null when it cannot be loaded
   let wasm;
   const loadWasm = async () => {
     if (wasm === undefined) wasm = await (globalThis.ScreenShareWasm?.load() ?? Promise.reject(new Error('no ss-web.js'))).catch(() => null);
     return wasm;
   };
+  const BASE_POINT = new Uint8Array(32);
+  BASE_POINT[0] = 9;
 
-  let keys = null;
-  /** The key exchange: WebCrypto's X25519 (Chrome / Edge 133+, Firefox 130+, Safari 17+). */
-  async function keyExchange() {
-    if (keys) return keys;
-    await subtle.generateKey({ name: 'X25519' }, false, ['deriveBits']);
-    keys = webCryptoKeys;
-    return keys;
+  /** A key pair for the exchange (X25519, RFC 7748): { pub, shared(theirPub) → 32 bytes, forget() }. */
+  function newKeys(c) {
+    const secret = randomBytes(32); // (the system's random numbers, as the apps')
+    return {
+      pub: c.x25519(secret, BASE_POINT),
+      shared(theirs) {
+        const s = c.x25519(secret, theirs);
+        if (!s) throw new Error('a low-order public key');
+        return s;
+      },
+      forget() {
+        secret.fill(0);
+      },
+    };
   }
 
   let support = null;
-  /** What this browser can do: { ok } – a WebSocket, WebCrypto (X25519 too) and an H.264 decoder, at
-   *  least; audio: 'wasm' (the lossless sound: our FLAC decoder and an AudioWorklet) | null. */
+  /** What this browser can do: { ok } – a WebSocket, WebAssembly (our cryptography) and an H.264 decoder,
+   *  at least; audio: 'wasm' (the lossless sound: our FLAC decoder and an AudioWorklet) | null. */
   function supported() {
     support ||= (async () => {
       const no = { ok: false };
-      if (!subtle || typeof WebSocket !== 'function' || typeof VideoDecoder !== 'function') return no;
+      if (typeof WebSocket !== 'function' || typeof VideoDecoder !== 'function' || typeof WebAssembly !== 'object') return no;
       try {
         if ((await VideoDecoder.isConfigSupported({ codec: 'avc1.640034' })).supported !== true) return no;
       } catch {
         return no;
       }
-      try {
-        await keyExchange();
-      } catch {
-        return no;
-      }
-      const audio = typeof AudioWorkletNode === 'function' && (await loadWasm()) ? 'wasm' : null;
-      return { ok: true, keys: 'webcrypto', audio };
+      if (!(await loadWasm())) return no;
+      const audio = typeof AudioWorkletNode === 'function' ? 'wasm' : null;
+      return { ok: true, keys: 'ours', audio };
     })();
     return support;
   }
@@ -99,17 +90,15 @@
       this.id = id;
       this.session = session >>> 0;
       this.role = role;
-      this.kx = null; // our key pair (see webCryptoKeys)
-      this.hmacKey = null;
-      this.sendKey = null;
+      this.kx = null; // our key pair (see newKeys)
+      this.hmacKey = null; // the session's secret (the server's HMAC key for this connection)
+      this.sendKey = null; // AES-128-GCM, one key each way (ss-web.js gcm())
       this.recvKey = null;
       this.counter = 0n;
       this.state = 'new';
       this.path = null; // { kind: 'tcp', rtt }
       this.ws = null;
       this.ready = false;
-      this.sendChain = Promise.resolve();
-      this.recvChain = Promise.resolve();
       this.probes = new Map();
       this.probeUntil = 0;
       this.nextProbe = 0;
@@ -139,27 +128,21 @@
     get sendDir() { return this.role === 'host' ? 1 : 2; }
     get recvDir() { return this.role === 'host' ? 2 : 1; }
 
-    /** Encrypts and sends, in order (WebCrypto answers asynchronously). */
+    /** Encrypts (our AES-GCM: at once, no promise to wait for) and sends. */
     send(type, payload) {
-      if (!this.sendKey || !this.ready) return;
+      if (!this.sendKey || !this.ready || this.ws?.readyState !== WebSocket.OPEN) return;
       this.counter += 1n;
-      const counter = this.counter;
-      this.sendChain = this.sendChain.then(async () => {
-        const head = new Uint8Array(HEADER);
-        const view = new DataView(head.buffer);
-        head[0] = PEER;
-        head[1] = type;
-        view.setUint32(2, this.session);
-        view.setBigUint64(6, counter);
-        const iv = new Uint8Array(12);
-        iv[0] = this.sendDir;
-        iv.set(head.subarray(6, 14), 4);
-        const sealed = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: head }, this.sendKey, payload));
-        const packet = new Uint8Array(HEADER + sealed.length);
-        packet.set(head);
-        packet.set(sealed, HEADER);
-        if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(packet);
-      }).catch(() => {});
+      const packet = new Uint8Array(HEADER + payload.length + 16);
+      const view = new DataView(packet.buffer);
+      packet[0] = PEER;
+      packet[1] = type;
+      view.setUint32(2, this.session);
+      view.setBigUint64(6, this.counter);
+      const iv = new Uint8Array(12);
+      iv[0] = this.sendDir;
+      iv.set(packet.subarray(6, 14), 4);
+      this.sendKey.seal(iv, packet.subarray(0, HEADER), payload, packet, HEADER);
+      this.ws.send(packet);
     }
   }
 
@@ -186,9 +169,11 @@
       this.removePeer(id);
       const peer = new Peer(id, Number(session), this.role);
       this.peers.set(id, peer);
-      peer.kx = await (await keyExchange()).generate();
-      peer.hmacKey = await subtle.importKey('raw', unb64(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      const w = await loadWasm();
+      if (!w) throw new Error('no ss-web.wasm');
       if (this.peers.get(id) !== peer) throw new Error('closed');
+      peer.kx = newKeys(w.crypto);
+      peer.hmacKey = unb64(secret);
       this.openSocket(peer);
       // no UDP addresses: the other side uses the WebSocket path at once
       return { pub: b64(peer.kx.pub), cands: [], tcp: true };
@@ -199,11 +184,11 @@
       const ws = new WebSocket(this.tcpUrl);
       ws.binaryType = 'arraybuffer';
       peer.ws = ws;
-      ws.onopen = async () => {
+      ws.onopen = () => {
         const role = ROLE[this.role];
         const nonce = hex(randomBytes(8));
-        const mac = new Uint8Array(await subtle.sign('HMAC', peer.hmacKey, new TextEncoder().encode(`tcp:${peer.session}:${role}:${nonce}`))).subarray(0, 16);
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ session: peer.session, role, nonce, mac: b64(mac) }));
+        const mac = wasm.crypto.hmacSha256(peer.hmacKey, `tcp:${peer.session}:${role}:${nonce}`).subarray(0, 16);
+        ws.send(JSON.stringify({ session: peer.session, role, nonce, mac: b64(mac) }));
       };
       ws.onmessage = (e) => {
         if (typeof e.data === 'string') {
@@ -211,10 +196,8 @@
           return;
         }
         const packet = new Uint8Array(e.data);
-        // opened at once (a 4K keyframe's decryption no longer holds up the sound packets behind it:
-        // the browser can open them side by side), handled in the order they came
-        const opened = this.open(peer, packet);
-        peer.recvChain = peer.recvChain.then(() => opened).then((body) => body && this.onPacket(peer, packet, body)).catch(() => {});
+        const body = this.open(peer, packet); // (at once, in the order they came)
+        if (body) this.onPacket(peer, packet, body);
       };
       ws.onclose = () => {
         if (peer.ws !== ws) return;
@@ -237,7 +220,8 @@
       const peer = this.peers.get(id);
       if (!peer) return;
       try {
-        const shared = await peer.kx.shared(unb64(pub));
+        const c = wasm.crypto;
+        const shared = peer.kx.shared(unb64(pub));
         // the room's own key (when both sides proved they hold it) goes into the keys too
         const withKey = psk?.length === 16;
         const ikm = withKey ? new Uint8Array(48) : shared;
@@ -245,14 +229,16 @@
           ikm.set(shared);
           ikm.set(psk, 32);
         }
-        const hkdf = await subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
-        if (withKey) ikm.fill(0);
         const salt = new Uint8Array(4);
         new DataView(salt.buffer).setUint32(0, peer.session);
-        const okm = new Uint8Array(await subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt, info: withKey ? INFO2 : INFO }, hkdf, 256));
-        const aes = (raw) => subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
-        const [toViewer, toHost] = await Promise.all([aes(okm.subarray(0, 16)), aes(okm.subarray(16, 32))]);
-        if (this.peers.get(id) !== peer) return;
+        const okm = c.hkdfSha256(salt, ikm, withKey ? INFO2 : INFO, 32);
+        ikm.fill(0);
+        shared.fill(0);
+        const toViewer = c.gcm(okm.subarray(0, 16));
+        const toHost = c.gcm(okm.subarray(16, 32));
+        okm.fill(0);
+        peer.sendKey?.close();
+        peer.recvKey?.close();
         peer.sendKey = this.role === 'host' ? toViewer : toHost;
         peer.recvKey = this.role === 'host' ? toHost : toViewer;
       } catch {
@@ -274,8 +260,15 @@
       this.peers.delete(id);
       const ws = peer.ws;
       peer.ws = null;
-      // after the goodbye has gone
-      peer.sendChain.then(() => { try { ws?.close(); } catch { /* closed */ } });
+      try {
+        ws?.close(); // (after the goodbye: what was sent goes first)
+      } catch {
+        // closed
+      }
+      peer.sendKey?.close(); // (the keys gone from memory)
+      peer.recvKey?.close();
+      peer.sendKey = peer.recvKey = null;
+      peer.kx?.forget();
     }
 
     setState(peer, state, diag = null) {
@@ -285,19 +278,15 @@
 
     /* ---- receiving */
 
-    /** A packet's body, decrypted – or null (not ours, or it does not open). */
-    async open(peer, packet) {
+    /** A packet's body, decrypted (our AES-GCM) – or null (not ours, or it does not open). */
+    open(peer, packet) {
       if (packet.length < HEADER + 16 || packet[0] !== PEER || !peer.recvKey) return null;
       const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
       if (view.getUint32(2) !== peer.session) return null;
       const iv = new Uint8Array(12);
       iv[0] = peer.recvDir;
       iv.set(packet.subarray(6, 14), 4);
-      try {
-        return new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv, additionalData: packet.subarray(0, HEADER) }, peer.recvKey, packet.subarray(HEADER)));
-      } catch {
-        return null;
-      }
+      return peer.recvKey.open(iv, packet.subarray(0, HEADER), packet.subarray(HEADER));
     }
 
     onPacket(peer, packet, body) {

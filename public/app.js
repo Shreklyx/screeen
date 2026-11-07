@@ -5,8 +5,9 @@
  *
  * No WebRTC. The picture and the sound go with our own protocol – the one the Windows and Mac
  * apps speak (native/core): H.264 from WebCodecs and lossless sound (FLAC, the apps' own C++ code as
- * WebAssembly – ss-web.js), encrypted end to end with the browser's own WebCrypto (X25519, AES-GCM),
- * every frame passed on the moment it is ready, through the server's WebSocket (direct-web.js).
+ * WebAssembly – ss-web.js), encrypted end to end with our own cryptography (X25519, AES-128-GCM – the
+ * apps' C++ code too, as WebAssembly), every frame passed on the moment it is ready, through the server's
+ * WebSocket (direct-web.js).
  * Signaling: a WebSocket to this site's server (/ws).
  * ===================================================================== */
 
@@ -2402,7 +2403,7 @@ function directStatsTick() {
   const own = 'saját C++ kód (WebAssembly)';
   renderStatsRows([
     ['Átvitel', 'saját protokoll, végig titkosítva (WebRTC nélkül)'],
-    ['Kulcscsere', 'X25519 · a böngésző saját WebCryptója'],
+    ['Titkosítás', 'saját: X25519 + AES-128-GCM (az alkalmazások C++ kódja, WebAssembly)'],
     ['Felbontás', res],
     ['FPS', d.drawn ? String(Math.round(fps)) : '–'],
     ['Bitráta', fmtKbps(r?.kbps ?? null)],

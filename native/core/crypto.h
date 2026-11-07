@@ -1,7 +1,8 @@
 // Screen Share native core – the cryptography of direct mode (same as test/direct-reference.cjs and
 // public/direct-web.js): X25519 key agreement, HKDF-SHA256, AES-128-GCM, HMAC-SHA256; for the
-// TURN client MD5, HMAC-SHA1 and CRC-32; SHA-1 for the WebSocket handshake. Our own code (crypto.cpp),
-// the standard algorithms from their specifications – no library.
+// TURN client MD5, HMAC-SHA1 and CRC-32; SHA-1 for the WebSocket handshake. Our own code, the standard
+// algorithms from their specifications – no library: crypto_core.cpp (which the website's WebAssembly and
+// the server run too); crypto.cpp is its C++ face.
 #pragma once
 
 #include <array>

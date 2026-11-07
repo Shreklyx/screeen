@@ -5,9 +5,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-// as the page loads it: a plain script that puts RoomKey on the global object
-const context = { crypto: globalThis.crypto, TextEncoder, Uint8Array, String, btoa };
+// as the page loads it: a plain script that puts RoomKey on the global object – after ss-web.js (our own
+// HMAC, WebAssembly)
+const context = { crypto: globalThis.crypto, TextEncoder, Uint8Array, String, btoa, WebAssembly, fetch };
 context.globalThis = context;
+vm.runInNewContext(fs.readFileSync(new URL('../public/ss-web.js', import.meta.url), 'utf8'), context);
+const ourWasm = context.ScreenShareWasm.wrap(new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(new URL('../public/ss-web.wasm', import.meta.url))), {}).exports);
+context.ScreenShareWasm.load = async () => ourWasm;
 vm.runInNewContext(fs.readFileSync(new URL('../public/room-key.js', import.meta.url), 'utf8'), context);
 const { base32, unbase32, parseRoomKey, e2eProof, e2eProofOk } = context.RoomKey;
 

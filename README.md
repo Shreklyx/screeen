@@ -215,12 +215,15 @@ lehető legrövidebb úton:
   egyenesen az UDP-re mennek;
 - a képkockák ~1,1 KB-os UDP-csomagokban mennek, AES-GCM titkosítással (a kulcsot a két alkalmazás X25519-cel
   egyezteti, a szerver sem látja a képet), a küldés gyors és csak enyhén tagolt (a célbitráta 3-szorosával);
-- a titkosítás **saját kód** (`native/core/crypto.cpp`), könyvtár nélkül, de szabványos algoritmusokkal (X25519,
-  HKDF-SHA256, AES-128-GCM – saját titkosító algoritmust kitalálni nem biztonságos): a processzor AES-utasításain
-  fut (x86: AES-NI + PCLMULQDQ, Apple Silicon: ARMv8 AES + PMULL), egyszerre négy blokkal – egy mag ~2–3 GB/s-ot
-  titkosít, a csomagonkénti költség mikroszekundum alatti; régi, AES-utasítás nélküli processzoron állandó idejű
-  (a kulcsot az időzítésen sem eláruló) hordozható kód fut. A tesztek (`native/tests/crypto_test.cpp`) a szabványok
-  tesztvektoraival és OpenSSL-lel számolt hosszú sorozatokkal ellenőrzik mindkét változatot;
+- a titkosítás **mindenhol saját kód** (`native/core/crypto_core.cpp`) – az alkalmazásokban, a weboldalon
+  (ugyanez a C++ kód WebAssemblyként) és a szerveren is –, könyvtár nélkül, de szabványos algoritmusokkal (X25519,
+  HKDF-SHA256, AES-128-GCM, HMAC, a szerver jelszavaihoz scrypt – saját titkosító algoritmust kitalálni nem
+  biztonságos). Az alkalmazásokban a processzor AES-utasításain fut (x86: AES-NI + PCLMULQDQ, Apple Silicon: ARMv8
+  AES + PMULL), egyszerre nyolc blokkal: egy mag több GB/s-ot titkosít, a csomagonkénti költség mikroszekundum
+  alatti. Ahol nincs AES-utasítás (régi processzor, a böngésző WebAssemblyje), állandó idejű (a kulcsot az
+  időzítésen sem eláruló) kód fut, SIMD-del nyolc blokk egyszerre (~100 MB/s). A véletlenszámok a rendszeréi. A
+  tesztek (`native/tests/crypto_test.cpp`, `test/ss-web.test.js`) a szabványok tesztvektoraival és OpenSSL-lel
+  számolt hosszú sorozatokkal ellenőrzik minden változatát;
 - a néző **puffer nélkül** dolgozik: minden teljes képkockát azonnal dekódol, és egy alacsony késleltetésű
   („desynchronized”) vásznon rajzolja ki, amely nem vár a böngésző képösszeállítására; ha a gép nem bírja a tempót,
   mindig csak a legfrissebb kép kerül ki;
@@ -248,9 +251,10 @@ WebSocketben, a szerver HTTPS-portján (`wss://…/direct`) mennek, és a szerve
 Ezen az úton egy képkocka egy csomag (a TCP nem veszít el semmit, nincs újrakérés); ha a néző vonala nem bírja, a
 megosztó eldobja a képkockákat a következő kulcskockáig ahelyett, hogy sorba állítaná őket (és amint van hely, újra
 kér kulcskockát – a kép nem marad állva). A néző itt is puffer nélkül, minden képet azonnal kirajzol. Így megy alkalmazás → böngésző, böngésző →
-böngésző és böngésző → alkalmazás. A kulcscsere és a titkosítás a böngésző saját WebCryptója (X25519, AES-GCM –
-Chrome / Edge 133+, Firefox 130+, Safari 17+); a hang veszteségmentes FLAC az alkalmazások saját C++ kódjával,
-WebAssemblyként (`public/ss-web.wasm`, forrás: `native/web`). A megosztó a képet és a hangot a
+böngésző és böngésző → alkalmazás. A kulcscsere és a titkosítás itt is a saját kódunk (X25519, HKDF, AES-128-GCM –
+az alkalmazásokéval azonos C++ kód WebAssemblyként; a böngészőben nincs AES-utasítás, így a konstans idejű, SIMD-es
+változat fut, ~100 MB/s – egy 4K-s adás ~12 MB/s), és a hang veszteségmentes FLAC is az alkalmazások saját C++
+kódja (`public/ss-web.wasm`, forrás: `native/web`). A megosztó a képet és a hangot a
 `MediaStreamTrackProcessor`-ral olvassa (Chrome, Edge), ahol ez nincs (Firefox, Safari), egy videóelemből
 (`requestVideoFrameCallback`) és egy AudioWorkletből. **WebRTC sehol nincs** az oldalon; ahol a böngésző ezt sem
 tudja (nagyon régi, WebCodecs nélküli böngésző), a néző üzenetet kap, és a megosztó nézőlistájában is látszik, miért
@@ -314,7 +318,7 @@ szerver 3479/udp reléjét vagy a WebSocketet használják. A `ss-web.wasm` repr
   a megosztó és a néző logikája), `server/direct-relay.js` (a szerver 3479/udp portja: címfelderítés és relé, csak a
   munkamenet titkával regisztrált címek felé), `public/app.js` *DIRECT MODE* része (WebCodecs kódolás/dekódolás,
   kirajzolás, hang), `public/direct-audio.js` (hanglejátszó AudioWorklet), `public/direct-web.js` (ugyanez a
-  böngészőben: WebCrypto + WebSocket a szerveren át), `public/capture-audio.js` (a megosztó hangja
+  böngészőben: a saját titkosításunk WebAssemblyként + WebSocket a szerveren át), `public/capture-audio.js` (a megosztó hangja
   ott, ahol nincs `MediaStreamTrackProcessor`), `public/ss-web.js` + `native/web` (a FLAC kódoló / dekódoló és a
   térhatás fejmodellje, az alkalmazások C++ kódja WebAssemblyként), `test/direct-reference.cjs` (a protokoll
   JavaScriptben, a tesztek használják).

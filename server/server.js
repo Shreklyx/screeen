@@ -8,10 +8,11 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
+import crypto from 'node:crypto'; // (the system's random numbers – the rest is ours: own-crypto.js)
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { createRelay } from './direct-relay.js';
+import * as own from './own-crypto.js';
 
 const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
 const STATIC_FILES = {
@@ -84,15 +85,14 @@ export function loadConfig(env = process.env) {
 
 /* ------------------------------------------------------------ helpers */
 
-const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest();
-const passwordMatches = (given, expected) => crypto.timingSafeEqual(sha256(given), sha256(expected));
+const passwordMatches = (given, expected) => own.equal(own.sha256(String(given)), own.sha256(String(expected)));
 
 /* A room's token is signed: HMAC(the server's key, its code). A server that started again has no rooms –
  * the sharer's app comes back with its code and token, and the room is there again with the same code
  * (nothing kept but the key). The key: ROOM_SECRET; else made once and kept in DATA_DIR; else from the TURN
  * secret or the host password (they stay the same across restarts); else new at each start. */
 function roomSigningKey(config) {
-  if (config.roomSecret) return crypto.createHmac('sha256', config.roomSecret).update('screenshare rooms').digest();
+  if (config.roomSecret) return own.hmacSha256(config.roomSecret, 'screenshare rooms');
   if (config.dataDir) {
     const file = path.join(config.dataDir, 'room-secret');
     try {
@@ -111,21 +111,21 @@ function roomSigningKey(config) {
     }
   }
   const base = config.turnSecret || config.hostPassword;
-  if (base) return crypto.createHmac('sha256', base).update('screenshare rooms').digest();
+  if (base) return own.hmacSha256(base, 'screenshare rooms');
   return crypto.randomBytes(32);
 }
 
 // A room's entry password: kept only as a slow salted hash (scrypt).
 function hashAccess(password) {
   const salt = crypto.randomBytes(16);
-  return { salt: salt.toString('base64'), hash: crypto.scryptSync(password, salt, 32).toString('base64') };
+  return { salt: salt.toString('base64'), hash: own.scrypt(password, salt).toString('base64') };
 }
 
 function accessMatches(password, access) {
   if (typeof password !== 'string' || !password || password.length > 128) return false;
   try {
     const want = Buffer.from(access.hash, 'base64');
-    return crypto.timingSafeEqual(crypto.scryptSync(password, Buffer.from(access.salt, 'base64'), 32), want);
+    return own.equal(own.scrypt(password, Buffer.from(access.salt, 'base64')), want);
   } catch {
     return false;
   }
@@ -169,7 +169,7 @@ class RateLimiter {
 // A unique name per client keeps coturn's per-user allocation quota per client.
 export function turnCredentials(secret, ttlSec = LIMITS.turnTtlSec, now = Date.now(), name = crypto.randomBytes(6).toString('hex')) {
   const username = `${Math.floor(now / 1000) + ttlSec}:${name}`;
-  const credential = crypto.createHmac('sha1', secret).update(username).digest('base64');
+  const credential = own.hmacSha1(secret, username).toString('base64');
   return { username, credential };
 }
 
@@ -250,7 +250,7 @@ function loadFile(name) {
     body,
     mtimeMs: stat.mtimeMs,
     size: stat.size,
-    etag: `"${crypto.createHash('sha1').update(body).digest('base64url').slice(0, 16)}"`,
+    etag: `"${own.sha1(body).toString('base64url').slice(0, 16)}"`,
   };
   fileCache.set(name, entry);
   return entry;
@@ -303,7 +303,7 @@ export function createApp(config = loadConfig()) {
   const rooms = new Map();
   let closing = false;
   const signKey = roomSigningKey(config);
-  const tokenFor = (code) => crypto.createHmac('sha256', signKey).update(`room|${code}`).digest('base64url');
+  const tokenFor = (code) => own.hmacSha256(signKey, `room|${code}`).toString('base64url');
   const newRoom = (code) => ({
     code,
     token: tokenFor(code),

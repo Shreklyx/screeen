@@ -1,12 +1,14 @@
 // Screen Share for the website – WebAssembly from the apps' own C++ code: the lossless sound (FLAC, our
-// own encoder and decoder – native/common/lossless.cpp, the same as the apps') and the spatial sound for
-// headphones (native/common/spatial.cpp, the apps' head model). No library: the key exchange and the
-// encryption are the browser's own (WebCrypto). public/ss-web.js loads it; build: native/web/build.sh.
+// own encoder and decoder – native/common/lossless.cpp, the same as the apps'), the spatial sound for
+// headphones (native/common/spatial.cpp, the apps' head model) and our own cryptography
+// (native/core/crypto_core.cpp, the apps' too: X25519, HKDF, AES-128-GCM, HMAC – the server's scrypt).
+// No library. public/ss-web.js loads it (the server too: server/own-crypto.js); build: native/web/build.sh.
 // (C headers: there is no C++ library for wasm32-wasi here, and none is needed)
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "crypto_core.h"
 #include "lossless.h"
 #include "spatial.h"
 
@@ -40,3 +42,42 @@ EXPORT(ss_spatial_yaw) void ss_spatial_yaw(ss::spatial::Renderer* r, float radia
 /** frames of its channels (interleaved) → stereo (interleaved). */
 EXPORT(ss_spatial_process) void ss_spatial_process(ss::spatial::Renderer* r, const float* in, int frames, float* out) { r->process(in, frames, out); }
 EXPORT(ss_spatial_destroy) void ss_spatial_destroy(ss::spatial::Renderer* r) { free(r); }
+
+/* ---- our own cryptography (native/core/crypto_core.h – the apps' code; portable: WebAssembly has no AES
+   instructions, so AES runs bitsliced on its SIMD, eight blocks at once – in constant time) */
+
+namespace sc = ss::crypto;
+
+/** X25519 (RFC 7748): out = scalar · point; 0 for a low-order point. */
+EXPORT(ss_x25519) int ss_x25519(uint8_t* out, const uint8_t* scalar, const uint8_t* point) { return sc::x25519(out, scalar, point) ? 1 : 0; }
+EXPORT(ss_sha256) void ss_sha256(const uint8_t* data, int n, uint8_t* out) { sc::sha256(data, size_t(n), out); }
+EXPORT(ss_sha1) void ss_sha1(const uint8_t* data, int n, uint8_t* out) { sc::sha1(data, size_t(n), out); }
+EXPORT(ss_hmac_sha256) void ss_hmac_sha256(const uint8_t* key, int keyLen, const uint8_t* data, int n, uint8_t* out) {
+  sc::hmacSha256(key, size_t(keyLen), data, size_t(n), out);
+}
+EXPORT(ss_hmac_sha1) void ss_hmac_sha1(const uint8_t* key, int keyLen, const uint8_t* data, int n, uint8_t* out) {
+  sc::hmacSha1(key, size_t(keyLen), data, size_t(n), out);
+}
+EXPORT(ss_hkdf_sha256) int ss_hkdf_sha256(const uint8_t* salt, int saltLen, const uint8_t* ikm, int ikmLen, const uint8_t* info, int infoLen, uint8_t* out, int outLen) {
+  return sc::hkdfSha256(salt, size_t(saltLen), ikm, size_t(ikmLen), info, size_t(infoLen), out, size_t(outLen)) ? 1 : 0;
+}
+EXPORT(ss_scrypt) int ss_scrypt(const uint8_t* pass, int passLen, const uint8_t* salt, int saltLen, uint32_t N, uint32_t r, uint32_t p, uint8_t* out, int outLen) {
+  return sc::scrypt(pass, size_t(passLen), salt, size_t(saltLen), N, r, p, out, size_t(outLen)) ? 1 : 0;
+}
+/** AES-128-GCM: a key's state (ss_gcm_free wipes it), then seal / open in place (iv: 12 bytes, tag: 16). */
+EXPORT(ss_gcm_new) sc::Gcm* ss_gcm_new(const uint8_t* key) {
+  sc::Gcm* g = static_cast<sc::Gcm*>(malloc(sizeof(sc::Gcm)));
+  if (g) sc::gcmInit(*g, key);
+  return g;
+}
+EXPORT(ss_gcm_seal) void ss_gcm_seal(const sc::Gcm* g, const uint8_t* iv, const uint8_t* aad, int aadLen, uint8_t* data, int n, uint8_t* tag) {
+  sc::gcmSeal(*g, iv, aad, size_t(aadLen), data, size_t(n), tag);
+}
+EXPORT(ss_gcm_open) int ss_gcm_open(const sc::Gcm* g, const uint8_t* iv, const uint8_t* aad, int aadLen, uint8_t* data, int n, const uint8_t* tag) {
+  return sc::gcmOpen(*g, iv, aad, size_t(aadLen), data, size_t(n), tag) ? 1 : 0;
+}
+EXPORT(ss_gcm_free) void ss_gcm_free(sc::Gcm* g) {
+  if (!g) return;
+  sc::wipe(g, sizeof *g);
+  free(g);
+}
